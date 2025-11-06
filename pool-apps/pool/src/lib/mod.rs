@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
 use async_channel::unbounded;
-use stratum_apps::{
-    persistence::{FileHandler, SharePersistence},
-    stratum_core::{bitcoin::consensus::Encodable, parsers_sv2::TemplateDistribution},
+#[cfg(feature = "persistence")]
+use stratum_apps::persistence::{DefaultHandler, FileHandler};
+use stratum_apps::stratum_core::{
+    bitcoin::consensus::Encodable, parsers_sv2::TemplateDistribution,
 };
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
@@ -69,26 +70,39 @@ impl PoolSv2 {
 
         debug!("Channels initialized.");
 
-        // Initialize persistence from config
-        let persistence = match self.config.persistence() {
-            Some(config) => match FileHandler::new(config.file_path.clone(), config.channel_size) {
-                Ok(handler) => {
-                    info!(
-                        "Persistence enabled: file_path={}, channel_size={}",
-                        config.file_path.display(),
-                        config.channel_size
-                    );
-                    SharePersistence::new(Some(handler))
+        // Initialize persistence handler based on feature flag
+        #[cfg(feature = "persistence")]
+        let persistence: DefaultHandler = {
+            match self.config.persistence() {
+                Some(config) => {
+                    match FileHandler::new(config.file_path.clone(), config.channel_size) {
+                        Ok(handler) => {
+                            info!(
+                                "Persistence enabled: file_path={}, channel_size={}",
+                                config.file_path.display(),
+                                config.channel_size
+                            );
+                            handler
+                        }
+                        Err(e) => {
+                            // If file handler fails, we need to panic or return error
+                            // since DefaultHandler = FileHandler, we can't fall back to no-op
+                            panic!("Failed to initialize persistence: {}", e);
+                        }
+                    }
                 }
-                Err(e) => {
-                    warn!("Failed to initialize persistence, disabling: {}", e);
-                    SharePersistence::default()
+                None => {
+                    panic!("Persistence feature enabled but not configured in config file");
                 }
-            },
-            None => {
-                info!("Persistence disabled (not configured).");
-                SharePersistence::default()
             }
+        };
+
+        #[cfg(not(feature = "persistence"))]
+        let persistence = {
+            info!("Persistence disabled (feature not enabled).");
+            // When feature disabled, just use NoOpHandler directly
+            use stratum_apps::persistence::NoOpHandler;
+            NoOpHandler
         };
 
         let channel_manager = ChannelManager::new(
