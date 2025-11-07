@@ -11,6 +11,7 @@ use stratum_apps::{
     custom_mutex::Mutex,
     key_utils::{Secp256k1PublicKey, Secp256k1SecretKey},
     network_helpers::noise_stream::NoiseTcpStream,
+    persistence::{DefaultHandler, SharePersistenceHandler},
     stratum_core::{
         channels_sv2::{
             server::{
@@ -83,17 +84,22 @@ pub struct ChannelManagerChannel {
 /// Contains all the state of mutable and immutable data required
 /// by channel manager to process its task along with channels
 /// to perform message traversal.
+///
+/// # Type Parameters
+///
+/// * `P` - The persistence handler type (defaults to `DefaultHandler`)
 #[derive(Clone)]
-pub struct ChannelManager {
+pub struct ChannelManager<P: SharePersistenceHandler + 'static = DefaultHandler> {
     channel_manager_data: Arc<Mutex<ChannelManagerData>>,
     channel_manager_channel: ChannelManagerChannel,
     pool_tag_string: String,
     share_batch_size: usize,
     shares_per_minute: f32,
     coinbase_reward_script: CoinbaseRewardScript,
+    persistence: P,
 }
 
-impl ChannelManager {
+impl<P: SharePersistenceHandler> ChannelManager<P> {
     /// Constructor method used to instantiate the ChannelManager
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
@@ -103,6 +109,7 @@ impl ChannelManager {
         downstream_sender: broadcast::Sender<(usize, Mining<'static>)>,
         downstream_receiver: Receiver<(usize, Mining<'static>)>,
         coinbase_outputs: Vec<u8>,
+        persistence: P,
     ) -> PoolResult<Self> {
         let range_0 = 0..0;
         let range_1 = 0..POOL_ALLOCATION_BYTES;
@@ -151,6 +158,7 @@ impl ChannelManager {
             shares_per_minute: config.shares_per_minute(),
             pool_tag_string: config.pool_signature().to_string(),
             coinbase_reward_script: config.coinbase_reward_script().clone(),
+            persistence,
         };
 
         Ok(channel_manager)

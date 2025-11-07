@@ -58,3 +58,11 @@ pub mod rpc;
 /// Provides Secp256k1 key management, serialization/deserialization, and signature services.
 /// Supports both standard and no_std environments.
 pub mod key_utils;
+
+/// Persistence abstractions for shares
+///
+/// Provides a generic persistence framework that can be used across different
+/// Stratum V2 roles with support for multiple backend implementations (file, SQLite, etc.).
+/// Features fire-and-forget semantics to avoid blocking the mining hot path.
+#[cfg(feature = "persistence")]
+pub mod persistence;
