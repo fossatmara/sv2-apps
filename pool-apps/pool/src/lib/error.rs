@@ -89,6 +89,8 @@ pub enum PoolError {
     ParseInt(std::num::ParseIntError),
     /// Failed to create group channel
     FailedToCreateGroupChannel(GroupChannelError),
+    /// Persistence error
+    PersistenceError(String),
 }
 
 impl std::fmt::Display for PoolError {
@@ -139,6 +141,7 @@ impl std::fmt::Display for PoolError {
             FailedToCreateGroupChannel(ref e) => {
                 write!(f, "Failed to create group channel: {e:?}")
             }
+            PersistenceError(e) => write!(f, "Persistence error: {e}"),
         }
     }
 }
