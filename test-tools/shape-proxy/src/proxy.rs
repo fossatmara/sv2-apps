@@ -725,6 +725,25 @@ impl ProxyCore {
                     .values_mut()
                     .find(|m| m.upstream_channel_id == Some(upstream_ch))
                 {
+                    let prev_difficulty = pair.pool_difficulty.unwrap_or(0.0);
+                    let pct_change = if prev_difficulty > 0.0 {
+                        (pool_difficulty - prev_difficulty) / prev_difficulty * 100.0
+                    } else {
+                        0.0
+                    };
+                    let profile_elapsed = pair.gate.elapsed_secs();
+                    let supply = pair.gate.current_supply_spm();
+                    let target_spm = pair.gate.current_target_spm();
+                    info!(
+                        upstream_ch,
+                        new_difficulty = pool_difficulty,
+                        prev_difficulty = prev_difficulty,
+                        pct_change = format!("{:+.1}%", pct_change),
+                        profile_elapsed_secs = format!("{:.1}", profile_elapsed),
+                        supply_spm = format!("{:.2}", supply),
+                        target_spm = format!("{:.2}", target_spm),
+                        "Pool vardiff fired"
+                    );
                     pair.pool_difficulty = Some(pool_difficulty);
                 }
 
