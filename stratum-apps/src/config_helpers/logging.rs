@@ -4,9 +4,7 @@ use std::{
     io::{self, IsTerminal},
     panic,
     path::Path,
-    str::FromStr,
 };
-use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{EnvFilter, Registry, fmt, prelude::*};
 
 /// Initialize logging to stdout and optionally to a file.
@@ -14,9 +12,13 @@ use tracing_subscriber::{EnvFilter, Registry, fmt, prelude::*};
 /// If `log_file` is Some, logs will be written to both stdout and the file.
 /// If `log_level` is not provided or is invalid, it defaults to "info".
 pub fn init_logging(log_file: Option<&Path>) {
-    let rust_log = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
-    let log_level_filter = LevelFilter::from_str(&rust_log).unwrap_or(LevelFilter::INFO);
-    let env_filter = EnvFilter::new(log_level_filter.to_string());
+    // Build the filter from the full RUST_LOG directive. EnvFilter natively
+    // parses per-target directives (e.g.
+    // "info,channels_sv2::vardiff=debug,pool_sv2::channel_manager=debug");
+    // the previous LevelFilter::from_str round-trip could only parse a bare
+    // global level and silently fell back to INFO on any comma-separated
+    // per-target directive, so targeted debug logging never took effect.
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let stdout_layer = fmt::layer()
         .with_writer(io::stdout)
         .with_ansi(io::stdout().is_terminal());
