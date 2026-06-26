@@ -74,6 +74,42 @@ enum HintAction {
     Reject,
 }
 
+/// Is a declared nominal hashrate trustworthy enough to act on? The shared
+/// plausibility floor used at BOTH entry points — the `UpdateChannel` guard
+/// (`classify_hint`) and the `OpenChannel` screen — so they reject identically:
+/// finite AND at least the sentinel floor. Catches the `nominal=1` field
+/// sentinel and the non-finite values `hash_rate_to_target` would otherwise
+/// silently accept (it rejects only negative-hashrate / zero-spm; 0.0/NaN/+inf
+/// pass it and yield a garbage target).
+fn is_plausible_nominal(nominal: f32) -> bool {
+    nominal.is_finite() && nominal >= MIN_PLAUSIBLE_NOMINAL_HS
+}
+
+/// The conservative-easy open nominal to substitute when a declared open nominal
+/// is implausible: the sentinel floor itself. Polarity is deliberate — the
+/// lowest plausible hashrate yields the easiest plausible open target, so the
+/// miner over-produces shares (floods the controller, the SELF-HEALING
+/// direction) and the EWMA tightens up fast from there. Opening too HARD would
+/// starve the controller at birth (the spiral direction), so erring easy is the
+/// correct cold-start polarity, and reusing MIN_PLAUSIBLE_NOMINAL_HS avoids
+/// inventing a config constant (same operand as the floor). The channel's
+/// `new_for_pool` derives the target via hash_rate_to_target and clamps it to
+/// the miner's `max_target` internally, so the max_target bound on this default
+/// is free.
+///
+/// max_target, precisely: a Target is a 256-bit int, so there is NO non-finite
+/// max_target to screen (the type closes the case the float `nominal` field
+/// could not — verified, not assumed). But the type does NOT close the
+/// HOSTILE-VALUE case: a *tight* max_target (low value → high difficulty) wins
+/// the internal `.min` and opens the channel hard. That is honored as the
+/// miner's self-inflicted, self-declared bound (it asked not to go easier than
+/// this), the same reasoning as honoring a mid-run shrink — and gated by the
+/// SAME missing operand: screening a hostile-tight open max_target needs a pool
+/// difficulty CEILING, which does not exist in config (cf. the reject-branch
+/// shrink and the non-biting pool-floor clamp — one missing pool-difficulty-band
+/// operand, three deviations, all reverting when the band is configured).
+const COLD_START_DEFAULT_NOMINAL_HS: f32 = MIN_PLAUSIBLE_NOMINAL_HS;
+
 /// Classify an UpdateChannel revision under the eager-ease/reluctant-tighten
 /// asymmetry. `current_nominal` is the channel's present operating point
 /// (get_nominal_hashrate); `declared` is msg.nominal_hash_rate.
@@ -94,10 +130,13 @@ enum HintAction {
 /// NaN reaches `<` as silently-false and would fall through to `DeferUp`. Do not
 /// reorder the magnitude check ahead of it.
 fn classify_hint(declared: f32, current_nominal: f32) -> HintAction {
-    if !declared.is_finite() || declared < MIN_PLAUSIBLE_NOMINAL_HS {
+    // ORDER IS LOAD-BEARING: screen the DECLARATION first. is_plausible_nominal
+    // is finite-AND-floor, so NaN (which would read silently-false at `<` and
+    // fall through to DeferUp) is caught here, not below.
+    if !is_plausible_nominal(declared) {
         // the DECLARATION itself is garbage → ignore in full.
         HintAction::Reject
-    } else if !current_nominal.is_finite() || current_nominal < MIN_PLAUSIBLE_NOMINAL_HS {
+    } else if !is_plausible_nominal(current_nominal) {
         // declaration is plausible, but the REFERENCE is degenerate → no
         // trustworthy direction. Can't justify an ease (the dangerous-adjacent
         // leg) against a garbage reference, so defer to the share loop (the safe
@@ -279,7 +318,21 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
             downstream.downstream_data.super_safe_lock(|downstream_data| {
                 downstream_data.payout_mode = Some(payout_mode);
 
-                let nominal_hash_rate = msg.nominal_hash_rate;
+                // COLD-START SCREEN (plausibility floor at the OPEN entry point —
+                // the companion to the UpdateChannel guard's floor). A declared
+                // open nominal that is non-finite or sub-floor is a REPORTING
+                // fault, not a hashing fault: substitute the conservative-easy
+                // default and let the share-driven controller converge from there,
+                // rather than reject the open (which would drop a hashing-capable
+                // miner over a bad sensor reading — the terminal-on-unverified
+                // mistake). max_target clamp is applied inside new_for_pool.
+                let nominal_hash_rate = if is_plausible_nominal(msg.nominal_hash_rate) {
+                    msg.nominal_hash_rate
+                } else {
+                    error!("OpenStandardMiningChannel: implausible nominal {} — opening at conservative default {} H/s, shares will converge",
+                        msg.nominal_hash_rate, COLD_START_DEFAULT_NOMINAL_HS);
+                    COLD_START_DEFAULT_NOMINAL_HS
+                };
                 let requested_max_target = Target::from_le_bytes(msg.max_target.inner_as_ref().try_into().unwrap());
                 let extranonce_prefix = channel_manager_data.extranonce_allocator.allocate_standard().map_err(PoolError::shutdown)?;
 
@@ -390,7 +443,18 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
             client_id.expect("client_id must be present for downstream_id extraction");
         info!("Received OpenExtendedMiningChannel: {}", msg);
 
-        let nominal_hash_rate = msg.nominal_hash_rate;
+        // COLD-START SCREEN (see the standard-channel open handler for the full
+        // rationale): an implausible open nominal is a reporting fault, not a
+        // hashing fault — substitute the conservative-easy default and let shares
+        // converge, rather than reject the open. max_target clamp is inside
+        // new_for_pool.
+        let nominal_hash_rate = if is_plausible_nominal(msg.nominal_hash_rate) {
+            msg.nominal_hash_rate
+        } else {
+            error!("OpenExtendedMiningChannel: implausible nominal {} — opening at conservative default {} H/s, shares will converge",
+                msg.nominal_hash_rate, COLD_START_DEFAULT_NOMINAL_HS);
+            COLD_START_DEFAULT_NOMINAL_HS
+        };
         let requested_max_target =
             Target::from_le_bytes(msg.max_target.inner_as_ref().try_into().unwrap());
         let requested_min_rollable_extranonce_size = msg.min_extranonce_size;
@@ -1352,6 +1416,47 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
 #[cfg(test)]
 mod hint_guard_tests {
     use super::{classify_hint, pool_floor_target, HintAction, MIN_PLAUSIBLE_NOMINAL_HS};
+
+    use super::{is_plausible_nominal, COLD_START_DEFAULT_NOMINAL_HS};
+
+    // ---- the shared plausibility primitive (used at BOTH entry points) ----
+    #[test]
+    fn is_plausible_nominal_screens_finite_and_floor() {
+        assert!(is_plausible_nominal(50_000.0));
+        assert!(is_plausible_nominal(MIN_PLAUSIBLE_NOMINAL_HS)); // boundary accepted
+        assert!(!is_plausible_nominal(MIN_PLAUSIBLE_NOMINAL_HS - 0.1)); // below floor
+        assert!(!is_plausible_nominal(1.0)); // the nominal=1 sentinel
+        assert!(!is_plausible_nominal(0.0));
+        assert!(!is_plausible_nominal(f32::NAN));
+        assert!(!is_plausible_nominal(f32::INFINITY));
+        assert!(!is_plausible_nominal(f32::NEG_INFINITY));
+    }
+
+    // ---- the cold-start default substitution (open path). The open handler
+    // binds `nominal = if is_plausible(msg) { msg } else { DEFAULT }`. Pin the
+    // decision and the polarity: the default is the FLOOR (conservative-easy),
+    // and it is ITSELF plausible (so it can't recurse into another substitution
+    // and the channel constructor accepts it). ----
+    #[test]
+    fn cold_start_default_is_the_floor_and_is_plausible() {
+        assert_eq!(COLD_START_DEFAULT_NOMINAL_HS, MIN_PLAUSIBLE_NOMINAL_HS);
+        // the substituted default must pass the same screen (else we'd open with
+        // a value we'd then reject — incoherent).
+        assert!(is_plausible_nominal(COLD_START_DEFAULT_NOMINAL_HS));
+    }
+
+    #[test]
+    fn open_substitutes_default_for_garbage_nominal() {
+        // model the open handler's binding decision for the field-failure cases.
+        let resolve = |declared: f32| {
+            if is_plausible_nominal(declared) { declared } else { COLD_START_DEFAULT_NOMINAL_HS }
+        };
+        assert_eq!(resolve(f32::NAN), COLD_START_DEFAULT_NOMINAL_HS); // NaN → default
+        assert_eq!(resolve(f32::INFINITY), COLD_START_DEFAULT_NOMINAL_HS); // inf → default
+        assert_eq!(resolve(0.0), COLD_START_DEFAULT_NOMINAL_HS); // zero → default
+        assert_eq!(resolve(1.0), COLD_START_DEFAULT_NOMINAL_HS); // sentinel → default
+        assert_eq!(resolve(80_000.0), 80_000.0); // plausible → kept as-is
+    }
 
     // ---- the three branches (happy path) ----
     #[test]
