@@ -11,6 +11,7 @@ use stratum_apps::stratum_core::{
             share_accounting::{ShareValidationError, ShareValidationResult},
             standard::StandardChannel,
         },
+        target::hash_rate_to_target,
         Vardiff, VardiffState,
     },
     extensions_sv2::{
@@ -24,6 +25,120 @@ use stratum_apps::stratum_core::{
 use tracing::{error, info};
 
 use jd_server_sv2::job_declarator::SetCustomMiningJobResponse;
+
+// ===========================================================================
+// Telemetry-hint guard for UpdateChannel (Home A — see
+// stratum sim/docs/NOMINAL_HASHRATE_COLDSTART.md "The guard, as it will ship").
+//
+// SAFETY FIX, not only a feature: today this handler calls update_channel
+// UNCONDITIONALLY, so it tightens the operating point on the miner's unverified
+// say-so on every upward revision — the unguarded-upward injection that is the
+// over-difficulty spiral entry. The guard replaces that with the eager-ease/
+// reluctant-tighten asymmetry: act on a plausible DOWNWARD revision (the safe,
+// self-healing direction), DEFER an upward revision to the share-driven vardiff
+// loop (which owns tightening on corroborated evidence). The asymmetry is
+// decided by worst-case survivability under a missing protocol field: an
+// UpdateChannel carries no device count, so the pool cannot tell a legitimate
+// aggregate-attach upward revision from an unbacked say-so claim — and easing
+// on a false hint costs only a bounded, self-correcting share burst, while
+// tightening on one is the spiral.
+// ===========================================================================
+
+/// Smallest declared nominal (H/s) the guard will act on. Below this a
+/// declaration is treated as a sentinel/garbage (the `nominal = 1` case observed
+/// in the field) and ignored. A STATIC floor — no share-rate dependence, so it
+/// is well-defined at all channel states (cold, post-reset, mid-run).
+const MIN_PLAUSIBLE_NOMINAL_HS: f32 = 1_000.0;
+
+/// Pool difficulty floor as a hashrate (H/s). The downward ease is clamped so it
+/// cannot drop the operating point below this. SHIPS NON-BITING: there is no
+/// pool difficulty-band policy in config today (only vardiff's internal
+/// DEFAULT_MIN_HASHRATE = 1.0), so a real floor would change live vardiff
+/// behavior on the reference baseline and must be an explicit operator choice.
+/// At 1.0 H/s this clamp is wired-and-ready but vacuous; the over-low-downward
+/// case is therefore bounded only by the miner's own max_target until an
+/// operator sets a real band. (See the doc's "pool-floor operand" gap.)
+const POOL_FLOOR_HASHRATE: f32 = 1.0;
+
+/// The guard's verdict for one UpdateChannel revision.
+#[derive(Debug, PartialEq)]
+enum HintAction {
+    /// Plausible downward revision: ease the operating point to this nominal
+    /// (already the lower-of declared, the caller still clamps to max_target).
+    EaseDown(f32),
+    /// Plausible upward revision: do NOT tighten on the nominal; defer to the
+    /// share loop. A max_target shrink in the same message is still honored.
+    DeferUp,
+    /// Implausible declaration (sentinel/garbage): ignore the nominal entirely.
+    /// A max_target shrink is honored ONLY if the max_target is itself sane.
+    Reject,
+}
+
+/// Classify an UpdateChannel revision under the eager-ease/reluctant-tighten
+/// asymmetry. `current_nominal` is the channel's present operating point
+/// (get_nominal_hashrate); `declared` is msg.nominal_hash_rate.
+///
+/// BOTH operands are screened — the direction comparison `declared <
+/// current_nominal` is only as trustworthy as both sides. `current_nominal` is
+/// NOT guaranteed finite-positive by construction: it is the fire-path-written
+/// register, seeded at open from the declared open nominal via
+/// `hash_rate_to_target`, and that converter rejects ONLY negative-hashrate /
+/// zero-spm — it accepts 0.0, NaN and +inf (they cast to a valid `u128`), and
+/// the pool's open handler does not screen the nominal either. So a channel can
+/// legitimately exist with a degenerate `current_nominal`; treating it as a
+/// clean reference would mis-classify (a plausible `declared` reads "downward"
+/// against a garbage-high reference → unwarranted ease, or "upward" against a
+/// garbage-low one → wrong defer).
+///
+/// ORDER IS LOAD-BEARING — the `!declared.is_finite()` check MUST stay first:
+/// NaN reaches `<` as silently-false and would fall through to `DeferUp`. Do not
+/// reorder the magnitude check ahead of it.
+fn classify_hint(declared: f32, current_nominal: f32) -> HintAction {
+    if !declared.is_finite() || declared < MIN_PLAUSIBLE_NOMINAL_HS {
+        // the DECLARATION itself is garbage → ignore in full.
+        HintAction::Reject
+    } else if !current_nominal.is_finite() || current_nominal < MIN_PLAUSIBLE_NOMINAL_HS {
+        // declaration is plausible, but the REFERENCE is degenerate → no
+        // trustworthy direction. Can't justify an ease (the dangerous-adjacent
+        // leg) against a garbage reference, so defer to the share loop (the safe
+        // leg). declared is already known-good here (screened above).
+        HintAction::DeferUp
+    } else if declared < current_nominal {
+        HintAction::EaseDown(declared)
+    } else {
+        HintAction::DeferUp
+    }
+}
+
+/// The pool-floor target for a given share rate: the easiest target (highest
+/// value) the pool will run. The ease clamps to `min(miner_max, this)` — in
+/// target space `.min` picks the harder ceiling, so this bounds how far an ease
+/// can lower difficulty. Non-biting at POOL_FLOOR_HASHRATE = 1.0 today.
+fn pool_floor_target(shares_per_minute: f32) -> Option<Target> {
+    hash_rate_to_target(POOL_FLOOR_HASHRATE as f64, shares_per_minute as f64)
+        .ok()
+        .map(Target::from)
+}
+
+// NOTE on the REJECT branch and max_target: the spec mandates reflecting a
+// max_target SHRINK, and the plausible branches (ease/defer) preserve that by
+// passing max_target through update_channel. The reject branch does NOT honor
+// the message's max_target — but the load-bearing reason is NOT "the shrink is
+// implausible because the nominal is" (nominal_hash_rate and maximum_target are
+// INDEPENDENT protocol fields, populated by different firmware paths; a miner
+// with a broken telemetry path could send a sentinel nominal AND a legitimate
+// shrink). The reason is that the shrink is UNSCREENABLE: a max_target shrink
+// moves difficulty UP (toward the ceiling), and a sentinel-tight shrink is a
+// difficulty-slam DoS whose only screen is a pool difficulty CEILING — which
+// does not exist in config (same missing-operand gap as the floor). Performing
+// an unvalidatable, side-effectful request from an already-rejected message is
+// the wrong default, so we drop the whole message. The spec assumes the pool
+// CAN evaluate the shrink; it does not contemplate "the shrink is itself an
+// attack I have no policy to bound." REVERSIBILITY (same discipline as the
+// pool-floor and warm-test gaps): once a pool difficulty band/ceiling is in
+// config, the reject branch can honor a shrink screened against the ceiling, and
+// this deviation closes — it is scoped to the missing operand, not to a claim
+// about miner behavior.
 
 use crate::{
     channel_manager::{ChannelManager, RouteMessageTo, CLIENT_SEARCH_SPACE_BYTES},
@@ -977,93 +1092,125 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                             if let Some(standard_channel) =
                                 downstream_data.standard_channels.get_mut(&channel_id)
                             {
-                                let res = standard_channel.update_channel(
+                                // GUARD: eager-ease / reluctant-tighten on the hint.
+                                let spm = standard_channel.get_shares_per_minute();
+                                let action = classify_hint(
                                     new_nominal_hash_rate,
-                                    Some(requested_maximum_target),
+                                    standard_channel.get_nominal_hashrate(),
                                 );
-                                match res {
-                                    Ok(_) => {}
-                                    Err(e) => {
-                                        error!("UpdateChannelError: {:?}", e);
-                                        match e {
-                                            StandardChannelError::UpdateChannelInvalidNominalHashrate(code) => {
-                                                error!("UpdateChannelError: {}", code);
-                                                let update_channel_error = UpdateChannelError {
-                                                    channel_id,
-                                                    error_code: code
-                                                        .to_string()
-                                                        .try_into()
-                                                        .expect("error code must be valid string"),
-                                                };
-                                                messages.push(
-                                                    (
-                                                        downstream_id,
-                                                        Mining::UpdateChannelError(
-                                                            update_channel_error,
-                                                        ),
-                                                    )
-                                                        .into(),
-                                                );
+                                let emit_set_target = match action {
+                                    HintAction::EaseDown(eased_nominal) => {
+                                        // clamp the ease to min(miner_max, pool_floor).
+                                        let clamp = match pool_floor_target(spm) {
+                                            Some(floor) => requested_maximum_target.min(floor),
+                                            None => requested_maximum_target,
+                                        };
+                                        let res = standard_channel
+                                            .update_channel(eased_nominal, Some(clamp));
+                                        if let Err(e) = res {
+                                            error!("UpdateChannelError: {:?}", e);
+                                            match e {
+                                                StandardChannelError::UpdateChannelInvalidNominalHashrate(code) => {
+                                                    let update_channel_error = UpdateChannelError {
+                                                        channel_id,
+                                                        error_code: code.to_string().try_into()
+                                                            .expect("error code must be valid string"),
+                                                    };
+                                                    messages.push((downstream_id,
+                                                        Mining::UpdateChannelError(update_channel_error)).into());
+                                                }
+                                                _ => unreachable!(),
                                             }
-                                            // We don't care about other variants as they are not
-                                            // associated to Update channel, and we will never
-                                            // encounter it.
-                                            _ => unreachable!(),
+                                        }
+                                        true
+                                    }
+                                    HintAction::DeferUp => {
+                                        // Do NOT tighten on the nominal — the share loop owns
+                                        // tightening. Still honor a max_target SHRINK (spec):
+                                        // re-apply with the CURRENT nominal so only the target
+                                        // ceiling moves, never the operating point upward.
+                                        if requested_maximum_target < *standard_channel.get_target() {
+                                            let cur = standard_channel.get_nominal_hashrate();
+                                            let _ = standard_channel
+                                                .update_channel(cur, Some(requested_maximum_target));
+                                            true
+                                        } else {
+                                            false
                                         }
                                     }
-                                }
-                                let new_target = standard_channel.get_target();
-                                let set_target = SetTarget {
-                                    channel_id,
-                                    maximum_target: new_target.to_le_bytes().into(),
+                                    HintAction::Reject => {
+                                        // Untrusted message — ignore in full (incl. its max_target).
+                                        error!("UpdateChannel ignored: implausible nominal {} (< {} H/s sentinel floor)",
+                                            new_nominal_hash_rate, MIN_PLAUSIBLE_NOMINAL_HS);
+                                        false
+                                    }
                                 };
-                                messages
-                                    .push((downstream_id, Mining::SetTarget(set_target)).into());
+                                if emit_set_target {
+                                    let new_target = standard_channel.get_target();
+                                    let set_target = SetTarget {
+                                        channel_id,
+                                        maximum_target: new_target.to_le_bytes().into(),
+                                    };
+                                    messages.push((downstream_id, Mining::SetTarget(set_target)).into());
+                                }
                             } else if let Some(extended_channel) =
                                 downstream_data.extended_channels.get_mut(&channel_id)
                             {
-                                let res = extended_channel.update_channel(
+                                // GUARD: eager-ease / reluctant-tighten on the hint.
+                                let spm = extended_channel.get_shares_per_minute();
+                                let action = classify_hint(
                                     new_nominal_hash_rate,
-                                    Some(requested_maximum_target),
+                                    extended_channel.get_nominal_hashrate(),
                                 );
-                                match res {
-                                    Ok(_) => {}
-                                    Err(e) => {
-                                        error!("UpdateChannelError: {:?}", e);
-                                        match e {
-                                            ExtendedChannelError::UpdateChannelInvalidNominalHashrate(code) => {
-                                                error!("UpdateChannelError: {}", code);
-                                                let update_channel_error = UpdateChannelError {
-                                                    channel_id,
-                                                    error_code: code
-                                                        .to_string()
-                                                        .try_into()
-                                                        .expect("error code must be valid string"),
-                                                };
-                                                messages.push(
-                                                    (
-                                                        downstream_id,
-                                                        Mining::UpdateChannelError(
-                                                            update_channel_error,
-                                                        ),
-                                                    )
-                                                        .into(),
-                                                );
+                                let emit_set_target = match action {
+                                    HintAction::EaseDown(eased_nominal) => {
+                                        let clamp = match pool_floor_target(spm) {
+                                            Some(floor) => requested_maximum_target.min(floor),
+                                            None => requested_maximum_target,
+                                        };
+                                        let res = extended_channel
+                                            .update_channel(eased_nominal, Some(clamp));
+                                        if let Err(e) = res {
+                                            error!("UpdateChannelError: {:?}", e);
+                                            match e {
+                                                ExtendedChannelError::UpdateChannelInvalidNominalHashrate(code) => {
+                                                    let update_channel_error = UpdateChannelError {
+                                                        channel_id,
+                                                        error_code: code.to_string().try_into()
+                                                            .expect("error code must be valid string"),
+                                                    };
+                                                    messages.push((downstream_id,
+                                                        Mining::UpdateChannelError(update_channel_error)).into());
+                                                }
+                                                _ => unreachable!(),
                                             }
-                                            // We don't care about other variants as they are not
-                                            // associated to Update channel, and we will never
-                                            // encounter it.
-                                            _ => unreachable!(),
+                                        }
+                                        true
+                                    }
+                                    HintAction::DeferUp => {
+                                        if requested_maximum_target < *extended_channel.get_target() {
+                                            let cur = extended_channel.get_nominal_hashrate();
+                                            let _ = extended_channel
+                                                .update_channel(cur, Some(requested_maximum_target));
+                                            true
+                                        } else {
+                                            false
                                         }
                                     }
-                                }
-                                let new_target = extended_channel.get_target();
-                                let set_target = SetTarget {
-                                    channel_id,
-                                    maximum_target: new_target.to_le_bytes().into(),
+                                    HintAction::Reject => {
+                                        error!("UpdateChannel ignored: implausible nominal {} (< {} H/s sentinel floor)",
+                                            new_nominal_hash_rate, MIN_PLAUSIBLE_NOMINAL_HS);
+                                        false
+                                    }
                                 };
-                                messages
-                                    .push((downstream_id, Mining::SetTarget(set_target)).into());
+                                if emit_set_target {
+                                    let new_target = extended_channel.get_target();
+                                    let set_target = SetTarget {
+                                        channel_id,
+                                        maximum_target: new_target.to_le_bytes().into(),
+                                    };
+                                    messages.push((downstream_id, Mining::SetTarget(set_target)).into());
+                                }
                             } else {
                                 error!("UpdateChannelError: invalid-channel-id");
                                 let update_channel_error = UpdateChannelError {
@@ -1199,5 +1346,119 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
             .map_err(|e| PoolError::disconnect(e, downstream_id))?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod hint_guard_tests {
+    use super::{classify_hint, pool_floor_target, HintAction, MIN_PLAUSIBLE_NOMINAL_HS};
+
+    // ---- the three branches (happy path) ----
+    #[test]
+    fn ease_down_on_plausible_downward_revision() {
+        // declared plausible AND below the current operating point → eager-ease.
+        assert_eq!(
+            classify_hint(50_000.0, 100_000.0),
+            HintAction::EaseDown(50_000.0)
+        );
+    }
+
+    #[test]
+    fn defer_up_on_plausible_upward_revision() {
+        // declared plausible AND at/above current → defer to the share loop.
+        assert_eq!(classify_hint(200_000.0, 100_000.0), HintAction::DeferUp);
+    }
+
+    #[test]
+    fn reject_on_sentinel_nominal() {
+        // the nominal=1 field sentinel, and anything below the floor.
+        assert_eq!(classify_hint(1.0, 100_000.0), HintAction::Reject);
+        assert_eq!(classify_hint(999.0, 100_000.0), HintAction::Reject);
+    }
+
+    // ---- the boundary: exactly MIN_PLAUSIBLE_NOMINAL_HS ----
+    #[test]
+    fn boundary_exactly_at_floor_is_accepted_not_rejected() {
+        // Guard is `< floor` rejects, so floor itself is ACCEPTED. Pin this so a
+        // refactor to `<=` (which would reject the floor) is caught at build.
+        let at_floor = MIN_PLAUSIBLE_NOMINAL_HS; // 1000.0
+        // at_floor below current → ease (NOT reject); confirms the boundary side.
+        assert_eq!(
+            classify_hint(at_floor, 2_000.0),
+            HintAction::EaseDown(at_floor)
+        );
+        // just below the floor → reject.
+        assert_eq!(classify_hint(at_floor - 0.1, 2_000.0), HintAction::Reject);
+    }
+
+    // ---- non-finite: the classic silent-pass. NaN < x is false, so WITHOUT
+    // the is_finite() guard a NaN would fall past reject AND past the direction
+    // comparison (also false vs NaN) into the wrong arm. Test it's caught. ----
+    #[test]
+    fn nan_nominal_is_rejected() {
+        assert_eq!(classify_hint(f32::NAN, 100_000.0), HintAction::Reject);
+    }
+
+    #[test]
+    fn infinite_nominal_is_rejected() {
+        assert_eq!(classify_hint(f32::INFINITY, 100_000.0), HintAction::Reject);
+        // -inf is below the floor by ordering too, but is_finite catches it first.
+        assert_eq!(classify_hint(f32::NEG_INFINITY, 100_000.0), HintAction::Reject);
+    }
+
+    // ---- clamp-direction: the seam most likely to silently invert.
+    // In target space LOWER difficulty = LARGER target, so the clamp
+    // `min(miner_max, pool_floor)` must pick the SMALLER target (= HARDER
+    // difficulty). Pin that with two targets ordered unambiguously BY VALUE —
+    // NOT via Target::MAX/ZERO: Target::MAX is the Bitcoin max-target,
+    // numerically SMALL, and a vardiff floor target can exceed it (the first
+    // draft of this test wrongly assumed MAX = largest and caught its own bad
+    // premise — recorded here so it isn't re-introduced). Catches a future
+    // `.min()` -> `.max()` inversion in the guard. ----
+    #[test]
+    fn ease_clamp_picks_the_harder_ceiling() {
+        use stratum_apps::stratum_core::bitcoin::Target;
+        let harder = Target::from_le_bytes([0x11u8; 32]); // smaller value
+        let easier = Target::from_le_bytes([0xEEu8; 32]); // larger value
+        assert!(harder < easier, "sanity: smaller target value = harder difficulty");
+        assert_eq!(easier.min(harder), harder, ".min must pick the harder (smaller) ceiling");
+        assert_eq!(harder.min(easier), harder, ".min result is order-independent");
+        // the guard's pool_floor_target is well-formed for a real spm.
+        assert!(pool_floor_target(6.0).is_some());
+    }
+
+    // ---- reject is side-effect-free BY CONSTRUCTION: the Reject arm calls no
+    // channel mutator (only error!() + emit_set_target=false). This test pins the
+    // classifier verdict that drives that arm; the no-op property is then a
+    // structural property of the arm (no update_channel / set_nominal call),
+    // verified by inspection against source. ----
+    // ---- the REFERENCE operand (current_nominal) is screened too. It is NOT
+    // guaranteed finite-positive: hash_rate_to_target (the open-time validator)
+    // accepts 0.0/NaN/+inf, and the open handler doesn't screen — so a channel
+    // can exist with a degenerate operating point. A plausible declaration
+    // against a garbage reference must NOT ease (no trustworthy direction) — it
+    // defers to the share loop. ----
+    #[test]
+    fn degenerate_reference_defers_not_eases() {
+        let good = 50_000.0; // a plausible declaration
+        // garbage-high reference: naive `declared < current` would read this as
+        // "downward" and EASE — the screen must prevent that and DeferUp instead.
+        assert_eq!(classify_hint(good, f32::INFINITY), HintAction::DeferUp);
+        assert_eq!(classify_hint(good, f32::NAN), HintAction::DeferUp);
+        // garbage-low / zero reference: also no trustworthy direction → defer.
+        assert_eq!(classify_hint(good, 0.0), HintAction::DeferUp);
+        assert_eq!(classify_hint(good, 1.0), HintAction::DeferUp); // sub-floor ref
+        // and a garbage DECLARATION still loses to Reject regardless of reference
+        // (declaration screened first).
+        assert_eq!(classify_hint(f32::NAN, f32::NAN), HintAction::Reject);
+    }
+
+    #[test]
+    fn reject_verdict_is_terminal_not_a_direction() {
+        // A sub-floor nominal that is ALSO below current must be Reject, NOT
+        // EaseDown — reject takes precedence over direction, so no ease fires on
+        // a sentinel that happens to be "downward".
+        assert_eq!(classify_hint(1.0, 100_000.0), HintAction::Reject);
+        assert_ne!(classify_hint(1.0, 100_000.0), HintAction::EaseDown(1.0));
     }
 }
