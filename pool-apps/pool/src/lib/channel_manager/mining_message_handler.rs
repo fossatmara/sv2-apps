@@ -1169,6 +1169,11 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                                             Some(floor) => requested_maximum_target.min(floor),
                                             None => requested_maximum_target,
                                         };
+                                        info!(
+                                            "UpdateChannel guard [standard ch {}]: EASE-DOWN \
+                                             declared {} H/s < current {} H/s — easing operating point",
+                                            channel_id, new_nominal_hash_rate,
+                                            standard_channel.get_nominal_hashrate());
                                         let res = standard_channel
                                             .update_channel(eased_nominal, Some(clamp));
                                         if let Err(e) = res {
@@ -1194,11 +1199,23 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                                         // re-apply with the CURRENT nominal so only the target
                                         // ceiling moves, never the operating point upward.
                                         if requested_maximum_target < *standard_channel.get_target() {
+                                            info!(
+                                                "UpdateChannel guard [standard ch {}]: DEFER-UP \
+                                                 declared {} H/s >= current {} H/s — not tightening on \
+                                                 hint; honoring max_target shrink only",
+                                                channel_id, new_nominal_hash_rate,
+                                                standard_channel.get_nominal_hashrate());
                                             let cur = standard_channel.get_nominal_hashrate();
                                             let _ = standard_channel
                                                 .update_channel(cur, Some(requested_maximum_target));
                                             true
                                         } else {
+                                            info!(
+                                                "UpdateChannel guard [standard ch {}]: DEFER-UP \
+                                                 declared {} H/s >= current {} H/s — not tightening on \
+                                                 hint; no max_target shrink to honor (no-op)",
+                                                channel_id, new_nominal_hash_rate,
+                                                standard_channel.get_nominal_hashrate());
                                             false
                                         }
                                     }
@@ -1232,6 +1249,11 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                                             Some(floor) => requested_maximum_target.min(floor),
                                             None => requested_maximum_target,
                                         };
+                                        info!(
+                                            "UpdateChannel guard [extended ch {}]: EASE-DOWN \
+                                             declared {} H/s < current {} H/s — easing operating point",
+                                            channel_id, new_nominal_hash_rate,
+                                            extended_channel.get_nominal_hashrate());
                                         let res = extended_channel
                                             .update_channel(eased_nominal, Some(clamp));
                                         if let Err(e) = res {
@@ -1253,11 +1275,23 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                                     }
                                     HintAction::DeferUp => {
                                         if requested_maximum_target < *extended_channel.get_target() {
+                                            info!(
+                                                "UpdateChannel guard [extended ch {}]: DEFER-UP \
+                                                 declared {} H/s >= current {} H/s — not tightening on \
+                                                 hint; honoring max_target shrink only",
+                                                channel_id, new_nominal_hash_rate,
+                                                extended_channel.get_nominal_hashrate());
                                             let cur = extended_channel.get_nominal_hashrate();
                                             let _ = extended_channel
                                                 .update_channel(cur, Some(requested_maximum_target));
                                             true
                                         } else {
+                                            info!(
+                                                "UpdateChannel guard [extended ch {}]: DEFER-UP \
+                                                 declared {} H/s >= current {} H/s — not tightening on \
+                                                 hint; no max_target shrink to honor (no-op)",
+                                                channel_id, new_nominal_hash_rate,
+                                                extended_channel.get_nominal_hashrate());
                                             false
                                         }
                                     }
