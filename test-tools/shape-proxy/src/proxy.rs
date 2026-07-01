@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::sync::OnceLock;
+use std::time::Instant;
 
 use stratum_apps::{
     key_utils::{Secp256k1PublicKey, Secp256k1SecretKey},
@@ -9,7 +11,21 @@ use stratum_apps::{
     },
 };
 use tokio::{net::TcpListener, select, sync::mpsc};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
+
+/// Process-global monotonic reference instant for arrival timestamping.
+///
+/// Lazily set on first raw share arrival. Every arrival is then logged (at
+/// TRACE) as nanoseconds since this reference, giving a monotonic,
+/// high-resolution timestamp *sequence* from which inter-arrival gaps can be
+/// computed offline — the input to the source-Poisson (exponential
+/// inter-arrival) check for shaped-vs-real analyzer calibration. TRACE level so
+/// it is off by default and enabled only for a measurement run; emits only the
+/// timestamp and channel id, never share content.
+fn arrival_clock() -> Instant {
+    static CLOCK: OnceLock<Instant> = OnceLock::new();
+    *CLOCK.get_or_init(Instant::now)
+}
 
 use crate::{
     api::{self, ApiCommand, ChannelStatus, ProfileInfo, ProxyStatus},
@@ -530,6 +546,16 @@ impl ProxyCore {
 
         let now = std::time::Instant::now();
         let difficulty = mapping.miner_difficulty;
+        // Raw pre-gate arrival timestamp (ns since process reference), for the
+        // source-Poisson / inter-arrival-exponentiality calibration check. This
+        // is the miner's UNTHINNED stream — logged before the gate below — so it
+        // measures the source we thin, not the forwarded rate. TRACE, timestamp
+        // + channel id only.
+        trace!(
+            channel_id,
+            arrival_ns = arrival_clock().elapsed().as_nanos() as u64,
+            "raw share arrival"
+        );
         mapping.gate.record_share_arrived(now, difficulty);
 
         if !mapping.gate.should_forward() {
