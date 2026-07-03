@@ -27,11 +27,16 @@ struct Args {
 
 #[tokio::main]
 async fn main() {
-    fmt()
-        .with_env_filter(
-            EnvFilter::from_default_env().add_directive("shape_proxy=info".parse().unwrap()),
-        )
-        .init();
+    // Log filter: honor RUST_LOG when set (so e.g. RUST_LOG=shape_proxy=trace
+    // enables the raw-arrival calibration trace), and fall back to
+    // shape_proxy=info only when RUST_LOG is unset. Previously an
+    // unconditional `add_directive("shape_proxy=info")` pinned shape_proxy at
+    // info and silently overrode a RUST_LOG=shape_proxy=trace request.
+    let env_filter = match std::env::var("RUST_LOG") {
+        Ok(v) if !v.trim().is_empty() => EnvFilter::new(v),
+        _ => EnvFilter::new("shape_proxy=info"),
+    };
+    fmt().with_env_filter(env_filter).init();
 
     let args = Args::parse();
 
