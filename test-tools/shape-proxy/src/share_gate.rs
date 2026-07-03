@@ -38,8 +38,14 @@ impl ShareGate {
         let now = Instant::now();
         self.current_supply_spm = self.supply_window.rate_spm(now);
 
-        // Bootstrap: forward everything until we have supply measurements.
-        if self.effective_supply_spm() == 0.0 {
+        // Bootstrap: forward everything until we have supply measurements — but
+        // ONLY for relative profiles, whose target is undefined without supply. An
+        // absolute profile (AbsStep) has a supply-independent target, so it must
+        // gate normally even at zero measured supply (else the pin is bypassed).
+        let elapsed = self.started_at.elapsed().as_secs_f64();
+        if self.profile.absolute_rate_at(elapsed).is_none()
+            && self.effective_supply_spm() == 0.0
+        {
             return true;
         }
 
@@ -53,8 +59,16 @@ impl ShareGate {
         }
     }
 
-    pub fn current_target_spm(&self) -> f64 {
-        let elapsed = self.started_at.elapsed().as_secs_f64();
+    /// The forwarding target (shares/min) at the given elapsed time.
+    ///
+    /// ABSOLUTE profiles (`AbsStep`) pin the target to a fixed spm independent of
+    /// supply — a source surge cannot leak through. RELATIVE profiles multiply the
+    /// observed supply by `factor_at`. This single helper is the one place the two
+    /// modes are resolved; every target computation goes through it.
+    fn target_spm_at(&self, elapsed: f64) -> f64 {
+        if let Some(abs) = self.profile.absolute_rate_at(elapsed) {
+            return abs;
+        }
         let factor = self.profile.factor_at(elapsed);
         let effective_supply = self.effective_supply_spm();
         if effective_supply == 0.0 {
@@ -62,6 +76,10 @@ impl ShareGate {
         } else {
             factor * effective_supply
         }
+    }
+
+    pub fn current_target_spm(&self) -> f64 {
+        self.target_spm_at(self.started_at.elapsed().as_secs_f64())
     }
 
     pub fn current_supply_spm(&self) -> f64 {
@@ -77,9 +95,11 @@ impl ShareGate {
     }
 
     pub fn set_profile(&mut self, profile: RateProfile) {
-        let factor = profile.factor_at(0.0);
-        let effective_supply = self.effective_supply_spm();
-        let initial_target = factor * effective_supply;
+        // initial target via the same abs-or-relative resolution used everywhere.
+        let initial_target = match profile.absolute_rate_at(0.0) {
+            Some(abs) => abs,
+            None => profile.factor_at(0.0) * self.effective_supply_spm(),
+        };
 
         self.profile = profile;
         self.started_at = Instant::now();
@@ -93,8 +113,7 @@ impl ShareGate {
         self.last_refill = now;
 
         let elapsed = now.duration_since(self.started_at).as_secs_f64();
-        let factor = self.profile.factor_at(elapsed);
-        let target_spm = factor * self.effective_supply_spm();
+        let target_spm = self.target_spm_at(elapsed);
 
         self.capacity = Self::compute_capacity(target_spm);
         let tokens_earned = (target_spm / 60.0) * dt;
@@ -172,5 +191,47 @@ mod tests {
             "Expected ~5 spm, got {}",
             target
         );
+    }
+
+    #[test]
+    fn abs_step_target_is_supply_independent() {
+        // The load-bearing property of absolute delivery: the target is a pinned
+        // spm regardless of what the source supply does. A source surge must NOT
+        // leak into the target (the confound that voided the relative-delivery runs).
+        let mut gate = ShareGate::new(RateProfile::AbsStep {
+            before_spm: 30.0,
+            after_spm: 15.0,
+            at_secs: 0.0, // "after" active immediately
+        });
+        let now = Instant::now();
+
+        // No supply yet: absolute target is still the pinned value (not supply-driven).
+        assert_eq!(gate.current_target_spm(), 15.0);
+
+        // Now slam in a huge supply surge (the thing that confounded relative runs).
+        for i in 0..30 {
+            // ~200 spm at difficulty 1.0
+            gate.record_share_arrived(now + Duration::from_millis(i * 300), 1.0);
+        }
+        // Target is UNCHANGED by the surge — still pinned at 15 spm.
+        assert_eq!(
+            gate.current_target_spm(),
+            15.0,
+            "absolute target must ignore a source supply surge"
+        );
+    }
+
+    #[test]
+    fn abs_step_switches_before_to_after_at_time() {
+        // before_spm active until at_secs, after_spm after — the step itself.
+        let gate = ShareGate::new(RateProfile::AbsStep {
+            before_spm: 40.0,
+            after_spm: 20.0,
+            at_secs: 100.0,
+        });
+        // At elapsed 0 (< at_secs), target is before_spm.
+        assert_eq!(gate.current_target_spm(), 40.0);
+        // (post-at_secs behaviour is covered by absolute_rate_at's unit logic;
+        // current_target_spm reads live elapsed, so we assert the pre-step value here.)
     }
 }

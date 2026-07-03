@@ -104,6 +104,17 @@ impl ProfileInfo {
                 profile_type: "oscillate".into(),
                 description: format!("{:.1}±{:.1}×, period {:.0}s", base, amp, period_secs),
             },
+            RateProfile::AbsStep {
+                before_spm,
+                after_spm,
+                at_secs,
+            } => ProfileInfo {
+                profile_type: "abs_step".into(),
+                description: format!(
+                    "{:.1} → {:.1} spm ABSOLUTE @ {:.0}s (supply-independent)",
+                    before_spm, after_spm, at_secs
+                ),
+            },
         }
     }
 }
