@@ -12,20 +12,6 @@
 # Note: marapool is ArgoCD-managed; fold this file into the ArgoCD source
 # repo for persistent deployments rather than applying by hand.
 ---
-apiVersion: v1
-kind: Secret
-metadata:
-  name: vardiff-hub
-  namespace: marapool
-  labels:
-    app: marapool
-    component: vardiff-hub
-type: Opaque
-stringData:
-  # Dashboard access token. Delete this Secret (and the env ref) for an
-  # open dashboard — but this LB is internet-facing, so keep one.
-  token: "change-me"
----
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -56,14 +42,10 @@ spec:
             - name: http
               containerPort: 8080
           env:
-            - name: HTTP_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: vardiff-hub
-                  key: token
-            # Sim settings forwarded to every session child.
+            # Open dashboard (no HTTP_TOKEN): anyone with the URL gets their
+            # own sandboxed session. Sim settings forwarded to children:
             - name: EXTRA_ARGS
-              value: "--algorithm qpid --speed 8 --session-ttl-secs 600"
+              value: "--algorithm qpid --session-ttl-secs 600"
           resources:
             # Each browser session spawns bitcoind + sv2-tp + a pool
             # (~300-500 MiB, ~0.5 CPU); size for a handful of concurrent
