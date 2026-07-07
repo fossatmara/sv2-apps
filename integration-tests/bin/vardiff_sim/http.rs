@@ -107,6 +107,11 @@ struct MinerSnapshot {
     hashrate_changes: Vec<(f64, f64, f64)>,
     /// Share submission times (elapsed_secs) within the window.
     shares: Vec<f64>,
+    /// Current controller gains (kp, ki, kd); None for the classic algorithm.
+    gains: Option<(f64, f64, f64)>,
+    /// (elapsed_secs, kp, ki, kd) gain changes within the window, with a
+    /// held entry at the window edge so stepped plots span it.
+    gain_changes: Vec<(f64, f64, f64, f64)>,
 }
 
 #[derive(Serialize)]
@@ -158,6 +163,19 @@ fn build_snapshot(st: &HttpState, full: bool) -> StatsSnapshot {
             if history.len() > FULL_HISTORY_CAP {
                 history.drain(..history.len() - FULL_HISTORY_CAP);
             }
+            // Gain changes: windowed like the difficulty series, with the
+            // last pre-window change held at the edge so stepped plots span
+            // the whole visible range.
+            let mut gain_changes: Vec<(f64, f64, f64, f64)> = Vec::new();
+            if let Some(&(_, kp, ki, kd)) =
+                s.gain_changes.iter().rev().find(|(t, ..)| *t < from)
+            {
+                gain_changes.push((from, kp, ki, kd));
+            }
+            gain_changes.extend(s.gain_changes.iter().filter(|(t, ..)| *t >= from));
+            if gain_changes.len() > FULL_HISTORY_CAP {
+                gain_changes.drain(..gain_changes.len() - FULL_HISTORY_CAP);
+            }
             MinerSnapshot {
                 connected: s.connected,
                 hashrate: s.hashrate,
@@ -171,6 +189,8 @@ fn build_snapshot(st: &HttpState, full: bool) -> StatsSnapshot {
                 disconnects: s.disconnects,
                 last_error: s.last_error.clone(),
                 difficulty_history: history,
+                gains: s.gains,
+                gain_changes,
                 hashrate_changes: s
                     .hashrate_changes
                     .iter()

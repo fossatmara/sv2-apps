@@ -65,6 +65,12 @@ pub struct MinerStats {
     /// updates are deliberately excluded so they don't flood chart
     /// annotations).
     pub hashrate_changes: Vec<HashrateChange>,
+    /// Current controller gains (kp, ki, kd), when the embedded pool runs a
+    /// pid/qpid controller for this miner's channel. Read-only telemetry.
+    pub gains: Option<(f64, f64, f64)>,
+    /// (elapsed_secs, kp, ki, kd) at every gain change, for plotting how the
+    /// Q-learning schedules gains over time.
+    pub gain_changes: Vec<(f64, f64, f64, f64)>,
 }
 
 /// A commanded hashrate change, for chart annotations.
@@ -135,6 +141,21 @@ impl SimEngine {
     /// Current sim clock speed factor (1.0 = real time).
     pub fn speed(&self) -> f64 {
         clock_speed()
+    }
+
+    /// Polls the embedded pool's gain telemetry and records changes per
+    /// miner. Cheap (one registry read per miner per UI tick).
+    fn poll_gain_telemetry(&mut self, elapsed: f64) {
+        for (name, stats) in self.stats.iter_mut() {
+            let Some(gains) = super::controller_gains(name) else {
+                continue;
+            };
+            if stats.gains != Some(gains) {
+                stats.gains = Some(gains);
+                let (kp, ki, kd) = gains;
+                stats.gain_changes.push((elapsed, kp, ki, kd));
+            }
+        }
     }
 
     /// Current PID confidence shrinkage constant K.
@@ -308,6 +329,7 @@ impl SimEngine {
     /// Drains pending miner events into the stats tables. Call every tick.
     pub fn drain_events(&mut self) {
         let elapsed = self.elapsed_secs();
+        self.poll_gain_telemetry(elapsed);
         let mut any = false;
         while let Ok((name, event)) = self.events_rx.try_recv() {
             any = true;

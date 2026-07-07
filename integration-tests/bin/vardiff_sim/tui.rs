@@ -401,7 +401,12 @@ fn draw(
                     Block::default()
                         .borders(Borders::ALL)
                         .title(format!(
-                            " difficulty history: {name} (last {chart_window:.0}s) "
+                            " difficulty history: {name} (last {chart_window:.0}s){} ",
+                            s.gains
+                                .map(|(kp, ki, kd)| format!(
+                                    " | kp={kp:.3} ki={ki:.4} kd={kd:.3}"
+                                ))
+                                .unwrap_or_default()
                         )),
                 )
                 .legend_position(Some(ratatui::widgets::LegendPosition::TopRight))

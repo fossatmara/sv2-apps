@@ -85,6 +85,12 @@ pub fn set_significance_z_down(z: f64) {
     stratum_apps::stratum_core::channels_sv2::vardiff::tuning::set_significance_z_down(z)
 }
 
+/// Current controller gains (kp, ki, kd) for a miner's channel, published by
+/// the embedded pool's pid/qpid controller under the miner's user identity.
+pub fn controller_gains(name: &str) -> Option<(f64, f64, f64)> {
+    stratum_apps::stratum_core::channels_sv2::vardiff::telemetry::gains(name)
+}
+
 /// Events a miner task reports back to the engine.
 #[derive(Debug, Clone)]
 pub enum MinerEvent {

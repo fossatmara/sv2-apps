@@ -193,9 +193,11 @@ function render(data) {
 function buildData(m, x2, hasSynthetic) {
   const hist = m.difficulty_history;
   if (!hist.length) return null;
+  const gainHist = m.gain_changes || [];
   const xs = new Set();
   hist.forEach(([t]) => xs.add(t));
   m.shares.forEach(t => xs.add(t));
+  gainHist.forEach(([t]) => xs.add(t));
   xs.add(x2);
   const x = [...xs].sort((a, b) => a - b);
   const idx = new Map(x.map((v, i) => [v, i]));
@@ -208,7 +210,21 @@ function buildData(m, x2, hasSynthetic) {
   hist.forEach(([t, d], i) => { if (!(i === 0 && hasSynthetic)) fire[idx.get(t)] = d; });
   const rug = Array(x.length).fill(null);
   m.shares.forEach(t => { rug[idx.get(t)] = 0.5; });
-  return [x, diff, fire, rug];
+  // Controller gains (read-only telemetry): stepped lines on their own
+  // scale; ki is upscaled 100x to share an axis with kp/kd.
+  const gkp = Array(x.length).fill(null);
+  const gki = Array(x.length).fill(null);
+  const gkd = Array(x.length).fill(null);
+  gainHist.forEach(([t, kp, ki, kd]) => {
+    const i = idx.get(t);
+    gkp[i] = kp; gki[i] = ki * 100; gkd[i] = kd;
+  });
+  if (gainHist.length) {
+    const [, kp, ki, kd] = gainHist.at(-1);
+    const i = idx.get(x2);
+    gkp[i] = kp; gki[i] = ki * 100; gkd[i] = kd;
+  }
+  return [x, diff, fire, rug, gkp, gki, gkd];
 }
 
 function drawChangeLines(u) {
@@ -233,7 +249,7 @@ function makeChart(data) {
   const opts = {
     width: el.parentElement.clientWidth - 16,
     height: 320,
-    scales: { x: { time: false }, y: {}, r: { range: [0, 12] } },
+    scales: { x: { time: false }, y: {}, r: { range: [0, 12] }, g: {} },
     series: [
       { label: 't', value: (u, v) => v == null ? '' : v.toFixed(1) + 's' },
       { label: 'difficulty', stroke: '#39c5cf', width: 2, spanGaps: true,
@@ -245,11 +261,22 @@ function makeChart(data) {
       { label: 'share', scale: 'r', stroke: '#6e7681', paths: () => null,
         points: {show: true, size: 4, fill: '#6e7681'},
         value: (u, v) => v == null ? '—' : '●' },
+      { label: 'kp', scale: 'g', stroke: '#e3b341', width: 1, spanGaps: true,
+        paths: uPlot.paths.stepped({align: 1}), points: {show: false},
+        value: (u, v) => v == null ? '—' : v.toFixed(3) },
+      { label: 'ki×100', scale: 'g', stroke: '#bc8cff', width: 1, spanGaps: true,
+        paths: uPlot.paths.stepped({align: 1}), points: {show: false},
+        value: (u, v) => v == null ? '—' : (v / 100).toFixed(4) },
+      { label: 'kd', scale: 'g', stroke: '#f778ba', width: 1, spanGaps: true,
+        paths: uPlot.paths.stepped({align: 1}), points: {show: false},
+        value: (u, v) => v == null ? '—' : v.toFixed(3) },
     ],
     axes: [
       { stroke: '#8b949e', grid: {stroke: '#21262d'}, ticks: {stroke: '#21262d'},
         values: (u, vals) => vals.map(v => v.toFixed(0) + 's') },
       { stroke: '#8b949e', grid: {stroke: '#21262d'}, ticks: {stroke: '#21262d'}, size: 76 },
+      { scale: 'g', side: 1, stroke: '#8b949e', grid: {show: false},
+        ticks: {stroke: '#21262d'}, size: 50 },
     ],
     cursor: { drag: { x: true, y: false } },
     hooks: {

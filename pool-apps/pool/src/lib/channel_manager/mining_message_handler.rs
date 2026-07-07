@@ -308,7 +308,9 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                             PoolError::shutdown(e)
                         })?;
                 }
-                let vardiff = vardiff_factory.build().map_err(PoolError::shutdown)?;
+                let vardiff = vardiff_factory
+                    .build(&user_identity)
+                    .map_err(PoolError::shutdown)?;
                 self.vardiff
                     .insert((downstream_id, channel_id).into(), vardiff);
 
@@ -597,7 +599,9 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                 downstream
                     .extended_channels
                     .insert(channel_id, extended_channel);
-                let vardiff = vardiff_factory.build().map_err(PoolError::shutdown)?;
+                let vardiff = vardiff_factory
+                    .build(&user_identity)
+                    .map_err(PoolError::shutdown)?;
                 self.vardiff
                     .insert((downstream_id, channel_id).into(), vardiff);
 

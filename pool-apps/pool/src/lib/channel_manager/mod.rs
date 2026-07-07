@@ -141,6 +141,7 @@ impl VardiffFactory {
 
     pub(crate) fn build(
         &self,
+        user_identity: &str,
     ) -> Result<
         Box<dyn Vardiff>,
         stratum_apps::stratum_core::channels_sv2::vardiff::error::VardiffError,
@@ -162,7 +163,11 @@ impl VardiffFactory {
         };
         match self.config.algorithm {
             VardiffAlgorithm::Classic => Ok(Box::new(VardiffState::new()?)),
-            VardiffAlgorithm::Pid => Ok(Box::new(PidVardiffState::with_params(pid_params)?)),
+            VardiffAlgorithm::Pid => {
+                let mut state = PidVardiffState::with_params(pid_params)?;
+                state.set_telemetry_key(user_identity.to_string());
+                Ok(Box::new(state))
+            }
             VardiffAlgorithm::QPid => {
                 let table = self
                     .qtable
@@ -173,9 +178,9 @@ impl VardiffFactory {
                     gamma: self.config.gamma,
                     epsilon: self.config.epsilon,
                 };
-                Ok(Box::new(QPidVardiffState::with_params(
-                    table, q_params, pid_params,
-                )?))
+                let mut state = QPidVardiffState::with_params(table, q_params, pid_params)?;
+                state.set_telemetry_key(user_identity.to_string());
+                Ok(Box::new(state))
             }
         }
     }
