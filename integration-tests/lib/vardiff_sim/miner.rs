@@ -86,7 +86,7 @@ async fn run_miner_inner(
     debug!("{name}: SetupConnection succeeded");
 
     let open_channel = OpenStandardMiningChannel {
-        request_id: 1.into(),
+        request_id: 1,
         user_identity: name
             .clone()
             .try_into()
@@ -217,7 +217,7 @@ impl MinerState {
             Mining::OpenStandardMiningChannelSuccess(m) => {
                 let target_le: [u8; 32] = m
                     .target
-                    .to_vec()
+                    .to_owned_bytes()
                     .try_into()
                     .map_err(|_| "target is not 32 bytes".to_string())?;
                 self.channel_id = Some(m.channel_id);
@@ -235,7 +235,7 @@ impl MinerState {
             Mining::SetTarget(m) => {
                 let target_le: [u8; 32] = m
                     .maximum_target
-                    .to_vec()
+                    .to_owned_bytes()
                     .try_into()
                     .map_err(|_| "target is not 32 bytes".to_string())?;
                 self.target_le = Some(target_le);
