@@ -4,6 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>vardiff-sim</title>
+<link rel="stylesheet" href="/assets/uplot.css">
+<script src="/assets/uplot.js"></script>
 <style>
   :root { color-scheme: dark; }
   body { margin: 0; padding: 1rem; background: #0d1117; color: #c9d1d9;
@@ -20,14 +22,15 @@
   button { background: #21262d; color: #c9d1d9; border: 1px solid #30363d;
            border-radius: 4px; padding: .1rem .45rem; margin-left: .2rem; cursor: pointer; }
   button:hover { border-color: #58a6ff; }
-  canvas { width: 100%; height: 300px; background: #010409; border: 1px solid #21262d;
-           border-radius: 6px; }
+  button.on { border-color: #3fb950; color: #3fb950; }
   .bar { display: flex; gap: .75rem; align-items: center; margin-bottom: .75rem; flex-wrap: wrap; }
-  .legend span { margin-right: 1rem; }
-  .cyan { color: #39c5cf; } .magenta { color: #d2a8ff; } .green { color: #3fb950; }
-  .red { color: #f85149; } .gray { color: #8b949e; }
   input { background: #010409; color: #c9d1d9; border: 1px solid #30363d;
           border-radius: 4px; padding: .15rem .4rem; width: 8rem; }
+  #chartwrap { background: #010409; border: 1px solid #21262d; border-radius: 6px;
+               padding: .5rem; }
+  .u-legend { color: #c9d1d9; font: 12px ui-monospace, monospace; }
+  .u-legend .u-marker { border-radius: 50%; }
+  .hint { color: #8b949e; font-size: 12px; margin-top: .25rem; }
 </style>
 </head>
 <body>
@@ -52,20 +55,22 @@
   <input id="addname" placeholder="name (optional)">
   <input id="addhash" placeholder="hashrate H/s" value="100e12">
   <button onclick="addMiner()">add miner</button>
+  <span style="flex:1"></span>
+  <button id="live" class="on" onclick="toggleLive()">live</button>
 </div>
 
-<div class="legend">
-  <span class="cyan">— difficulty</span>
-  <span class="magenta">● vardiff fired</span>
-  <span class="green">| hashrate up</span>
-  <span class="red">| hashrate down</span>
-  <span class="gray">▪ shares</span>
-</div>
-<canvas id="chart" width="1600" height="300"></canvas>
+<div id="chartwrap"><div id="chart"></div></div>
+<div class="hint">hover for values · drag to zoom (pauses live) · double-click to reset zoom</div>
 
 <script>
+const TOKEN = new URLSearchParams(location.search).get('token') || '';
+const AUTH = { 'authorization': 'Bearer ' + TOKEN };
 let selected = null;
 let last = null;
+let live = true;
+let chart = null;
+let chartMiner = null;
+let changes = [];   // hashrate changes of the selected miner, for the draw hook
 
 function fmtHash(h) {
   const u = [[1e15,'PH/s'],[1e12,'TH/s'],[1e9,'GH/s'],[1e6,'MH/s'],[1e3,'kH/s']];
@@ -74,7 +79,8 @@ function fmtHash(h) {
 }
 
 async function post(path, body) {
-  await fetch(path, {method:'POST', headers:{'content-type':'application/json'},
+  await fetch(path, {method:'POST',
+                     headers: {...AUTH, 'content-type':'application/json'},
                      body: body ? JSON.stringify(body) : '{}'});
 }
 function setSpeed(mul) { if (last) post('/api/speed', {speed: last.speed * mul}); }
@@ -87,6 +93,11 @@ function addMiner() {
   const name = document.getElementById('addname').value.trim() || undefined;
   const hashrate = parseFloat(document.getElementById('addhash').value) || undefined;
   post('/api/miners', {name, hashrate});
+}
+function toggleLive() {
+  live = !live;
+  document.getElementById('live').classList.toggle('on', live);
+  if (live && last) updateChart(last);
 }
 
 function render(data) {
@@ -116,60 +127,105 @@ function render(data) {
       `<button onclick="event.stopPropagation();act('${m.name}','remove')">✕</button></td>`;
     tb.appendChild(tr);
   }
-  drawChart(data);
+  if (live) updateChart(data);
 }
 
-function drawChart(data) {
-  const canvas = document.getElementById('chart');
-  const ctx = canvas.getContext('2d');
-  const W = canvas.width, H = canvas.height, PAD = 46;
-  ctx.clearRect(0, 0, W, H);
-  const m = data.miners.find(m => m.name === selected);
-  if (!m || !m.difficulty_history.length) return;
+// Merge the event-based series onto one x axis (uPlot needs aligned arrays).
+function buildData(m, x2, hasSynthetic) {
+  const hist = m.difficulty_history;
+  if (!hist.length) return null;
+  const xs = new Set();
+  hist.forEach(([t]) => xs.add(t));
+  m.shares.forEach(t => xs.add(t));
+  xs.add(x2);
+  const x = [...xs].sort((a, b) => a - b);
+  const idx = new Map(x.map((v, i) => [v, i]));
+  const diff = Array(x.length).fill(null);
+  hist.forEach(([t, d]) => { diff[idx.get(t)] = d; });
+  diff[idx.get(x2)] = hist.at(-1)[1];
+  const fire = Array(x.length).fill(null);
+  // Every real history point is a vardiff firing; once the window has slid
+  // past the origin, index 0 is the synthetic held entry point, not a fire.
+  hist.forEach(([t, d], i) => { if (!(i === 0 && hasSynthetic)) fire[idx.get(t)] = d; });
+  const rug = Array(x.length).fill(null);
+  m.shares.forEach(t => { rug[idx.get(t)] = 0.5; });
+  return [x, diff, fire, rug];
+}
 
-  const x1 = Math.max(0, data.elapsed_secs - data.window_secs);
-  const x2 = Math.max(data.elapsed_secs, x1 + 1);
-  const pts = m.difficulty_history.concat([[x2, m.difficulty_history.at(-1)[1]]]);
-  const yMax = Math.max(...pts.map(p => p[1])) * 1.1 || 1;
-  const X = t => PAD + (t - x1) / (x2 - x1) * (W - PAD - 8);
-  const Y = d => H - 20 - d / yMax * (H - 34);
-
-  // axes labels
-  ctx.fillStyle = '#8b949e'; ctx.font = '13px monospace';
-  ctx.fillText(`${x1.toFixed(0)}s`, PAD, H - 5);
-  ctx.fillText(`${x2.toFixed(0)}s`, W - 60, H - 5);
-  ctx.fillText(yMax.toExponential(2), 2, 16);
-
-  // share rug
-  ctx.fillStyle = '#484f58';
-  for (const t of m.shares) ctx.fillRect(X(t), H - 26, 2, 6);
-
-  // hashrate change markers
-  for (const [t, from, to] of m.hashrate_changes) {
+function drawChangeLines(u) {
+  const ctx = u.ctx;
+  ctx.save();
+  ctx.lineWidth = 1.5;
+  for (const [t, from, to] of changes) {
+    const x = u.valToPos(t, 'x', true);
+    if (x < u.bbox.left || x > u.bbox.left + u.bbox.width) continue;
     ctx.strokeStyle = to >= from ? '#3fb950' : '#f85149';
-    ctx.beginPath(); ctx.moveTo(X(t), 14); ctx.lineTo(X(t), H - 20); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(x, u.bbox.top);
+    ctx.lineTo(x, u.bbox.top + u.bbox.height);
+    ctx.stroke();
   }
+  ctx.restore();
+}
 
-  // difficulty step-line
-  ctx.strokeStyle = '#39c5cf'; ctx.lineWidth = 2; ctx.beginPath();
-  pts.forEach(([t, d], i) => {
-    const x = X(t), y = Y(d);
-    if (i === 0) ctx.moveTo(x, y);
-    else { ctx.lineTo(x, Y(pts[i-1][1])); ctx.lineTo(x, y); }
-  });
-  ctx.stroke(); ctx.lineWidth = 1;
+function makeChart(data) {
+  const el = document.getElementById('chart');
+  el.innerHTML = '';
+  const opts = {
+    width: el.parentElement.clientWidth - 16,
+    height: 320,
+    scales: { x: { time: false }, y: {}, r: { range: [0, 12] } },
+    series: [
+      { label: 't', value: (u, v) => v == null ? '' : v.toFixed(1) + 's' },
+      { label: 'difficulty', stroke: '#39c5cf', width: 2, spanGaps: true,
+        paths: uPlot.paths.stepped({align: 1}), points: {show: false},
+        value: (u, v) => v == null ? '—' : v.toFixed(2) },
+      { label: 'vardiff fired', stroke: '#d2a8ff', paths: () => null,
+        points: {show: true, size: 8, fill: '#d2a8ff'},
+        value: (u, v) => v == null ? '—' : 'diff → ' + v.toFixed(2) },
+      { label: 'share', scale: 'r', stroke: '#6e7681', paths: () => null,
+        points: {show: true, size: 4, fill: '#6e7681'},
+        value: (u, v) => v == null ? '—' : '●' },
+    ],
+    axes: [
+      { stroke: '#8b949e', grid: {stroke: '#21262d'}, ticks: {stroke: '#21262d'},
+        values: (u, vals) => vals.map(v => v.toFixed(0) + 's') },
+      { stroke: '#8b949e', grid: {stroke: '#21262d'}, ticks: {stroke: '#21262d'}, size: 76 },
+    ],
+    cursor: { drag: { x: true, y: false } },
+    hooks: {
+      draw: [drawChangeLines],
+      setSelect: [u => { if (u.select.width > 0 && live) toggleLive(); }],
+    },
+  };
+  chart = new uPlot(opts, data, el);
+}
 
-  // vardiff fire dots (skip the synthetic entry point at the window edge)
-  ctx.fillStyle = '#d2a8ff';
-  for (const [t, d] of m.difficulty_history) {
-    if (t <= x1) continue;
-    ctx.beginPath(); ctx.arc(X(t), Y(d), 3.5, 0, 7); ctx.fill();
+function updateChart(data) {
+  const m = data.miners.find(m => m.name === selected);
+  if (!m) return;
+  const d = buildData(m, data.elapsed_secs, data.elapsed_secs > data.window_secs);
+  if (!d) return;
+  changes = m.hashrate_changes;
+  if (!chart || chartMiner !== selected) {
+    chartMiner = selected;
+    makeChart(d);
+  } else {
+    chart.setData(d);
   }
 }
+
+window.addEventListener('resize', () => {
+  if (chart) chart.setSize({width: document.getElementById('chartwrap').clientWidth - 16, height: 320});
+});
 
 async function tick() {
   try {
-    const r = await fetch('/api/stats');
+    const r = await fetch('/api/stats', {headers: AUTH});
+    if (r.status === 401) {
+      document.getElementById('meta').textContent = 'unauthorized — open the URL printed by vardiff-sim (includes ?token=)';
+      return;
+    }
     render(await r.json());
   } catch (e) {
     document.getElementById('meta').textContent = 'disconnected';

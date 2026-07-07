@@ -133,6 +133,11 @@ struct Args {
     #[arg(long)]
     http: Option<SocketAddr>,
 
+    /// Access token for the dashboard and API. Generated (and printed) if
+    /// not provided.
+    #[arg(long)]
+    http_token: Option<String>,
+
     /// Sim clock speed factor (e.g. 8 = one wall second counts as eight
     /// simulated seconds). Requires --spawn-pool: the pool's vardiff clock
     /// must live in this process to stay consistent. In the TUI, 1 and 2
@@ -274,11 +279,17 @@ async fn main() {
     let shutdown_signal = spawn_signal_listener();
 
     if let Some(addr) = args.http {
+        let token = args.http_token.clone().unwrap_or_else(|| {
+            use rand::Rng;
+            let mut rng = rand::thread_rng();
+            (0..32).map(|_| format!("{:x}", rng.gen_range(0..16u8))).collect()
+        });
         tokio::spawn(http::serve(
             addr,
             http::HttpState {
                 engine: engine.clone(),
                 speed_control: args.spawn_pool,
+                token,
             },
         ));
     }

@@ -10,9 +10,10 @@
 use std::sync::{Arc, Mutex};
 
 use axum::{
-    extract::{Path, State},
-    http::StatusCode,
-    response::Html,
+    extract::{Path, Request, State},
+    http::{header, StatusCode},
+    middleware::{self, Next},
+    response::{Html, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -29,6 +30,53 @@ pub struct HttpState {
     pub engine: SharedEngine,
     /// Speed control only makes sense with an embedded pool.
     pub speed_control: bool,
+    /// Required on every request (Bearer header or ?token= query) except
+    /// the static chart-library assets.
+    pub token: String,
+}
+
+/// Accepts `Authorization: Bearer <token>` or `?token=<token>`; the vendored
+/// chart-library assets are public (static third-party code, nothing to
+/// protect). Comparison is not constant-time; this guards a lab dashboard,
+/// not production credentials.
+async fn auth(State(st): State<HttpState>, req: Request, next: Next) -> Result<Response, StatusCode> {
+    if req.uri().path().starts_with("/assets/") {
+        return Ok(next.run(req).await);
+    }
+    let bearer_ok = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|t| t == st.token)
+        .unwrap_or(false);
+    let query_ok = req
+        .uri()
+        .query()
+        .map(|q| {
+            q.split('&')
+                .any(|kv| kv.strip_prefix("token=") == Some(st.token.as_str()))
+        })
+        .unwrap_or(false);
+    if bearer_ok || query_ok {
+        Ok(next.run(req).await)
+    } else {
+        Err(StatusCode::UNAUTHORIZED)
+    }
+}
+
+async fn uplot_js() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "application/javascript")],
+        include_str!("assets/uplot.min.js"),
+    )
+}
+
+async fn uplot_css() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/css")],
+        include_str!("assets/uplot.min.css"),
+    )
 }
 
 #[derive(Serialize)]
@@ -222,6 +270,8 @@ async fn set_speed(State(st): State<HttpState>, Json(body): Json<SpeedBody>) -> 
 pub fn router(state: HttpState) -> Router {
     Router::new()
         .route("/", get(index))
+        .route("/assets/uplot.js", get(uplot_js))
+        .route("/assets/uplot.css", get(uplot_css))
         .route("/api/stats", get(stats))
         .route("/api/miners", post(add_miner))
         .route("/api/miners/:name/hashrate", post(set_hashrate))
@@ -229,6 +279,7 @@ pub fn router(state: HttpState) -> Router {
         .route("/api/miners/:name/reconnect", post(reconnect))
         .route("/api/miners/:name/remove", post(remove))
         .route("/api/speed", post(set_speed))
+        .layer(middleware::from_fn_with_state(state.clone(), auth))
         .with_state(state)
 }
 
@@ -241,7 +292,7 @@ pub async fn serve(addr: std::net::SocketAddr, state: HttpState) {
             return;
         }
     };
-    eprintln!("dashboard: http://{addr}/");
+    eprintln!("dashboard: http://{addr}/?token={}", state.token);
     if let Err(e) = axum::serve(listener, router(state)).await {
         eprintln!("http server error: {e}");
     }
