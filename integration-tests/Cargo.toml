@@ -81,5 +81,3 @@ harness = false
 name = "mining_device_scaling_bench"
 harness = false
 
-[patch."https://github.com/stratum-mining/stratum"]
-stratum-core = { path = "../../stratum-vardiff/stratum-core" }

@@ -14,5 +14,3 @@ opt-level = 1
 # Required by super_safe_lock
 opt-level = 1
 
-[patch."https://github.com/stratum-mining/stratum"]
-stratum-core = { path = "../../stratum-vardiff/stratum-core" }
