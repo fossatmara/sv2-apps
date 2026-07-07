@@ -122,11 +122,19 @@ async fn index() -> Html<&'static str> {
     Html(include_str!("dashboard.html"))
 }
 
-fn build_snapshot(st: &HttpState) -> StatsSnapshot {
+/// `full` disables the sliding window for the difficulty/marker series
+/// (capped to the most recent points as a safety bound); the share rug stays
+/// windowed — it is only legible zoomed-in and dominates payload size.
+fn build_snapshot(st: &HttpState, full: bool) -> StatsSnapshot {
+    const FULL_HISTORY_CAP: usize = 10_000;
     let engine = st.engine.lock().expect("engine lock");
     let elapsed = engine.elapsed_secs();
     let window = WINDOW_BASE_SECS * engine.speed();
-    let from = (elapsed - window).max(0.0);
+    let from = if full {
+        0.0
+    } else {
+        (elapsed - window).max(0.0)
+    };
     let miners = engine
         .miner_names()
         .into_iter()
@@ -144,6 +152,9 @@ fn build_snapshot(st: &HttpState) -> StatsSnapshot {
                 history.push((from, held));
             }
             history.extend(s.difficulty_history.iter().filter(|(t, _)| *t >= from));
+            if history.len() > FULL_HISTORY_CAP {
+                history.drain(..history.len() - FULL_HISTORY_CAP);
+            }
             MinerSnapshot {
                 connected: s.connected,
                 hashrate: s.hashrate,
@@ -177,8 +188,17 @@ fn build_snapshot(st: &HttpState) -> StatsSnapshot {
     }
 }
 
-async fn stats(State(st): State<HttpState>) -> Json<StatsSnapshot> {
-    Json(build_snapshot(&st))
+#[derive(Deserialize, Default)]
+struct StatsParams {
+    #[serde(default)]
+    full: Option<u8>,
+}
+
+async fn stats(
+    State(st): State<HttpState>,
+    axum::extract::Query(params): axum::extract::Query<StatsParams>,
+) -> Json<StatsSnapshot> {
+    Json(build_snapshot(&st, params.full.unwrap_or(0) != 0))
 }
 
 async fn ws_upgrade(State(st): State<HttpState>, ws: WebSocketUpgrade) -> Response {
@@ -194,7 +214,7 @@ async fn ws_stream(mut socket: WebSocket, st: HttpState) {
         .expect("engine lock")
         .change_notifier();
     loop {
-        let json = match serde_json::to_string(&build_snapshot(&st)) {
+        let json = match serde_json::to_string(&build_snapshot(&st, false)) {
             Ok(j) => j,
             Err(_) => return,
         };

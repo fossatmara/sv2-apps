@@ -56,6 +56,7 @@
   <input id="addhash" placeholder="hashrate H/s" value="100e12">
   <button onclick="addMiner()">add miner</button>
   <span style="flex:1"></span>
+  <button id="full" onclick="toggleFull()">full history</button>
   <button id="live" class="on" onclick="toggleLive()">live</button>
 </div>
 
@@ -97,7 +98,41 @@ function addMiner() {
 function toggleLive() {
   live = !live;
   document.getElementById('live').classList.toggle('on', live);
-  if (live && last) updateChart(last);
+  if (live && last) refreshChart();
+}
+
+let fullMode = false;
+let fullTimer = null;
+let lastFull = null;
+async function fetchFull() {
+  try {
+    const r = await fetch('/api/stats?full=1', {headers: AUTH});
+    if (r.ok) {
+      lastFull = await r.json();
+      if (live) updateChart(lastFull, true);
+    }
+  } catch (e) {}
+}
+function toggleFull() {
+  fullMode = !fullMode;
+  document.getElementById('full').classList.toggle('on', fullMode);
+  chartMiner = null; // force chart rebuild for the new x-range
+  if (fullMode) {
+    fetchFull();
+    fullTimer = setInterval(fetchFull, 3000);
+  } else {
+    clearInterval(fullTimer);
+    fullTimer = null;
+    if (last) refreshChart();
+  }
+}
+/// Chart from the right source for the current mode.
+function refreshChart() {
+  if (fullMode) {
+    if (lastFull) updateChart(lastFull, true);
+  } else if (last) {
+    updateChart(last, false);
+  }
 }
 
 function render(data) {
@@ -115,7 +150,7 @@ function render(data) {
     const tr = document.createElement('tr');
     if (m.name === selected) tr.classList.add('sel');
     if (!m.connected) tr.classList.add('down');
-    tr.onclick = () => { selected = m.name; render(last); };
+    tr.onclick = () => { selected = m.name; chartMiner = null; render(last); refreshChart(); };
     tr.innerHTML = `<td>${m.name}</td><td>${m.connected ? 'up' : 'down'}</td>` +
       `<td>${fmtHash(m.hashrate)}</td><td>${m.difficulty.toFixed(2)}</td>` +
       `<td>${m.expected_spm.toFixed(2)}</td><td>${m.realized_spm.toFixed(2)}</td>` +
@@ -127,7 +162,7 @@ function render(data) {
       `<button onclick="event.stopPropagation();act('${m.name}','remove')">✕</button></td>`;
     tb.appendChild(tr);
   }
-  if (live) updateChart(data);
+  if (live && !fullMode) updateChart(data, false);
 }
 
 // Merge the event-based series onto one x axis (uPlot needs aligned arrays).
@@ -201,10 +236,11 @@ function makeChart(data) {
   chart = new uPlot(opts, data, el);
 }
 
-function updateChart(data) {
+function updateChart(data, full) {
   const m = data.miners.find(m => m.name === selected);
   if (!m) return;
-  const d = buildData(m, data.elapsed_secs, data.elapsed_secs > data.window_secs);
+  const hasSynthetic = !full && data.elapsed_secs > data.window_secs;
+  const d = buildData(m, data.elapsed_secs, hasSynthetic);
   if (!d) return;
   changes = m.hashrate_changes;
   if (!chart || chartMiner !== selected) {
