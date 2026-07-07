@@ -40,11 +40,12 @@ struct Args {
     #[arg(long)]
     spawn_pool: bool,
 
-    /// shares_per_minute for the spawned pool (vardiff setpoint). The
-    /// interactive default is high so each vardiff window carries enough
-    /// shares to react quickly; use production-like values (e.g. 6) when
-    /// testing that regime deliberately.
-    #[arg(long, default_value_t = 60.0)]
+    /// shares_per_minute for the spawned pool (vardiff setpoint).
+    /// Production-like default: share-driven evaluation with evidence
+    /// gating no longer needs a high rate to be responsive, so the sim
+    /// mirrors the statistics a real pool sees. Raise it (e.g. 60) when you
+    /// deliberately want dense windows.
+    #[arg(long, default_value_t = 4.0)]
     shares_per_minute: f32,
 
     /// Idle-backstop interval (seconds). Difficulty adjusts share-driven;
