@@ -75,6 +75,9 @@ pub enum VardiffAlgorithm {
     Classic,
     /// Log-space PID controller.
     Pid,
+    /// PID with Q-learning gain scheduling (shared table per pool).
+    #[serde(rename = "qpid")]
+    QPid,
 }
 
 /// Vardiff algorithm configuration (`[vardiff]` section).
@@ -97,11 +100,17 @@ pub struct VardiffConfig {
     pub significance_z: f64,
     /// Back-calculation anti-windup tracking time constant in seconds.
     pub tracking_secs: f64,
+    /// Q-learning rate (qpid only).
+    pub alpha: f64,
+    /// Q-learning discount factor (qpid only).
+    pub gamma: f64,
+    /// Q-learning exploration rate (qpid only).
+    pub epsilon: f64,
 }
 
 impl Default for VardiffConfig {
     fn default() -> Self {
-        use stratum_apps::stratum_core::channels_sv2::vardiff::pid;
+        use stratum_apps::stratum_core::channels_sv2::vardiff::{pid, qpid};
         Self {
             algorithm: VardiffAlgorithm::default(),
             kp: pid::DEFAULT_KP,
@@ -111,37 +120,13 @@ impl Default for VardiffConfig {
             deadband: pid::DEFAULT_DEADBAND,
             significance_z: pid::DEFAULT_SIGNIFICANCE_Z,
             tracking_secs: pid::DEFAULT_TRACKING_SECS,
+            alpha: qpid::DEFAULT_ALPHA,
+            gamma: qpid::DEFAULT_GAMMA,
+            epsilon: qpid::DEFAULT_EPSILON,
         }
     }
 }
 
-impl VardiffConfig {
-    /// Instantiates the configured vardiff controller for one channel.
-    pub fn build(
-        &self,
-    ) -> Result<
-        Box<dyn stratum_apps::stratum_core::channels_sv2::Vardiff>,
-        stratum_apps::stratum_core::channels_sv2::vardiff::error::VardiffError,
-    > {
-        use stratum_apps::stratum_core::channels_sv2::{PidParams, PidVardiffState, VardiffState};
-        match self.algorithm {
-            VardiffAlgorithm::Classic => Ok(Box::new(VardiffState::new()?)),
-            VardiffAlgorithm::Pid => {
-                let params = PidParams {
-                    kp: self.kp,
-                    ki: self.ki,
-                    kd: self.kd,
-                    max_step: self.max_step,
-                    deadband: self.deadband,
-                    significance_z: self.significance_z,
-                    tracking_secs: self.tracking_secs,
-                    ..PidParams::default()
-                };
-                Ok(Box::new(PidVardiffState::with_params(params)?))
-            }
-        }
-    }
-}
 
 impl PoolConfig {
     /// Creates a new instance of the [`PoolConfig`].

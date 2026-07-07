@@ -54,7 +54,7 @@ struct Args {
     #[arg(long, default_value_t = 20)]
     vardiff_interval: u64,
 
-    /// Vardiff algorithm for the spawned pool: "classic" or "pid".
+    /// Vardiff algorithm for the spawned pool: "classic", "pid" or "qpid".
     #[arg(long, default_value = "classic")]
     algorithm: String,
 
@@ -85,6 +85,18 @@ struct Args {
     /// Anti-windup tracking time constant in seconds (pid only).
     #[arg(long)]
     tracking_secs: Option<f64>,
+
+    /// Q-learning rate (qpid only).
+    #[arg(long)]
+    q_alpha: Option<f64>,
+
+    /// Q-learning discount factor (qpid only).
+    #[arg(long)]
+    q_gamma: Option<f64>,
+
+    /// Q-learning exploration rate (qpid only).
+    #[arg(long)]
+    q_epsilon: Option<f64>,
 
     /// Scenario file (TOML). Required in headless mode.
     #[arg(long)]
@@ -161,8 +173,9 @@ async fn main() {
         let algorithm = match args.algorithm.as_str() {
             "classic" => pool_sv2::config::VardiffAlgorithm::Classic,
             "pid" => pool_sv2::config::VardiffAlgorithm::Pid,
+            "qpid" => pool_sv2::config::VardiffAlgorithm::QPid,
             other => {
-                eprintln!("error: unknown --algorithm '{other}' (use classic or pid)");
+                eprintln!("error: unknown --algorithm '{other}' (use classic, pid or qpid)");
                 std::process::exit(1);
             }
         };
@@ -190,6 +203,15 @@ async fn main() {
         }
         if let Some(v) = args.tracking_secs {
             vardiff.tracking_secs = v;
+        }
+        if let Some(v) = args.q_alpha {
+            vardiff.alpha = v;
+        }
+        if let Some(v) = args.q_gamma {
+            vardiff.gamma = v;
+        }
+        if let Some(v) = args.q_epsilon {
+            vardiff.epsilon = v;
         }
         eprintln!(
             "starting regtest template provider + pool (ignore_share_validation=true, vardiff={})...",

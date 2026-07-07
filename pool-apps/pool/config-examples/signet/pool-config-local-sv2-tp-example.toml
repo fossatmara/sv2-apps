@@ -44,10 +44,13 @@ address = "127.0.0.1:38442"
 # Vardiff algorithm selection and tuning. Defaults to the classic
 # threshold controller; "pid" is a log-space PID controller.
 # [vardiff]
-# algorithm = "pid"   # "classic" (default) or "pid"
+# algorithm = "pid"   # "classic" (default), "pid", or "qpid" (PID + Q-learning gains)
 # kp = 0.6            # proportional gain on log-space rate error
 # ki = 0.005          # integral gain per second
 # kd = 0.0            # derivative gain (off by default)
 # max_step = 8.0      # largest multiplicative difficulty change per update
 # deadband = 0.1      # I-term pressure needed to emit without a significant window
 # significance_z = 2.0 # single-window statistical significance gate (sigmas)
+# alpha = 0.15         # qpid: Q-learning rate
+# gamma = 0.7          # qpid: discount factor
+# epsilon = 0.1        # qpid: exploration rate

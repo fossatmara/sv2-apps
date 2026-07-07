@@ -118,8 +118,66 @@ pub struct ChannelManager {
     ignore_share_validation: bool,
     /// How often the vardiff loop re-evaluates every channel's difficulty.
     vardiff_interval_secs: u64,
-    /// Which vardiff algorithm new channels get, and its tuning.
-    vardiff_config: crate::config::VardiffConfig,
+    /// Builds the configured vardiff controller for new channels.
+    vardiff_factory: VardiffFactory,
+}
+
+/// Builds vardiff controllers per the pool's `[vardiff]` config. For the
+/// qpid algorithm it owns the pool-wide Q-table every channel shares, so the
+/// whole fleet trains a single gain-scheduling policy.
+#[derive(Clone)]
+pub(crate) struct VardiffFactory {
+    config: crate::config::VardiffConfig,
+    qtable: Option<stratum_apps::stratum_core::channels_sv2::SharedQTable>,
+}
+
+impl VardiffFactory {
+    fn new(config: crate::config::VardiffConfig) -> Self {
+        use stratum_apps::stratum_core::channels_sv2::QTable;
+        let qtable = matches!(config.algorithm, crate::config::VardiffAlgorithm::QPid)
+            .then(|| std::sync::Arc::new(std::sync::Mutex::new(QTable::new())));
+        Self { config, qtable }
+    }
+
+    pub(crate) fn build(
+        &self,
+    ) -> Result<
+        Box<dyn Vardiff>,
+        stratum_apps::stratum_core::channels_sv2::vardiff::error::VardiffError,
+    > {
+        use crate::config::VardiffAlgorithm;
+        use stratum_apps::stratum_core::channels_sv2::{
+            PidParams, PidVardiffState, QPidParams, QPidVardiffState, VardiffState,
+        };
+        let pid_params = PidParams {
+            kp: self.config.kp,
+            ki: self.config.ki,
+            kd: self.config.kd,
+            max_step: self.config.max_step,
+            deadband: self.config.deadband,
+            significance_z: self.config.significance_z,
+            tracking_secs: self.config.tracking_secs,
+            ..PidParams::default()
+        };
+        match self.config.algorithm {
+            VardiffAlgorithm::Classic => Ok(Box::new(VardiffState::new()?)),
+            VardiffAlgorithm::Pid => Ok(Box::new(PidVardiffState::with_params(pid_params)?)),
+            VardiffAlgorithm::QPid => {
+                let table = self
+                    .qtable
+                    .clone()
+                    .expect("factory for qpid always holds a table");
+                let q_params = QPidParams {
+                    alpha: self.config.alpha,
+                    gamma: self.config.gamma,
+                    epsilon: self.config.epsilon,
+                };
+                Ok(Box::new(QPidVardiffState::with_params(
+                    table, q_params, pid_params,
+                )?))
+            }
+        }
+    }
 }
 
 #[cfg_attr(not(test), hotpath::measure_all)]
@@ -203,7 +261,7 @@ impl ChannelManager {
             job_declarator,
             ignore_share_validation: config.ignore_share_validation(),
             vardiff_interval_secs: config.vardiff_interval_secs(),
-            vardiff_config: config.vardiff(),
+            vardiff_factory: VardiffFactory::new(config.vardiff()),
         };
 
         Ok(channel_manager)
