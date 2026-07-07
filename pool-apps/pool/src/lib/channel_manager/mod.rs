@@ -588,10 +588,13 @@ impl ChannelManager {
         vardiff_state: &mut Box<dyn Vardiff>,
         updates: &mut Vec<RouteMessageTo>,
     ) {
-        let (hashrate, target, shares_per_minute) = (
+        let shares_per_minute = Self::effective_spm(channel_state.get_shares_per_minute());
+        // Keep the channel's baked setpoint in sync so update_channel's
+        // hashrate-to-target conversion matches what vardiff optimized.
+        channel_state.set_shares_per_minute(shares_per_minute);
+        let (hashrate, target) = (
             channel_state.get_nominal_hashrate(),
             channel_state.get_target(),
-            channel_state.get_shares_per_minute(),
         );
 
         let Ok(new_hashrate_opt) = vardiff_state.try_vardiff(hashrate, target, shares_per_minute)
@@ -628,6 +631,14 @@ impl ChannelManager {
         }
     }
 
+    // The live setpoint override (UI-tunable in simulators) wins over the
+    // configured/baked value.
+    fn effective_spm(configured: f32) -> f32 {
+        stratum_apps::stratum_core::channels_sv2::vardiff::tuning::shares_per_minute_override()
+            .map(|v| v as f32)
+            .unwrap_or(configured)
+    }
+
     // Runs the vardiff on the standard channel.
     fn run_vardiff_on_standard_channel(
         downstream_id: DownstreamId,
@@ -636,9 +647,10 @@ impl ChannelManager {
         vardiff_state: &mut Box<dyn Vardiff>,
         updates: &mut Vec<RouteMessageTo>,
     ) {
+        let shares_per_minute = Self::effective_spm(channel.get_shares_per_minute());
+        channel.set_shares_per_minute(shares_per_minute);
         let hashrate = channel.get_nominal_hashrate();
         let target = channel.get_target();
-        let shares_per_minute = channel.get_shares_per_minute();
 
         let Ok(new_hashrate_opt) = vardiff_state.try_vardiff(hashrate, target, shares_per_minute)
         else {

@@ -190,7 +190,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                     requested_max_target,
                     nominal_hash_rate,
                     self.share_batch_size,
-                    self.shares_per_minute,
+                    Self::effective_spm(self.shares_per_minute),
                     self.pool_tag_string.clone(),
                 ) {
                     Ok(channel) => channel,
@@ -428,7 +428,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                     true, // version rolling always allowed
                     CLIENT_SEARCH_SPACE_BYTES as u16,
                     self.share_batch_size,
-                    self.shares_per_minute,
+                    Self::effective_spm(self.shares_per_minute),
                     self.pool_tag_string.clone(),
                 ) {
                     Ok(channel) => channel,

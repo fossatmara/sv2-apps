@@ -119,6 +119,7 @@ struct StatsSnapshot {
     elapsed_secs: f64,
     speed: f64,
     speed_control: bool,
+    setpoint_spm: f64,
     confidence_k: f64,
     significance_z: f64,
     significance_z_down: f64,
@@ -206,6 +207,7 @@ fn build_snapshot(st: &HttpState, full: bool) -> StatsSnapshot {
         elapsed_secs: elapsed,
         speed: engine.speed(),
         speed_control: st.speed_control,
+        setpoint_spm: engine.setpoint_spm(),
         confidence_k: engine.confidence_k(),
         significance_z: engine.significance_z(),
         significance_z_down: engine.significance_z_down(),
@@ -277,6 +279,11 @@ struct SpeedBody {
 #[derive(Deserialize)]
 struct ConfidenceBody {
     k: f64,
+}
+
+#[derive(Deserialize)]
+struct SpmBody {
+    spm: f64,
 }
 
 #[derive(Deserialize)]
@@ -389,6 +396,20 @@ async fn set_confidence(State(st): State<HttpState>, Json(body): Json<Confidence
     StatusCode::NO_CONTENT
 }
 
+async fn set_spm(State(st): State<HttpState>, Json(body): Json<SpmBody>) -> StatusCode {
+    if !st.speed_control {
+        return StatusCode::FORBIDDEN;
+    }
+    if !body.spm.is_finite() || body.spm <= 0.0 {
+        return StatusCode::BAD_REQUEST;
+    }
+    st.engine
+        .lock()
+        .expect("engine lock")
+        .set_setpoint_spm(body.spm);
+    StatusCode::NO_CONTENT
+}
+
 async fn set_significance(
     State(st): State<HttpState>,
     Json(body): Json<SignificanceBody>,
@@ -423,6 +444,7 @@ pub fn router(state: HttpState) -> Router {
         .route("/api/speed", post(set_speed))
         .route("/api/confidence", post(set_confidence))
         .route("/api/significance", post(set_significance))
+        .route("/api/spm", post(set_spm))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
         .with_state(state)
 }

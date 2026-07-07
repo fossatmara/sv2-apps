@@ -85,6 +85,18 @@ pub fn set_significance_z_down(z: f64) {
     stratum_apps::stratum_core::channels_sv2::vardiff::tuning::set_significance_z_down(z)
 }
 
+/// Current vardiff setpoint in shares per minute (the live override; primed
+/// by the sim CLI at startup so it is always set in simulator processes).
+pub fn setpoint_spm() -> f64 {
+    stratum_apps::stratum_core::channels_sv2::vardiff::tuning::shares_per_minute_override()
+        .unwrap_or(4.0)
+}
+
+/// Sets the live vardiff setpoint (shares per minute).
+pub fn set_setpoint_spm(spm: f64) {
+    stratum_apps::stratum_core::channels_sv2::vardiff::tuning::set_shares_per_minute(spm)
+}
+
 /// Current controller gains (kp, ki, kd) for a miner's channel, published by
 /// the embedded pool's pid/qpid controller under the miner's user identity.
 pub fn controller_gains(name: &str) -> Option<(f64, f64, f64)> {

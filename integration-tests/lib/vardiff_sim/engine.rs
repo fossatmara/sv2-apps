@@ -158,6 +158,17 @@ impl SimEngine {
         }
     }
 
+    /// Current vardiff setpoint (shares per minute).
+    pub fn setpoint_spm(&self) -> f64 {
+        super::setpoint_spm()
+    }
+
+    /// Sets the vardiff setpoint (embedded pool only).
+    pub fn set_setpoint_spm(&mut self, spm: f64) {
+        super::set_setpoint_spm(spm);
+        self.changed.notify_waiters();
+    }
+
     /// Current PID confidence shrinkage constant K.
     pub fn confidence_k(&self) -> f64 {
         super::confidence_k()

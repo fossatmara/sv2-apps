@@ -40,6 +40,10 @@
   speed: <b id="speed">1</b>x
   <button onclick="setSpeed(0.5)">÷2</button>
   <button onclick="setSpeed(2)">×2</button>
+  <span style="width:1rem"></span>
+  spm: <b id="spm">4</b>
+  <button onclick="setSpm(0.5)">÷2</button>
+  <button onclick="setSpm(2)">×2</button>
   <span style="width:1.5rem"></span>
   confidence K: <b id="confk">2</b>
   <button onclick="setConfK(0.5)">÷2</button>
@@ -98,6 +102,9 @@ async function post(path, body) {
                      body: body ? JSON.stringify(body) : '{}'});
 }
 function setSpeed(mul) { if (last) post('/api/speed', {speed: last.speed * mul}); }
+function setSpm(mul) {
+  if (last) post('/api/spm', {spm: Math.max(0.5, last.setpoint_spm * mul)});
+}
 function setConfK(mul) {
   if (last) post('/api/confidence', {k: Math.max(0.25, last.confidence_k * mul)});
 }
@@ -171,6 +178,7 @@ function render(data) {
   const sb = document.getElementById('speedbar');
   sb.style.display = data.speed_control ? 'flex' : 'none';
   document.getElementById('speed').textContent = data.speed.toFixed(2);
+  document.getElementById('spm').textContent = data.setpoint_spm.toFixed(1);
   document.getElementById('confk').textContent = data.confidence_k.toFixed(2);
   document.getElementById('sigz').textContent = data.significance_z.toFixed(1);
   document.getElementById('sigzd').textContent = data.significance_z_down.toFixed(1);

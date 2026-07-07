@@ -196,6 +196,9 @@ async fn main() {
         })
     });
 
+    // The setpoint is always primed so UIs (and the pool's effective-spm
+    // reads) start from the CLI value.
+    integration_tests_sv2::vardiff_sim::set_setpoint_spm(args.shares_per_minute as f64);
     if let Some(k) = args.confidence_k {
         integration_tests_sv2::vardiff_sim::set_confidence_k(k);
     }

@@ -156,6 +156,14 @@ pub async fn run(
                         let z = eng.significance_z_down();
                         eng.set_significance_z_down(z + 0.5);
                     }
+                    KeyCode::Char('9') if speed_control => {
+                        let s = eng.setpoint_spm();
+                        eng.set_setpoint_spm(s / 2.0);
+                    }
+                    KeyCode::Char('0') if speed_control => {
+                        let s = eng.setpoint_spm();
+                        eng.set_setpoint_spm(s * 2.0);
+                    }
                     KeyCode::Char('e') => {
                         added += 1;
                         eng.spawn_miner(
@@ -270,9 +278,10 @@ fn draw(
         Constraint::Length(8),
     ];
     let title = format!(
-        " vardiff-sim | t={:.0}s | speed x{:.2} | conf-K={:.2} | Z↑={:.1} Z↓={:.1} | {} miners ",
+        " vardiff-sim | t={:.0}s | speed x{:.2} | spm={:.1} | conf-K={:.2} | Z↑={:.1} Z↓={:.1} | {} miners ",
         engine.elapsed_secs(),
         engine.speed(),
+        engine.setpoint_spm(),
         engine.confidence_k(),
         engine.significance_z(),
         engine.significance_z_down(),
@@ -443,7 +452,7 @@ fn draw(
 
     let help = if fleet_ready {
         Line::from(vec![Span::styled(
-            " z quit | w/s sel | a/d hashrate | f disc | r reconn | e add | q rm | 1/2 spd | 3/4 K | 5/6 Z↑ | 7/8 Z↓",
+            " z quit | w/s sel | a/d hash | f disc | r reconn | e add | q rm | 1/2 spd | 3/4 K | 5/6 Z↑ | 7/8 Z↓ | 9/0 spm",
             Style::default().fg(Color::DarkGray),
         )])
     } else {
