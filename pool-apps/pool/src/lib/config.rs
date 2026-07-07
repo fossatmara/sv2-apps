@@ -64,9 +64,9 @@ pub struct PoolConfig {
 
 fn default_vardiff_interval_secs() -> u64 {
     // The backstop only rescues silent channels (difficulty adjusts
-    // share-driven otherwise); 30s keeps drop-detection latency low at
-    // negligible evaluation cost.
-    30
+    // share-driven otherwise), and its statistical gates make premature
+    // ticks a no-op — the frequency is purely a notice-latency knob.
+    10
 }
 
 /// Vardiff algorithm selection.
@@ -101,6 +101,9 @@ pub struct VardiffConfig {
     pub deadband: f64,
     /// Single-window significance threshold in sigmas (statistical deadband).
     pub significance_z: f64,
+    /// Significance threshold for downward corrections (capped at
+    /// `significance_z`); lower by design — see the pid module docs.
+    pub significance_z_down: f64,
     /// Back-calculation anti-windup tracking time constant in seconds.
     pub tracking_secs: f64,
     /// Q-learning rate (qpid only).
@@ -122,6 +125,7 @@ impl Default for VardiffConfig {
             max_step: pid::DEFAULT_MAX_STEP,
             deadband: pid::DEFAULT_DEADBAND,
             significance_z: pid::DEFAULT_SIGNIFICANCE_Z,
+            significance_z_down: pid::DEFAULT_SIGNIFICANCE_Z_DOWN,
             tracking_secs: pid::DEFAULT_TRACKING_SECS,
             alpha: qpid::DEFAULT_ALPHA,
             gamma: qpid::DEFAULT_GAMMA,

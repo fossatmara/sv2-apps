@@ -54,7 +54,7 @@ struct Args {
     /// this timer only rescues channels producing no shares (difficulty far
     /// too high). The classic algorithm additionally skips windows of 15s or
     /// less.
-    #[arg(long, default_value_t = 20)]
+    #[arg(long, default_value_t = 10)]
     vardiff_interval: u64,
 
     /// Vardiff algorithm for the spawned pool: "classic", "pid" or "qpid".
@@ -87,6 +87,11 @@ struct Args {
     /// Single-window significance threshold in sigmas (pid only).
     #[arg(long)]
     significance_z: Option<f64>,
+
+    /// Downward-correction significance threshold in sigmas (pid only;
+    /// capped at --significance-z).
+    #[arg(long)]
+    significance_z_down: Option<f64>,
 
     /// Anti-windup tracking time constant in seconds (pid only).
     #[arg(long)]
@@ -199,6 +204,9 @@ async fn main() {
         // the UI displays and adjusts from the real starting point.
         integration_tests_sv2::vardiff_sim::set_significance_z(z);
     }
+    if let Some(z) = args.significance_z_down {
+        integration_tests_sv2::vardiff_sim::set_significance_z_down(z);
+    }
 
     if let Some(addr) = args.hub {
         let mut child_args: Vec<String> = vec![
@@ -216,6 +224,7 @@ async fn main() {
             ("--tracking-secs", args.tracking_secs),
             ("--q-alpha", args.q_alpha), ("--q-gamma", args.q_gamma),
             ("--q-epsilon", args.q_epsilon), ("--confidence-k", args.confidence_k),
+            ("--significance-z-down", args.significance_z_down),
         ] {
             if let Some(v) = v {
                 child_args.push(flag.into());
@@ -278,6 +287,9 @@ async fn main() {
         }
         if let Some(v) = args.significance_z {
             vardiff.significance_z = v;
+        }
+        if let Some(v) = args.significance_z_down {
+            vardiff.significance_z_down = v;
         }
         if let Some(v) = args.tracking_secs {
             vardiff.tracking_secs = v;

@@ -116,6 +116,7 @@ struct StatsSnapshot {
     speed_control: bool,
     confidence_k: f64,
     significance_z: f64,
+    significance_z_down: f64,
     window_secs: f64,
     miners: Vec<MinerSnapshot>,
 }
@@ -187,6 +188,7 @@ fn build_snapshot(st: &HttpState, full: bool) -> StatsSnapshot {
         speed_control: st.speed_control,
         confidence_k: engine.confidence_k(),
         significance_z: engine.significance_z(),
+        significance_z_down: engine.significance_z_down(),
         window_secs: window,
         miners,
     }
@@ -260,6 +262,8 @@ struct ConfidenceBody {
 #[derive(Deserialize)]
 struct SignificanceBody {
     z: f64,
+    #[serde(default)]
+    down: bool,
 }
 
 #[derive(Deserialize, Default)]
@@ -375,10 +379,12 @@ async fn set_significance(
     if !body.z.is_finite() || body.z <= 0.0 {
         return StatusCode::BAD_REQUEST;
     }
-    st.engine
-        .lock()
-        .expect("engine lock")
-        .set_significance_z(body.z);
+    let mut engine = st.engine.lock().expect("engine lock");
+    if body.down {
+        engine.set_significance_z_down(body.z);
+    } else {
+        engine.set_significance_z(body.z);
+    }
     StatusCode::NO_CONTENT
 }
 

@@ -45,9 +45,13 @@
   <button onclick="setConfK(0.5)">÷2</button>
   <button onclick="setConfK(2)">×2</button>
   <span style="width:1.5rem"></span>
-  significance Z: <b id="sigz">3</b>σ
+  Z↑: <b id="sigz">2</b>σ
   <button onclick="setSigZ(-0.5)">−.5</button>
   <button onclick="setSigZ(0.5)">+.5</button>
+  <span style="width:1rem"></span>
+  Z↓: <b id="sigzd">1.5</b>σ
+  <button onclick="setSigZDown(-0.5)">−.5</button>
+  <button onclick="setSigZDown(0.5)">+.5</button>
 </div>
 
 <table id="miners">
@@ -98,6 +102,9 @@ function setConfK(mul) {
 }
 function setSigZ(delta) {
   if (last) post('/api/significance', {z: Math.max(0.5, last.significance_z + delta)});
+}
+function setSigZDown(delta) {
+  if (last) post('/api/significance', {z: Math.max(0.5, last.significance_z_down + delta), down: true});
 }
 function scale(name, mul) {
   const m = last.miners.find(m => m.name === name);
@@ -158,6 +165,7 @@ function render(data) {
   document.getElementById('speed').textContent = data.speed.toFixed(2);
   document.getElementById('confk').textContent = data.confidence_k.toFixed(2);
   document.getElementById('sigz').textContent = data.significance_z.toFixed(1);
+  document.getElementById('sigzd').textContent = data.significance_z_down.toFixed(1);
 
   if (!selected && data.miners.length) selected = data.miners[0].name;
   const tb = document.querySelector('#miners tbody');

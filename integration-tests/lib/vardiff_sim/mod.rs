@@ -72,6 +72,19 @@ pub fn set_significance_z(z: f64) {
     stratum_apps::stratum_core::channels_sv2::vardiff::tuning::set_significance_z(z)
 }
 
+/// Current downward significance threshold (override or default).
+pub fn significance_z_down() -> f64 {
+    stratum_apps::stratum_core::channels_sv2::vardiff::tuning::significance_z_down_override()
+        .unwrap_or(
+            stratum_apps::stratum_core::channels_sv2::vardiff::pid::DEFAULT_SIGNIFICANCE_Z_DOWN,
+        )
+}
+
+/// Sets the live downward significance override.
+pub fn set_significance_z_down(z: f64) {
+    stratum_apps::stratum_core::channels_sv2::vardiff::tuning::set_significance_z_down(z)
+}
+
 /// Events a miner task reports back to the engine.
 #[derive(Debug, Clone)]
 pub enum MinerEvent {

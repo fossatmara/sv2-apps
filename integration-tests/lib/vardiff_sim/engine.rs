@@ -159,6 +159,17 @@ impl SimEngine {
         self.changed.notify_waiters();
     }
 
+    /// Current downward significance threshold.
+    pub fn significance_z_down(&self) -> f64 {
+        super::significance_z_down()
+    }
+
+    /// Sets the downward significance threshold (embedded pool only).
+    pub fn set_significance_z_down(&mut self, z: f64) {
+        super::set_significance_z_down(z);
+        self.changed.notify_waiters();
+    }
+
     /// Changes the sim clock speed. Miners re-sample their share timers so
     /// deadlines scheduled at the old speed don't linger.
     pub fn set_speed(&mut self, speed: f64) {

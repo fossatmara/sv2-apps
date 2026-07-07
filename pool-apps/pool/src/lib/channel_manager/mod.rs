@@ -156,6 +156,7 @@ impl VardiffFactory {
             max_step: self.config.max_step,
             deadband: self.config.deadband,
             significance_z: self.config.significance_z,
+            significance_z_down: self.config.significance_z_down,
             tracking_secs: self.config.tracking_secs,
             ..PidParams::default()
         };
@@ -677,7 +678,7 @@ impl ChannelManager {
     //   backstop: a channel whose difficulty is far too high produces no
     //   shares, hence no share-driven evaluations, and only a timer can
     //   rescue it.
-    // - Executes the vardiff cycle every `vardiff_interval_secs` (default 30)
+    // - Executes the vardiff cycle every `vardiff_interval_secs` (default 10)
     //   for all downstreams.
     // - Delegates to [`Self::run_vardiff`] on each tick.
     //
