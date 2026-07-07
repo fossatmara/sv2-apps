@@ -3,8 +3,8 @@
 //! Keys: `z` quit, `w`/`s` (or arrows) select miner, `a`/`d` halve/double the
 //! selected miner's hashrate, `f` disconnect, `r` reconnect, `e` add a miner
 //! (100 TH/s), `q` remove the selected miner, `1`/`2` halve/double the sim
-//! clock speed, `3`/`4` halve/double the PID confidence constant K (both
-//! embedded pool only).
+//! clock speed, `3`/`4` halve/double the PID confidence constant K,
+//! `5`/`6` step the significance Z by 0.5 (all embedded pool only).
 
 use std::{
     io,
@@ -140,6 +140,14 @@ pub async fn run(
                         let k = eng.confidence_k();
                         eng.set_confidence_k((k * 2.0).max(0.5));
                     }
+                    KeyCode::Char('5') if speed_control => {
+                        let z = eng.significance_z();
+                        eng.set_significance_z(z - 0.5);
+                    }
+                    KeyCode::Char('6') if speed_control => {
+                        let z = eng.significance_z();
+                        eng.set_significance_z(z + 0.5);
+                    }
                     KeyCode::Char('e') => {
                         added += 1;
                         eng.spawn_miner(
@@ -254,10 +262,11 @@ fn draw(
         Constraint::Length(8),
     ];
     let title = format!(
-        " vardiff-sim | t={:.0}s | speed x{:.2} | conf-K={:.2} | {} miners ",
+        " vardiff-sim | t={:.0}s | speed x{:.2} | conf-K={:.2} | Z={:.1} | {} miners ",
         engine.elapsed_secs(),
         engine.speed(),
         engine.confidence_k(),
+        engine.significance_z(),
         names.len()
     );
     let table = Table::new(rows, widths)
@@ -420,7 +429,7 @@ fn draw(
 
     let help = if fleet_ready {
         Line::from(vec![Span::styled(
-            " z quit | w/s select | a/d hashrate | f disc | r reconn | e add | q remove | 1/2 speed | 3/4 conf-K",
+            " z quit | w/s sel | a/d hashrate | f disc | r reconn | e add | q rm | 1/2 speed | 3/4 K | 5/6 Z",
             Style::default().fg(Color::DarkGray),
         )])
     } else {

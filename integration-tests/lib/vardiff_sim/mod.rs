@@ -60,6 +60,18 @@ pub fn set_confidence_k(k: f64) {
     stratum_apps::stratum_core::channels_sv2::vardiff::tuning::set_confidence_k(k)
 }
 
+/// Current PID significance threshold Z (the live override, or the default
+/// when untouched).
+pub fn significance_z() -> f64 {
+    stratum_apps::stratum_core::channels_sv2::vardiff::tuning::significance_z_override()
+        .unwrap_or(stratum_apps::stratum_core::channels_sv2::vardiff::pid::DEFAULT_SIGNIFICANCE_Z)
+}
+
+/// Sets the live PID significance-Z override.
+pub fn set_significance_z(z: f64) {
+    stratum_apps::stratum_core::channels_sv2::vardiff::tuning::set_significance_z(z)
+}
+
 /// Events a miner task reports back to the engine.
 #[derive(Debug, Clone)]
 pub enum MinerEvent {

@@ -44,6 +44,10 @@
   confidence K: <b id="confk">2</b>
   <button onclick="setConfK(0.5)">÷2</button>
   <button onclick="setConfK(2)">×2</button>
+  <span style="width:1.5rem"></span>
+  significance Z: <b id="sigz">3</b>σ
+  <button onclick="setSigZ(-0.5)">−.5</button>
+  <button onclick="setSigZ(0.5)">+.5</button>
 </div>
 
 <table id="miners">
@@ -91,6 +95,9 @@ async function post(path, body) {
 function setSpeed(mul) { if (last) post('/api/speed', {speed: last.speed * mul}); }
 function setConfK(mul) {
   if (last) post('/api/confidence', {k: Math.max(0.25, last.confidence_k * mul)});
+}
+function setSigZ(delta) {
+  if (last) post('/api/significance', {z: Math.max(0.5, last.significance_z + delta)});
 }
 function scale(name, mul) {
   const m = last.miners.find(m => m.name === name);
@@ -150,6 +157,7 @@ function render(data) {
   sb.style.display = data.speed_control ? 'flex' : 'none';
   document.getElementById('speed').textContent = data.speed.toFixed(2);
   document.getElementById('confk').textContent = data.confidence_k.toFixed(2);
+  document.getElementById('sigz').textContent = data.significance_z.toFixed(1);
 
   if (!selected && data.miners.length) selected = data.miners[0].name;
   const tb = document.querySelector('#miners tbody');

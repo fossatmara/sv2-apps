@@ -148,6 +148,17 @@ impl SimEngine {
         self.changed.notify_waiters();
     }
 
+    /// Current PID significance threshold Z.
+    pub fn significance_z(&self) -> f64 {
+        super::significance_z()
+    }
+
+    /// Sets the PID significance threshold Z (embedded pool only).
+    pub fn set_significance_z(&mut self, z: f64) {
+        super::set_significance_z(z);
+        self.changed.notify_waiters();
+    }
+
     /// Changes the sim clock speed. Miners re-sample their share timers so
     /// deadlines scheduled at the old speed don't linger.
     pub fn set_speed(&mut self, speed: f64) {

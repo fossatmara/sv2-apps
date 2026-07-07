@@ -115,6 +115,7 @@ struct StatsSnapshot {
     speed: f64,
     speed_control: bool,
     confidence_k: f64,
+    significance_z: f64,
     window_secs: f64,
     miners: Vec<MinerSnapshot>,
 }
@@ -185,6 +186,7 @@ fn build_snapshot(st: &HttpState, full: bool) -> StatsSnapshot {
         speed: engine.speed(),
         speed_control: st.speed_control,
         confidence_k: engine.confidence_k(),
+        significance_z: engine.significance_z(),
         window_secs: window,
         miners,
     }
@@ -253,6 +255,11 @@ struct SpeedBody {
 #[derive(Deserialize)]
 struct ConfidenceBody {
     k: f64,
+}
+
+#[derive(Deserialize)]
+struct SignificanceBody {
+    z: f64,
 }
 
 #[derive(Deserialize, Default)]
@@ -358,6 +365,23 @@ async fn set_confidence(State(st): State<HttpState>, Json(body): Json<Confidence
     StatusCode::NO_CONTENT
 }
 
+async fn set_significance(
+    State(st): State<HttpState>,
+    Json(body): Json<SignificanceBody>,
+) -> StatusCode {
+    if !st.speed_control {
+        return StatusCode::FORBIDDEN;
+    }
+    if !body.z.is_finite() || body.z <= 0.0 {
+        return StatusCode::BAD_REQUEST;
+    }
+    st.engine
+        .lock()
+        .expect("engine lock")
+        .set_significance_z(body.z);
+    StatusCode::NO_CONTENT
+}
+
 pub fn router(state: HttpState) -> Router {
     Router::new()
         .route("/", get(index))
@@ -372,6 +396,7 @@ pub fn router(state: HttpState) -> Router {
         .route("/api/miners/:name/remove", post(remove))
         .route("/api/speed", post(set_speed))
         .route("/api/confidence", post(set_confidence))
+        .route("/api/significance", post(set_significance))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
         .with_state(state)
 }

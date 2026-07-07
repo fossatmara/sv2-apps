@@ -194,6 +194,11 @@ async fn main() {
     if let Some(k) = args.confidence_k {
         integration_tests_sv2::vardiff_sim::set_confidence_k(k);
     }
+    if let Some(z) = args.significance_z {
+        // Keep the live tunable in sync with the configured controllers so
+        // the UI displays and adjusts from the real starting point.
+        integration_tests_sv2::vardiff_sim::set_significance_z(z);
+    }
 
     if let Some(addr) = args.hub {
         let mut child_args: Vec<String> = vec![
