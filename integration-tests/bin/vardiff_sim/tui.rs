@@ -5,7 +5,11 @@
 //! (100 TH/s), `q` remove the selected miner, `1`/`2` halve/double the sim
 //! clock speed (embedded pool only).
 
-use std::{io, time::Duration};
+use std::{
+    io,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use crossterm::{
     event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
@@ -27,15 +31,18 @@ use ratatui::{
 };
 
 pub async fn run(
-    mut engine: SimEngine,
+    engine: Arc<Mutex<SimEngine>>,
     mut driver: Option<ScenarioDriver>,
     default_fleet: Vec<MinerConfig>,
     mut csv: Option<CsvWriter>,
     shutdown_signal: async_channel::Receiver<()>,
     speed_control: bool,
 ) -> io::Result<()> {
-    for config in default_fleet {
-        engine.spawn_miner(config, None);
+    {
+        let mut eng = engine.lock().expect("engine lock");
+        for config in default_fleet {
+            eng.spawn_miner(config, None);
+        }
     }
 
     enable_raw_mode()?;
@@ -71,7 +78,8 @@ pub async fn run(
             _ = ticker.tick() => {}
             _ = shutdown_signal.recv() => break Ok(()),
             key = key_rx.recv() => {
-                let names = engine.miner_names();
+                let mut eng = engine.lock().expect("engine lock");
+                let names = eng.miner_names();
                 let Ok(key) = key else { break Ok(()) };
                 // Raw mode delivers Ctrl-C as a key event, not a SIGINT.
                 if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -84,7 +92,7 @@ pub async fn run(
                     KeyCode::Char('z') | KeyCode::Esc => break Ok(()),
                     KeyCode::Char('q') => {
                         if let Some(name) = names.get(selected) {
-                            engine.remove_miner(name);
+                            eng.remove_miner(name);
                         }
                     }
                     KeyCode::Up | KeyCode::Char('w') => {
@@ -97,35 +105,35 @@ pub async fn run(
                     }
                     KeyCode::Char('a') => {
                         if let Some(name) = names.get(selected) {
-                            engine.scale_hashrate(name, 0.5);
+                            eng.scale_hashrate(name, 0.5);
                         }
                     }
                     KeyCode::Char('d') => {
                         if let Some(name) = names.get(selected) {
-                            engine.scale_hashrate(name, 2.0);
+                            eng.scale_hashrate(name, 2.0);
                         }
                     }
                     KeyCode::Char('f') => {
                         if let Some(name) = names.get(selected) {
-                            engine.disconnect(name);
+                            eng.disconnect(name);
                         }
                     }
                     KeyCode::Char('r') => {
                         if let Some(name) = names.get(selected) {
-                            engine.reconnect(name);
+                            eng.reconnect(name);
                         }
                     }
                     KeyCode::Char('1') if speed_control => {
-                        let s = engine.speed();
-                        engine.set_speed(s / 2.0);
+                        let s = eng.speed();
+                        eng.set_speed(s / 2.0);
                     }
                     KeyCode::Char('2') if speed_control => {
-                        let s = engine.speed();
-                        engine.set_speed(s * 2.0);
+                        let s = eng.speed();
+                        eng.set_speed(s * 2.0);
                     }
                     KeyCode::Char('e') => {
                         added += 1;
-                        engine.spawn_miner(
+                        eng.spawn_miner(
                             MinerConfig {
                                 name: format!("added-{added}"),
                                 hashrate: 100e12,
@@ -139,32 +147,33 @@ pub async fn run(
             }
         }
 
-        engine.drain_events();
-        let elapsed = engine.elapsed_secs();
+        let mut eng = engine.lock().expect("engine lock");
+        eng.drain_events();
+        let elapsed = eng.elapsed_secs();
         if let Some(driver) = driver.as_mut() {
             for action in driver.due_actions(elapsed) {
-                crate::apply_action(&mut engine, action);
+                crate::apply_action(&mut eng, action);
             }
         }
-        engine.apply_drift();
-        engine.drain_events();
+        eng.apply_drift();
+        eng.drain_events();
 
         // CSV once per second even though the UI refreshes faster.
         if let Some(csv) = csv.as_mut() {
             let now = elapsed as u64;
             if now > last_csv_tick {
                 last_csv_tick = now;
-                let _ = csv.write_tick(&engine);
+                let _ = csv.write_tick(&eng);
             }
         }
 
-        let names = engine.miner_names();
+        let names = eng.miner_names();
         selected = selected.min(names.len().saturating_sub(1));
         if !fleet_ready {
-            fleet_ready = !engine.stats.is_empty()
-                && engine.stats.values().all(|s| s.channel_id.is_some());
+            fleet_ready = !eng.stats.is_empty()
+                && eng.stats.values().all(|s| s.channel_id.is_some());
         }
-        terminal.draw(|frame| draw(frame, &engine, &names, selected, fleet_ready))?;
+        terminal.draw(|frame| draw(frame, &eng, &names, selected, fleet_ready))?;
     };
 
     disable_raw_mode()?;

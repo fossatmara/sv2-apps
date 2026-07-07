@@ -12,6 +12,7 @@
 //!   vardiff-sim --spawn-pool --tui
 //!   vardiff-sim --pool 127.0.0.1:34254 --tui
 
+mod http;
 mod tui;
 
 use std::{convert::TryFrom, net::SocketAddr, path::PathBuf, time::Duration};
@@ -125,6 +126,12 @@ struct Args {
     /// Hashrate (H/s) of the default TUI miners.
     #[arg(long, default_value_t = 100e12)]
     hashrate: f64,
+
+    /// Serve the web dashboard on this address (e.g. 127.0.0.1:8080). The
+    /// dashboard mirrors the TUI (stats table, difficulty chart, controls)
+    /// and works alongside it or headless.
+    #[arg(long)]
+    http: Option<SocketAddr>,
 
     /// Sim clock speed factor (e.g. 8 = one wall second counts as eight
     /// simulated seconds). Requires --spawn-pool: the pool's vardiff clock
@@ -260,11 +267,21 @@ async fn main() {
         eprintln!("sim clock speed x{:.2}", args.speed);
     }
 
-    let mut engine = SimEngine::new(EngineConfig {
+    let engine = std::sync::Arc::new(std::sync::Mutex::new(SimEngine::new(EngineConfig {
         pool_address,
         authority_pubkey,
-    });
+    })));
     let shutdown_signal = spawn_signal_listener();
+
+    if let Some(addr) = args.http {
+        tokio::spawn(http::serve(
+            addr,
+            http::HttpState {
+                engine: engine.clone(),
+                speed_control: args.spawn_pool,
+            },
+        ));
+    }
 
     if args.tui {
         let driver = scenario.map(ScenarioDriver::new);
@@ -280,7 +297,7 @@ async fn main() {
             Vec::new()
         };
         let result = tui::run(
-            engine,
+            engine.clone(),
             driver,
             default_fleet,
             csv,
@@ -312,7 +329,7 @@ async fn main() {
     loop {
         // One iteration per *virtual* second: at speed 8 the loop runs 8x
         // faster in wall time, keeping one CSV row per simulated second.
-        let wall_secs = (1.0 / engine.speed()).clamp(0.05, 10.0);
+        let wall_secs = (1.0 / engine.lock().expect("engine lock").speed()).clamp(0.05, 10.0);
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs_f64(wall_secs)) => {}
             _ = shutdown_signal.recv() => {
@@ -320,15 +337,16 @@ async fn main() {
                 break;
             }
         }
-        let elapsed = engine.elapsed_secs();
-        engine.drain_events();
+        let mut eng = engine.lock().expect("engine lock");
+        let elapsed = eng.elapsed_secs();
+        eng.drain_events();
         for action in driver.due_actions(elapsed) {
-            apply_action(&mut engine, action);
+            apply_action(&mut eng, action);
         }
-        engine.apply_drift();
-        engine.drain_events();
+        eng.apply_drift();
+        eng.drain_events();
         if let Some(csv) = csv.as_mut() {
-            if let Err(e) = csv.write_tick(&engine) {
+            if let Err(e) = csv.write_tick(&eng) {
                 eprintln!("csv write failed: {e}");
             }
         }
@@ -336,18 +354,23 @@ async fn main() {
         if elapsed_whole >= last_print + 10 {
             last_print = elapsed_whole;
             println!("--- t={elapsed_whole}s");
-            for line in engine.summary_lines() {
+            for line in eng.summary_lines() {
                 println!("{line}");
             }
         }
+        drop(eng);
         if elapsed >= duration as f64 {
             break;
         }
     }
 
-    println!("=== final state at t={:.0}s", engine.elapsed_secs());
-    for line in engine.summary_lines() {
-        println!("{line}");
+    // Scoped so clippy can see the guard is not held across the await.
+    {
+        let eng = engine.lock().expect("engine lock");
+        println!("=== final state at t={:.0}s", eng.elapsed_secs());
+        for line in eng.summary_lines() {
+            println!("{line}");
+        }
     }
     shutdown_embedded_pool(embedded_pool, _template_provider).await;
     // See the TUI path: skip the runtime drop, which can hang on a wedged
