@@ -92,6 +92,11 @@ fn cookie_sid(req: &Request) -> Option<String> {
 }
 
 fn hub_authorized(st: &HubState, req: &Request) -> bool {
+    // Static chart-library assets are public, mirroring the child dashboard:
+    // the browser fetches them without the token query/header.
+    if req.uri().path().starts_with("/assets/") {
+        return true;
+    }
     let Some(token) = st.cfg.token.as_deref() else {
         return true;
     };
