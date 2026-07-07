@@ -256,14 +256,17 @@ fn draw(
     frame.render_widget(table, layout[0]);
 
     // Difficulty-over-time chart for the selected miner: a sliding window of
-    // the most recent history rather than the whole run condensed.
-    const CHART_WINDOW_SECS: f64 = 300.0;
+    // the most recent history rather than the whole run condensed. The
+    // window scales with the sim clock speed so it always spans roughly the
+    // same wall-clock viewing time regardless of acceleration.
+    const CHART_WINDOW_BASE_SECS: f64 = 300.0;
+    let chart_window = CHART_WINDOW_BASE_SECS * engine.speed();
     if let Some(name) = names.get(selected) {
         let s = &engine.stats[name];
         let data: &[(f64, f64)] = &s.difficulty_history;
         if !data.is_empty() {
             let x_max = engine.elapsed_secs().max(1.0);
-            let x_min = (x_max - CHART_WINDOW_SECS).max(0.0);
+            let x_min = (x_max - chart_window).max(0.0);
             // Visible points, plus a synthetic entry point holding the value
             // the series had when it slid past the left edge.
             let mut plotted: Vec<(f64, f64)> = Vec::new();
@@ -370,7 +373,7 @@ fn draw(
                     Block::default()
                         .borders(Borders::ALL)
                         .title(format!(
-                            " difficulty history: {name} (last {CHART_WINDOW_SECS:.0}s) "
+                            " difficulty history: {name} (last {chart_window:.0}s) "
                         )),
                 )
                 .legend_position(Some(ratatui::widgets::LegendPosition::TopRight))

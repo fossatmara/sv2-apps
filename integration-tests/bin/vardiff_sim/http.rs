@@ -26,8 +26,10 @@ use serde::{Deserialize, Serialize};
 
 pub type SharedEngine = Arc<Mutex<SimEngine>>;
 
-/// Matches the TUI chart window.
-const WINDOW_SECS: f64 = 300.0;
+/// Web chart window base (virtual seconds at speed 1): longer than the
+/// TUI's, and scaled by the sim clock speed at snapshot time so the window
+/// spans a consistent wall-clock viewing time under acceleration.
+const WINDOW_BASE_SECS: f64 = 600.0;
 
 #[derive(Clone)]
 pub struct HttpState {
@@ -123,7 +125,8 @@ async fn index() -> Html<&'static str> {
 fn build_snapshot(st: &HttpState) -> StatsSnapshot {
     let engine = st.engine.lock().expect("engine lock");
     let elapsed = engine.elapsed_secs();
-    let from = (elapsed - WINDOW_SECS).max(0.0);
+    let window = WINDOW_BASE_SECS * engine.speed();
+    let from = (elapsed - window).max(0.0);
     let miners = engine
         .miner_names()
         .into_iter()
@@ -169,7 +172,7 @@ fn build_snapshot(st: &HttpState) -> StatsSnapshot {
         elapsed_secs: elapsed,
         speed: engine.speed(),
         speed_control: st.speed_control,
-        window_secs: WINDOW_SECS,
+        window_secs: window,
         miners,
     }
 }
