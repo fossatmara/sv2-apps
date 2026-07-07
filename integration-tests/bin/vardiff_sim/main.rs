@@ -267,7 +267,10 @@ async fn main() {
             eprintln!("tui error: {e}");
             std::process::exit(1);
         }
-        return;
+        // Exit explicitly: everything that matters was torn down above, and
+        // dropping the tokio runtime can hang forever if a blocking-pool
+        // thread is wedged in a syscall.
+        std::process::exit(0);
     }
 
     // Headless mode (--scenario presence was checked before the pool spawned).
@@ -321,6 +324,9 @@ async fn main() {
         println!("{line}");
     }
     shutdown_embedded_pool(embedded_pool, _template_provider).await;
+    // See the TUI path: skip the runtime drop, which can hang on a wedged
+    // blocking-pool thread.
+    std::process::exit(0);
 }
 
 /// Resolves once SIGINT (Ctrl-C) or SIGTERM arrives, so both run modes can

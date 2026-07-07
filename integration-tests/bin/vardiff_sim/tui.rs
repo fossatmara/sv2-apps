@@ -320,7 +320,7 @@ fn draw(
                         .bounds([0.0, x_max])
                         .labels(vec![
                             Span::raw("0s"),
-                            Span::raw(format!("{:.0}s", x_max)),
+                            Span::raw(format!("{x_max:.0}s")),
                         ]),
                 )
                 .y_axis(
