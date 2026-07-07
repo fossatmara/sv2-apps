@@ -293,7 +293,12 @@ impl SimEngine {
         let mut any = false;
         while let Ok((name, event)) = self.events_rx.try_recv() {
             any = true;
-            let stats = self.stats.entry(name.clone()).or_default();
+            // Only update known miners: a removed miner's task still emits a
+            // final Disconnected event, and entry().or_default() would
+            // resurrect it as a ghost row.
+            let Some(stats) = self.stats.get_mut(&name) else {
+                continue;
+            };
             match event {
                 MinerEvent::Connected => {
                     stats.connected = true;
