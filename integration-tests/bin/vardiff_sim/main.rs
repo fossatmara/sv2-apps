@@ -104,6 +104,11 @@ struct Args {
     #[arg(long)]
     q_epsilon: Option<f64>,
 
+    /// Initial PID confidence shrinkage constant K (live-tunable from the
+    /// TUI with 3/4 and from the web dashboard).
+    #[arg(long)]
+    confidence_k: Option<f64>,
+
     /// Scenario file (TOML). Required in headless mode.
     #[arg(long)]
     scenario: Option<PathBuf>,
@@ -186,6 +191,10 @@ async fn main() {
         })
     });
 
+    if let Some(k) = args.confidence_k {
+        integration_tests_sv2::vardiff_sim::set_confidence_k(k);
+    }
+
     if let Some(addr) = args.hub {
         let mut child_args: Vec<String> = vec![
             "--algorithm".into(), args.algorithm.clone(),
@@ -201,7 +210,7 @@ async fn main() {
             ("--significance-z", args.significance_z),
             ("--tracking-secs", args.tracking_secs),
             ("--q-alpha", args.q_alpha), ("--q-gamma", args.q_gamma),
-            ("--q-epsilon", args.q_epsilon),
+            ("--q-epsilon", args.q_epsilon), ("--confidence-k", args.confidence_k),
         ] {
             if let Some(v) = v {
                 child_args.push(flag.into());

@@ -3,7 +3,8 @@
 //! Keys: `z` quit, `w`/`s` (or arrows) select miner, `a`/`d` halve/double the
 //! selected miner's hashrate, `f` disconnect, `r` reconnect, `e` add a miner
 //! (100 TH/s), `q` remove the selected miner, `1`/`2` halve/double the sim
-//! clock speed (embedded pool only).
+//! clock speed, `3`/`4` halve/double the PID confidence constant K (both
+//! embedded pool only).
 
 use std::{
     io,
@@ -131,6 +132,14 @@ pub async fn run(
                         let s = eng.speed();
                         eng.set_speed(s * 2.0);
                     }
+                    KeyCode::Char('3') if speed_control => {
+                        let k = eng.confidence_k();
+                        eng.set_confidence_k((k / 2.0).max(0.25));
+                    }
+                    KeyCode::Char('4') if speed_control => {
+                        let k = eng.confidence_k();
+                        eng.set_confidence_k((k * 2.0).max(0.5));
+                    }
                     KeyCode::Char('e') => {
                         added += 1;
                         eng.spawn_miner(
@@ -245,9 +254,10 @@ fn draw(
         Constraint::Length(8),
     ];
     let title = format!(
-        " vardiff-sim | t={:.0}s | speed x{:.2} | {} miners ",
+        " vardiff-sim | t={:.0}s | speed x{:.2} | conf-K={:.2} | {} miners ",
         engine.elapsed_secs(),
         engine.speed(),
+        engine.confidence_k(),
         names.len()
     );
     let table = Table::new(rows, widths)
@@ -410,7 +420,7 @@ fn draw(
 
     let help = if fleet_ready {
         Line::from(vec![Span::styled(
-            " z quit | w/s select | a/d hashrate /2 x2 | f disc | r reconn | e add | q remove | 1/2 speed",
+            " z quit | w/s select | a/d hashrate | f disc | r reconn | e add | q remove | 1/2 speed | 3/4 conf-K",
             Style::default().fg(Color::DarkGray),
         )])
     } else {

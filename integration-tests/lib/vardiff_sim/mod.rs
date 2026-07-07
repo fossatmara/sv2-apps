@@ -49,6 +49,17 @@ pub fn virtual_now_secs() -> f64 {
     stratum_apps::stratum_core::channels_sv2::vardiff::sim_clock::now_secs_f64()
 }
 
+/// Current PID confidence shrinkage constant K (live-tunable; embedded
+/// pool only, like the clock speed).
+pub fn confidence_k() -> f64 {
+    stratum_apps::stratum_core::channels_sv2::vardiff::tuning::confidence_k()
+}
+
+/// Sets the PID confidence shrinkage constant K.
+pub fn set_confidence_k(k: f64) {
+    stratum_apps::stratum_core::channels_sv2::vardiff::tuning::set_confidence_k(k)
+}
+
 /// Events a miner task reports back to the engine.
 #[derive(Debug, Clone)]
 pub enum MinerEvent {

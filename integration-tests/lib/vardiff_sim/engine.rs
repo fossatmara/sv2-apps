@@ -137,6 +137,17 @@ impl SimEngine {
         clock_speed()
     }
 
+    /// Current PID confidence shrinkage constant K.
+    pub fn confidence_k(&self) -> f64 {
+        super::confidence_k()
+    }
+
+    /// Sets the PID confidence shrinkage constant K (embedded pool only).
+    pub fn set_confidence_k(&mut self, k: f64) {
+        super::set_confidence_k(k);
+        self.changed.notify_waiters();
+    }
+
     /// Changes the sim clock speed. Miners re-sample their share timers so
     /// deadlines scheduled at the old speed don't linger.
     pub fn set_speed(&mut self, speed: f64) {
