@@ -63,7 +63,10 @@ pub struct PoolConfig {
 }
 
 fn default_vardiff_interval_secs() -> u64 {
-    60
+    // The backstop only rescues silent channels (difficulty adjusts
+    // share-driven otherwise); 30s keeps drop-detection latency low at
+    // negligible evaluation cost.
+    30
 }
 
 /// Vardiff algorithm selection.

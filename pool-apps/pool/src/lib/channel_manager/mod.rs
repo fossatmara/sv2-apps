@@ -677,7 +677,7 @@ impl ChannelManager {
     //   backstop: a channel whose difficulty is far too high produces no
     //   shares, hence no share-driven evaluations, and only a timer can
     //   rescue it.
-    // - Executes the vardiff cycle every `vardiff_interval_secs` (default 60)
+    // - Executes the vardiff cycle every `vardiff_interval_secs` (default 30)
     //   for all downstreams.
     // - Delegates to [`Self::run_vardiff`] on each tick.
     //
