@@ -669,9 +669,14 @@ impl ChannelManager {
         }
     }
 
-    // Periodic vardiff task loop.
+    // Periodic vardiff backstop loop.
     //
     // # Purpose
+    // - Difficulty normally adjusts share-driven (each counted share
+    //   evaluates its channel's vardiff immediately). This loop is the idle
+    //   backstop: a channel whose difficulty is far too high produces no
+    //   shares, hence no share-driven evaluations, and only a timer can
+    //   rescue it.
     // - Executes the vardiff cycle every `vardiff_interval_secs` (default 60)
     //   for all downstreams.
     // - Delegates to [`Self::run_vardiff`] on each tick.

@@ -835,10 +835,30 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                             });
                     match validation {
                         Some(validation) => {
+                            // Share-driven vardiff: every counted share is
+                            // fresh evidence, so evaluate immediately rather
+                            // than waiting for the idle-backstop tick. Lock
+                            // order (vardiff, then channel) matches
+                            // run_vardiff.
+                            let mut vardiff_messages: Vec<RouteMessageTo> = Vec::new();
                             self.vardiff.with_mut(&vardiff_key, |vardiff| {
-                                vardiff.increment_shares_since_last_update()
+                                vardiff.increment_shares_since_last_update();
+                                downstream.standard_channels.with_mut(
+                                    &channel_id,
+                                    |standard_channel| {
+                                        Self::run_vardiff_on_standard_channel(
+                                            downstream_id,
+                                            channel_id,
+                                            standard_channel,
+                                            vardiff,
+                                            &mut vardiff_messages,
+                                        );
+                                    },
+                                );
                             });
-                            validation?
+                            let mut messages = validation?;
+                            messages.extend(vardiff_messages);
+                            messages
                         }
                         None => {
                             let submit_shares_error = SubmitSharesError {
@@ -1127,10 +1147,26 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                             });
                     match validation {
                         Some(validation) => {
+                            // Share-driven vardiff (see the standard handler).
+                            let mut vardiff_messages: Vec<RouteMessageTo> = Vec::new();
                             self.vardiff.with_mut(&vardiff_key, |vardiff| {
-                                vardiff.increment_shares_since_last_update()
+                                vardiff.increment_shares_since_last_update();
+                                downstream.extended_channels.with_mut(
+                                    &channel_id,
+                                    |extended_channel| {
+                                        Self::run_vardiff_on_extended_channel(
+                                            downstream_id,
+                                            channel_id,
+                                            extended_channel,
+                                            vardiff,
+                                            &mut vardiff_messages,
+                                        );
+                                    },
+                                );
                             });
-                            validation?
+                            let mut messages = validation?;
+                            messages.extend(vardiff_messages);
+                            messages
                         }
                         None => {
                             let error = SubmitSharesError {

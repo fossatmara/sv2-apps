@@ -47,10 +47,10 @@ struct Args {
     #[arg(long, default_value_t = 60.0)]
     shares_per_minute: f32,
 
-    /// How often (seconds) the spawned pool re-evaluates channel difficulty.
-    /// The classic algorithm skips windows of 15s or less (effective minimum
-    /// 16); pid accepts any interval and gates on statistical significance.
-    /// The interactive default is snappier than the production default (60).
+    /// Idle-backstop interval (seconds). Difficulty adjusts share-driven;
+    /// this timer only rescues channels producing no shares (difficulty far
+    /// too high). The classic algorithm additionally skips windows of 15s or
+    /// less.
     #[arg(long, default_value_t = 20)]
     vardiff_interval: u64,
 
