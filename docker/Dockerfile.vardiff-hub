@@ -1,0 +1,75 @@
+###
+# vardiff-sim session hub
+#
+# Serves the multi-session vardiff dashboard: every browser session gets its
+# own fully isolated child sim (pool + template provider + miners) inside the
+# container, managed and proxied by the hub process.
+#
+# Build from the repo root:
+#   docker build -f docker/Dockerfile.vardiff-hub \
+#     -t 047385673162.dkr.ecr.us-east-2.amazonaws.com/vardiff-hub:latest .
+###
+
+###
+# ---- Builder Stage ----
+###
+FROM rust:1.88-slim-bookworm AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    capnproto libcapnp-dev curl cmake clang pkg-config ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY stratum-apps/ stratum-apps/
+COPY pool-apps/ pool-apps/
+COPY miner-apps/ miner-apps/
+COPY bitcoin-core-sv2/ bitcoin-core-sv2/
+COPY integration-tests/ integration-tests/
+
+RUN cargo build --release \
+    --manifest-path integration-tests/Cargo.toml \
+    --bin vardiff-sim \
+    --target-dir ./build
+
+###
+# ---- Template-provider binaries ----
+# Baked into the image so session children never download at runtime.
+# Versions must match integration-tests/lib/template_provider.rs.
+###
+FROM debian:bookworm-slim AS tp-binaries
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /tp
+ARG BITCOIN_CORE_VERSION=31.0
+ARG SV2_TP_VERSION=1.1.0
+RUN curl -fsSL "https://bitcoincore.org/bin/bitcoin-core-${BITCOIN_CORE_VERSION}/bitcoin-${BITCOIN_CORE_VERSION}-x86_64-linux-gnu.tar.gz" | tar xz && \
+    curl -fsSL "https://github.com/stratum-mining/sv2-tp/releases/download/v${SV2_TP_VERSION}/sv2-tp-${SV2_TP_VERSION}-x86_64-linux-gnu.tar.gz" | tar xz
+
+###
+# ---- Runtime Stage ----
+###
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates && \
+    rm -rf /var/lib/apt/lists/* && \
+    useradd -m -u 1000 sim
+
+WORKDIR /app
+
+COPY --from=builder /app/build/release/vardiff-sim /usr/local/bin/vardiff-sim
+# The sim looks for template-provider binaries under $CWD/template-provider.
+COPY --from=tp-binaries /tp/ /app/template-provider/
+
+USER sim
+
+# HTTP_TOKEN  — optional dashboard token (omit for an open dashboard)
+# EXTRA_ARGS  — forwarded sim flags, e.g. "--algorithm qpid --speed 8"
+ENV HUB_ADDR=0.0.0.0:8080
+EXPOSE 8080
+
+ENTRYPOINT ["/bin/sh", "-c", "exec vardiff-sim --hub \"$HUB_ADDR\" ${HTTP_TOKEN:+--http-token \"$HTTP_TOKEN\"} $EXTRA_ARGS"]

@@ -35,7 +35,12 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 ratatui = "0.29"
 crossterm = "0.28"
-axum = { version = "0.7", features = ["ws"] }
+axum = { version = "0.7", features = ["ws", "macros"] }
+# Session hub: HTTP/WS proxying to per-session child processes.
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+tokio-tungstenite = "0.21"
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+libc = "0.2"
 
 # Direct dependencies kept only for the embedded `mining_device` module.
 # Remove this block when removing:

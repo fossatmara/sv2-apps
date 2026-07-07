@@ -13,6 +13,7 @@
 //!   vardiff-sim --pool 127.0.0.1:34254 --tui
 
 mod http;
+mod hub;
 mod tui;
 
 use std::{convert::TryFrom, net::SocketAddr, path::PathBuf, time::Duration};
@@ -138,6 +139,17 @@ struct Args {
     #[arg(long)]
     http_token: Option<String>,
 
+    /// Session-hub mode: serve this address publicly and give every browser
+    /// session its own fully isolated child sim (own pool, template
+    /// provider, clock, Q-table). All other sim flags are forwarded to the
+    /// children. Idle sessions are reaped after --session-ttl-secs.
+    #[arg(long, conflicts_with_all = ["http", "tui", "scenario", "pool"])]
+    hub: Option<SocketAddr>,
+
+    /// Idle TTL in seconds for hub sessions (no WebSocket + no requests).
+    #[arg(long, default_value_t = 600)]
+    session_ttl_secs: u64,
+
     /// Sim clock speed factor (e.g. 8 = one wall second counts as eight
     /// simulated seconds). Requires --spawn-pool: the pool's vardiff clock
     /// must live in this process to stay consistent. In the TUI, 1 and 2
@@ -162,8 +174,8 @@ async fn main() {
             std::process::exit(1);
         })
     });
-    if !args.tui && scenario.is_none() && args.http.is_none() {
-        eprintln!("error: headless mode needs --scenario, --http, or --tui");
+    if !args.tui && scenario.is_none() && args.http.is_none() && args.hub.is_none() {
+        eprintln!("error: headless mode needs --scenario, --http, --hub, or --tui");
         std::process::exit(1);
     }
 
@@ -173,6 +185,42 @@ async fn main() {
             std::process::exit(1);
         })
     });
+
+    if let Some(addr) = args.hub {
+        let mut child_args: Vec<String> = vec![
+            "--algorithm".into(), args.algorithm.clone(),
+            "--shares-per-minute".into(), args.shares_per_minute.to_string(),
+            "--vardiff-interval".into(), args.vardiff_interval.to_string(),
+            "--speed".into(), args.speed.to_string(),
+            "--miners".into(), args.miners.to_string(),
+            "--hashrate".into(), args.hashrate.to_string(),
+        ];
+        for (flag, v) in [
+            ("--kp", args.kp), ("--ki", args.ki), ("--kd", args.kd),
+            ("--max-step", args.max_step), ("--deadband", args.deadband),
+            ("--significance-z", args.significance_z),
+            ("--tracking-secs", args.tracking_secs),
+            ("--q-alpha", args.q_alpha), ("--q-gamma", args.q_gamma),
+            ("--q-epsilon", args.q_epsilon),
+        ] {
+            if let Some(v) = v {
+                child_args.push(flag.into());
+                child_args.push(v.to_string());
+            }
+        }
+        let shutdown = spawn_signal_listener();
+        hub::serve(
+            hub::HubConfig {
+                addr,
+                token: args.http_token.clone(),
+                ttl: Duration::from_secs(args.session_ttl_secs),
+                child_args,
+            },
+            shutdown,
+        )
+        .await;
+        std::process::exit(0);
+    }
 
     let pubkey_str = args.pubkey.as_deref().unwrap_or(AUTHORITY_PUBLIC_KEY);
     let authority_pubkey = Some(
