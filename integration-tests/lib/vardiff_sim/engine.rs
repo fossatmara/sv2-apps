@@ -241,6 +241,13 @@ impl SimEngine {
         let elapsed = self.elapsed_secs();
         if let Some(slot) = self.miners.get_mut(name) {
             let previous = slot.config.hashrate;
+            // No-op sets happen when a UI races its own snapshot (e.g. the
+            // half-rate button clicked twice before the update arrives);
+            // recording them would annotate a phantom "increase" (from ==
+            // to) on the chart.
+            if hashrate == previous {
+                return;
+            }
             slot.config.hashrate = hashrate;
             if let Some(drift) = slot.drift.as_mut() {
                 drift.base_hashrate = hashrate;
