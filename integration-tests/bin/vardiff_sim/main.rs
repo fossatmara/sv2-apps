@@ -350,16 +350,32 @@ fn spawn_signal_listener() -> async_channel::Receiver<()> {
 }
 
 /// Gracefully stops a `--spawn-pool` pool and its template provider (the
-/// template provider's child processes are killed on drop).
+/// template provider's child processes are killed on drop). Every stage is
+/// bounded by a timeout so a wedged component can't hang the exit forever.
 async fn shutdown_embedded_pool(
     pool: Option<pool_sv2::PoolSv2>,
     template_provider: Option<integration_tests_sv2::template_provider::TemplateProvider>,
 ) {
     if let Some(pool) = pool {
         eprintln!("shutting down embedded pool...");
-        pool.shutdown().await;
+        match tokio::time::timeout(Duration::from_secs(10), pool.shutdown()).await {
+            Ok(()) => eprintln!("pool stopped"),
+            Err(_) => eprintln!("warning: pool did not shut down within 10s; continuing"),
+        }
     }
-    drop(template_provider);
+    if let Some(tp) = template_provider {
+        eprintln!("stopping template provider (bitcoind/sv2-tp)...");
+        // Drop blocks on child-process teardown; run it off the async runtime
+        // and bound it.
+        let teardown = tokio::task::spawn_blocking(move || drop(tp));
+        match tokio::time::timeout(Duration::from_secs(15), teardown).await {
+            Ok(_) => eprintln!("template provider stopped"),
+            Err(_) => eprintln!(
+                "warning: template provider did not stop within 15s; \
+                 check for leftovers with: pgrep -af 'bitcoin-node|sv2-tp'"
+            ),
+        }
+    }
 }
 
 pub(crate) fn apply_action(engine: &mut SimEngine, action: DueAction) {
