@@ -944,6 +944,7 @@ checksum = "edca88bc138befd0323b20752846e6587272d3b03b0343c8ea28a6f819e6e71f"
 dependencies = [
  "async-trait",
  "axum-core 0.4.5",
+ "base64 0.22.1",
  "bytes",
  "futures-util",
  "http",
@@ -962,8 +963,10 @@ dependencies = [
  "serde_json",
  "serde_path_to_error",
  "serde_urlencoded",
+ "sha1",
  "sync_wrapper",
  "tokio",
+ "tokio-tungstenite",
  "tower",
  "tower-layer",
  "tower-service",
@@ -1080,7 +1083,7 @@ checksum = "32637268377fc7b10a8c6d51de3e7fba1ce5dd371a96e342b34e6078db558e7f"
 [[package]]
 name = "binary_sv2"
 version = "6.0.0"
-source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#a27f41b45edb645eaec9248ca4ca4477d7110550"
+source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#4cc05c391c8a75f993b74b275f5adebc7ffe34b7"
 dependencies = [
  "buffer_sv2",
  "derive_codec_sv2",
@@ -1265,7 +1268,7 @@ dependencies = [
 [[package]]
 name = "buffer_sv2"
 version = "3.0.1"
-source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#a27f41b45edb645eaec9248ca4ca4477d7110550"
+source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#4cc05c391c8a75f993b74b275f5adebc7ffe34b7"
 dependencies = [
  "aes-gcm",
 ]
@@ -1417,7 +1420,7 @@ dependencies = [
 [[package]]
 name = "channels_sv2"
 version = "7.0.0"
-source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#a27f41b45edb645eaec9248ca4ca4477d7110550"
+source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#4cc05c391c8a75f993b74b275f5adebc7ffe34b7"
 dependencies = [
  "binary_sv2",
  "bitcoin",
@@ -1530,7 +1533,7 @@ dependencies = [
 [[package]]
 name = "codec_sv2"
 version = "6.0.0"
-source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#a27f41b45edb645eaec9248ca4ca4477d7110550"
+source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#4cc05c391c8a75f993b74b275f5adebc7ffe34b7"
 dependencies = [
  "binary_sv2",
  "buffer_sv2",
@@ -1559,7 +1562,7 @@ dependencies = [
 [[package]]
 name = "common_messages_sv2"
 version = "8.0.0"
-source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#a27f41b45edb645eaec9248ca4ca4477d7110550"
+source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#4cc05c391c8a75f993b74b275f5adebc7ffe34b7"
 dependencies = [
  "binary_sv2",
 ]
@@ -1920,6 +1923,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "data-encoding"
+version = "2.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
+
+[[package]]
 name = "derive_arbitrary"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1933,7 +1942,7 @@ dependencies = [
 [[package]]
 name = "derive_codec_sv2"
 version = "1.1.2"
-source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#a27f41b45edb645eaec9248ca4ca4477d7110550"
+source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#4cc05c391c8a75f993b74b275f5adebc7ffe34b7"
 
 [[package]]
 name = "digest"
@@ -2112,7 +2121,7 @@ dependencies = [
 [[package]]
 name = "extensions_sv2"
 version = "0.2.0"
-source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#a27f41b45edb645eaec9248ca4ca4477d7110550"
+source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#4cc05c391c8a75f993b74b275f5adebc7ffe34b7"
 dependencies = [
  "binary_sv2",
 ]
@@ -2185,7 +2194,7 @@ dependencies = [
 [[package]]
 name = "framing_sv2"
 version = "7.0.0"
-source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#a27f41b45edb645eaec9248ca4ca4477d7110550"
+source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#4cc05c391c8a75f993b74b275f5adebc7ffe34b7"
 dependencies = [
  "binary_sv2",
  "buffer_sv2",
@@ -2406,7 +2415,7 @@ dependencies = [
 [[package]]
 name = "handlers_sv2"
 version = "0.5.0"
-source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#a27f41b45edb645eaec9248ca4ca4477d7110550"
+source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#4cc05c391c8a75f993b74b275f5adebc7ffe34b7"
 dependencies = [
  "binary_sv2",
  "common_messages_sv2",
@@ -3012,7 +3021,7 @@ dependencies = [
 [[package]]
 name = "job_declaration_sv2"
 version = "9.0.0"
-source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#a27f41b45edb645eaec9248ca4ca4477d7110550"
+source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#4cc05c391c8a75f993b74b275f5adebc7ffe34b7"
 dependencies = [
  "binary_sv2",
 ]
@@ -3272,7 +3281,7 @@ checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 [[package]]
 name = "mining_sv2"
 version = "11.0.0"
-source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#a27f41b45edb645eaec9248ca4ca4477d7110550"
+source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#4cc05c391c8a75f993b74b275f5adebc7ffe34b7"
 dependencies = [
  "binary_sv2",
 ]
@@ -3326,7 +3335,7 @@ dependencies = [
 [[package]]
 name = "noise_sv2"
 version = "1.4.2"
-source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#a27f41b45edb645eaec9248ca4ca4477d7110550"
+source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#4cc05c391c8a75f993b74b275f5adebc7ffe34b7"
 dependencies = [
  "aes-gcm",
  "chacha20poly1305",
@@ -3488,7 +3497,7 @@ dependencies = [
 [[package]]
 name = "parsers_sv2"
 version = "0.5.0"
-source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#a27f41b45edb645eaec9248ca4ca4477d7110550"
+source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#4cc05c391c8a75f993b74b275f5adebc7ffe34b7"
 dependencies = [
  "binary_sv2",
  "common_messages_sv2",
@@ -4446,6 +4455,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha1"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3bf829a2d51ab4a5ddf1352d8470c140cadc8301b2ae1789db023f01cedd6ba"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "digest 0.10.7",
+]
+
+[[package]]
 name = "sha2"
 version = "0.9.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4650,7 +4670,7 @@ dependencies = [
 [[package]]
 name = "stratum-core"
 version = "0.5.0"
-source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#a27f41b45edb645eaec9248ca4ca4477d7110550"
+source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#4cc05c391c8a75f993b74b275f5adebc7ffe34b7"
 dependencies = [
  "binary_sv2",
  "bitcoin",
@@ -4673,7 +4693,7 @@ dependencies = [
 [[package]]
 name = "stratum_translation"
 version = "0.4.0"
-source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#a27f41b45edb645eaec9248ca4ca4477d7110550"
+source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#4cc05c391c8a75f993b74b275f5adebc7ffe34b7"
 dependencies = [
  "binary_sv2",
  "bitcoin",
@@ -4742,7 +4762,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 [[package]]
 name = "sv1_api"
 version = "5.0.0"
-source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#a27f41b45edb645eaec9248ca4ca4477d7110550"
+source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#4cc05c391c8a75f993b74b275f5adebc7ffe34b7"
 dependencies = [
  "binary_sv2",
  "bitcoin",
@@ -4810,7 +4830,7 @@ dependencies = [
 [[package]]
 name = "template_distribution_sv2"
 version = "6.0.0"
-source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#a27f41b45edb645eaec9248ca4ca4477d7110550"
+source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#4cc05c391c8a75f993b74b275f5adebc7ffe34b7"
 dependencies = [
  "binary_sv2",
 ]
@@ -4956,6 +4976,18 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+]
+
+[[package]]
+name = "tokio-tungstenite"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "edc5f74e248dc973e0dbb7b74c7e0d6fcc301c694ff50049504004ef4d0cdcd9"
+dependencies = [
+ "futures-util",
+ "log",
+ "tokio",
+ "tungstenite",
 ]
 
 [[package]]
@@ -5192,6 +5224,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
+name = "tungstenite"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "18e5b8366ee7a95b16d32197d0b2604b43a0be89dc5fac9f8e96ccafbaedda8a"
+dependencies = [
+ "byteorder",
+ "bytes",
+ "data-encoding",
+ "http",
+ "httparse",
+ "log",
+ "rand 0.8.6",
+ "sha1",
+ "thiserror 1.0.69",
+ "utf-8",
+]
+
+[[package]]
 name = "typenum"
 version = "1.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5289,6 +5339,12 @@ dependencies = [
  "percent-encoding",
  "serde",
 ]
+
+[[package]]
+name = "utf-8"
+version = "0.7.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09cc8ee72d2a9becf2f2febe0205bbed8fc6615b7cb429ad062dc7b7ddd036a9"
 
 [[package]]
 name = "utf8_iter"
