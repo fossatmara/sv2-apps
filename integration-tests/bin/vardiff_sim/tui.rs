@@ -297,12 +297,45 @@ fn draw(
                 .iter()
                 .filter(|c| !c.is_increase() && c.at >= x_min)
                 .count();
+            // Every vardiff firing inside the window (the real history
+            // points, not the synthetic edge extensions).
+            let vardiff_fires: Vec<(f64, f64)> = data
+                .iter()
+                .filter(|(t, _)| *t >= x_min)
+                .copied()
+                .collect();
+            // Share arrivals as a rug of ticks along the bottom edge.
+            let shares: Vec<(f64, f64)> = engine
+                .share_times_since(name, x_min)
+                .into_iter()
+                .map(|t| (t, y_max * 0.02))
+                .collect();
             let mut datasets = vec![Dataset::default()
                 .name(format!("difficulty ({name})"))
                 .marker(symbols::Marker::Braille)
                 .graph_type(GraphType::Line)
                 .style(Style::default().fg(Color::Cyan))
                 .data(&plotted)];
+            if !shares.is_empty() {
+                datasets.push(
+                    Dataset::default()
+                        .name(format!("shares ({})", shares.len()))
+                        .marker(symbols::Marker::Dot)
+                        .graph_type(GraphType::Scatter)
+                        .style(Style::default().fg(Color::DarkGray))
+                        .data(&shares),
+                );
+            }
+            if !vardiff_fires.is_empty() {
+                datasets.push(
+                    Dataset::default()
+                        .name(format!("vardiff fired ({})", vardiff_fires.len()))
+                        .marker(symbols::Marker::Dot)
+                        .graph_type(GraphType::Scatter)
+                        .style(Style::default().fg(Color::Magenta))
+                        .data(&vardiff_fires),
+                );
+            }
             if !increases.is_empty() {
                 datasets.push(
                     Dataset::default()

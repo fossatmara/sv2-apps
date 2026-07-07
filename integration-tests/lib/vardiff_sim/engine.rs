@@ -137,6 +137,20 @@ impl SimEngine {
         }
     }
 
+    /// Share submission times for a miner as elapsed virtual seconds (the
+    /// difficulty-history timebase), newest window only.
+    pub fn share_times_since(&self, name: &str, from_elapsed: f64) -> Vec<f64> {
+        let Some(stats) = self.stats.get(name) else {
+            return Vec::new();
+        };
+        stats
+            .share_times
+            .iter()
+            .map(|t| t - self.started_virtual)
+            .filter(|t| *t >= from_elapsed)
+            .collect()
+    }
+
     /// Names of all miners ever spawned, sorted for stable display.
     pub fn miner_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self.stats.keys().cloned().collect();
