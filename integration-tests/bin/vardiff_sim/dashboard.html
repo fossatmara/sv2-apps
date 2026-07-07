@@ -68,6 +68,7 @@
   <input id="addhash" placeholder="hashrate H/s" value="100e12">
   <button onclick="addMiner()">add miner</button>
   <span style="flex:1"></span>
+  <button id="gains" class="on" onclick="toggleGains()">gains</button>
   <button id="full" onclick="toggleFull()">full history</button>
   <button id="live" class="on" onclick="toggleLive()">live</button>
 </div>
@@ -120,6 +121,13 @@ function toggleLive() {
   live = !live;
   document.getElementById('live').classList.toggle('on', live);
   if (live && last) refreshChart();
+}
+
+let showGains = true;
+function toggleGains() {
+  showGains = !showGains;
+  document.getElementById('gains').classList.toggle('on', showGains);
+  if (chart) [4, 5, 6].forEach(i => chart.setSeries(i, {show: showGains}));
 }
 
 let fullMode = false;
@@ -262,13 +270,13 @@ function makeChart(data) {
         points: {show: true, size: 4, fill: '#6e7681'},
         value: (u, v) => v == null ? '—' : '●' },
       { label: 'kp', scale: 'g', stroke: '#e3b341', width: 1, spanGaps: true,
-        paths: uPlot.paths.stepped({align: 1}), points: {show: false},
+        show: showGains, paths: uPlot.paths.stepped({align: 1}), points: {show: false},
         value: (u, v) => v == null ? '—' : v.toFixed(3) },
       { label: 'ki×100', scale: 'g', stroke: '#bc8cff', width: 1, spanGaps: true,
-        paths: uPlot.paths.stepped({align: 1}), points: {show: false},
+        show: showGains, paths: uPlot.paths.stepped({align: 1}), points: {show: false},
         value: (u, v) => v == null ? '—' : (v / 100).toFixed(4) },
       { label: 'kd', scale: 'g', stroke: '#f778ba', width: 1, spanGaps: true,
-        paths: uPlot.paths.stepped({align: 1}), points: {show: false},
+        show: showGains, paths: uPlot.paths.stepped({align: 1}), points: {show: false},
         value: (u, v) => v == null ? '—' : v.toFixed(3) },
     ],
     axes: [
