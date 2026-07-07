@@ -34,6 +34,7 @@ pub mod sv1_sniffer;
 pub mod template_provider;
 pub mod types;
 pub mod utils;
+pub mod vardiff_sim;
 
 /// Concurrently shuts down multiple services.
 ///

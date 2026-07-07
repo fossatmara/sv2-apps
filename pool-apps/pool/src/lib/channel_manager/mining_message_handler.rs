@@ -623,6 +623,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
         info!("Received SubmitSharesStandard: {msg}");
         let downstream_id =
             client_id.expect("client_id must be present for downstream_id extraction");
+        let ignore_share_validation = self.ignore_share_validation;
 
         let channel_id = msg.channel_id;
         let vardiff_key = (downstream_id, channel_id).into();
@@ -653,6 +654,25 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                             .standard_channels
                             .with_mut(&channel_id, |standard_channel| {
                                 let mut messages: Vec<RouteMessageTo> = Vec::new();
+                                if ignore_share_validation {
+                                    let share_work =
+                                        standard_channel.get_target().difficulty_float();
+                                    let success = SubmitSharesSuccess {
+                                        channel_id,
+                                        last_sequence_number: msg.sequence_number,
+                                        new_submits_accepted_count: 1,
+                                        new_shares_sum: share_work as u64,
+                                    };
+                                    info!(
+                                        "SubmitSharesStandard: accepted without validation | downstream_id: {}, channel_id: {}, sequence_number: {} \u{2705}",
+                                        downstream_id, channel_id, msg.sequence_number
+                                    );
+                                    messages.push(
+                                        (downstream_id, Mining::SubmitSharesSuccess(success))
+                                            .into(),
+                                    );
+                                    return Ok(messages);
+                                }
                                 let res = standard_channel.validate_share(msg.clone());
                                 match res {
                                     Ok(ShareValidationResult::Valid(share_hash)) => {
@@ -862,6 +882,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
         info!("Received SubmitSharesExtended: {msg}");
         let downstream_id =
             client_id.expect("client_id must be present for downstream_id extraction");
+        let ignore_share_validation = self.ignore_share_validation;
 
         // Extract user_identity from TLV fields if the extension is negotiated
         let negotiated_extensions = self.get_negotiated_extensions_with_client(client_id);
@@ -914,6 +935,25 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                             .extended_channels
                             .with_mut(&channel_id, |extended_channel| {
                                 let mut messages: Vec<RouteMessageTo> = Vec::new();
+                                if ignore_share_validation {
+                                    let share_work =
+                                        extended_channel.get_target().difficulty_float();
+                                    let success = SubmitSharesSuccess {
+                                        channel_id,
+                                        last_sequence_number: msg.sequence_number,
+                                        new_submits_accepted_count: 1,
+                                        new_shares_sum: share_work as u64,
+                                    };
+                                    info!(
+                                        "SubmitSharesExtended: accepted without validation | downstream_id: {}, channel_id: {}, sequence_number: {} \u{2705}",
+                                        downstream_id, channel_id, msg.sequence_number
+                                    );
+                                    messages.push(
+                                        (downstream_id, Mining::SubmitSharesSuccess(success))
+                                            .into(),
+                                    );
+                                    return Ok(messages);
+                                }
                                 let res = extended_channel.validate_share(msg.clone());
                                 match res {
                                     Ok(ShareValidationResult::Valid(share_hash)) => {

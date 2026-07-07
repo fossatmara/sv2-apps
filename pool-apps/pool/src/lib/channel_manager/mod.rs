@@ -114,6 +114,10 @@ pub struct ChannelManager {
     required_extensions: Vec<u16>,
     /// Embedded Job Declaration engine (present when `[jds]` config is set).
     job_declarator: Option<JobDeclarator>,
+    /// Accept every SubmitShares message without validating it (testing only).
+    ignore_share_validation: bool,
+    /// How often the vardiff loop re-evaluates every channel's difficulty.
+    vardiff_interval_secs: u64,
 }
 
 #[cfg_attr(not(test), hotpath::measure_all)]
@@ -195,6 +199,8 @@ impl ChannelManager {
             supported_extensions: config.supported_extensions().to_vec(),
             required_extensions: config.required_extensions().to_vec(),
             job_declarator,
+            ignore_share_validation: config.ignore_share_validation(),
+            vardiff_interval_secs: config.vardiff_interval_secs(),
         };
 
         Ok(channel_manager)
@@ -605,10 +611,12 @@ impl ChannelManager {
     // Periodic vardiff task loop.
     //
     // # Purpose
-    // - Executes the vardiff cycle every 60 seconds for all downstreams.
+    // - Executes the vardiff cycle every `vardiff_interval_secs` (default 60)
+    //   for all downstreams.
     // - Delegates to [`Self::run_vardiff`] on each tick.
     async fn run_vardiff_loop(&self) -> PoolResult<(), error::ChannelManager> {
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+        let mut ticker =
+            tokio::time::interval(std::time::Duration::from_secs(self.vardiff_interval_secs));
         loop {
             ticker.tick().await;
             info!("Starting vardiff loop for downstreams");

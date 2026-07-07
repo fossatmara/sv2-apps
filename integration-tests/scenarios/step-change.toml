@@ -1,0 +1,23 @@
+# Sudden hashrate steps: a farm 10x-ing at t=120s, then dropping to a tenth
+# at t=360s. Tests vardiff reaction time in both directions.
+name = "step-change"
+duration_secs = 600
+
+[[miners]]
+name = "stepper"
+hashrate = 100e12
+
+[[miners.events]]
+at = 120
+action = "set_hashrate"
+hashrate = 1000e12
+
+[[miners.events]]
+at = 360
+action = "set_hashrate"
+hashrate = 10e12
+
+# Control miner: no changes, should stay converged throughout.
+[[miners]]
+name = "control"
+hashrate = 100e12

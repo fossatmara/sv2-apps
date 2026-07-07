@@ -1,0 +1,18 @@
+# Baseline: three static miners, one of which lies about its hashrate.
+# Watch vardiff converge each channel to the pool's shares_per_minute setpoint.
+name = "convergence"
+duration_secs = 600
+
+[[miners]]
+name = "honest-big"
+hashrate = 500e12
+
+[[miners]]
+name = "honest-small"
+hashrate = 10e12
+
+# Reports 100x less than it actually has: vardiff must correct upward.
+[[miners]]
+name = "sandbagger"
+hashrate = 200e12
+reported_hashrate = 2e12

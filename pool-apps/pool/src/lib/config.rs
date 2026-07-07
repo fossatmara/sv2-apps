@@ -50,6 +50,17 @@ pub struct PoolConfig {
     jds: Option<JDSPartialConfig>,
     #[serde(default)]
     monitoring_cache_refresh_secs: Option<u64>,
+    // Accept every SubmitShares message without validating it. FOR TESTING ONLY:
+    // lets simulated miners submit dummy shares to exercise vardiff without hashing.
+    #[serde(default)]
+    ignore_share_validation: bool,
+    // How often the vardiff loop re-evaluates every channel's difficulty.
+    #[serde(default = "default_vardiff_interval_secs")]
+    vardiff_interval_secs: u64,
+}
+
+fn default_vardiff_interval_secs() -> u64 {
+    60
 }
 
 impl PoolConfig {
@@ -90,6 +101,8 @@ impl PoolConfig {
             monitoring_address,
             monitoring_cache_refresh_secs,
             jds,
+            ignore_share_validation: false,
+            vardiff_interval_secs: default_vardiff_interval_secs(),
         }
     }
 
@@ -141,6 +154,26 @@ impl PoolConfig {
     /// Returns the shares per minute.
     pub fn shares_per_minute(&self) -> f32 {
         self.shares_per_minute
+    }
+
+    /// Returns whether share validation is ignored (testing only).
+    pub fn ignore_share_validation(&self) -> bool {
+        self.ignore_share_validation
+    }
+
+    /// Sets whether share validation is ignored (testing only).
+    pub fn set_ignore_share_validation(&mut self, ignore: bool) {
+        self.ignore_share_validation = ignore;
+    }
+
+    /// Returns the vardiff re-evaluation interval in seconds.
+    pub fn vardiff_interval_secs(&self) -> u64 {
+        self.vardiff_interval_secs
+    }
+
+    /// Sets the vardiff re-evaluation interval in seconds.
+    pub fn set_vardiff_interval_secs(&mut self, secs: u64) {
+        self.vardiff_interval_secs = secs;
     }
 
     /// Returns the supported extensions.

@@ -1,0 +1,39 @@
+# Connect/disconnect churn plus noisy hashrates: exercises vardiff state
+# cleanup, cold starts, and stability against oscillation and random drift.
+name = "churn-and-drift"
+duration_secs = 900
+
+# Joins late, leaves, comes back.
+[[miners]]
+name = "churner"
+hashrate = 100e12
+start_at = 60
+
+[[miners.events]]
+at = 300
+action = "disconnect"
+
+[[miners.events]]
+at = 420
+action = "reconnect"
+
+# Thermal-throttling-style slow oscillation (+/-20% over 5 minutes).
+[[miners]]
+name = "oscillator"
+hashrate = 100e12
+
+[miners.drift]
+mode = "sine"
+amplitude = 0.2
+period_secs = 300
+step_secs = 5
+
+# Random walk within +/-30% of base.
+[[miners]]
+name = "wanderer"
+hashrate = 50e12
+
+[miners.drift]
+mode = "random_walk"
+amplitude = 0.3
+step_secs = 5

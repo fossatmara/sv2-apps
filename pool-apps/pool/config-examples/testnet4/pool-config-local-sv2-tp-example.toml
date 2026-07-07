@@ -23,6 +23,10 @@ pool_signature = "Stratum V2 SRI Pool"
 
 # How many shares we expect to receive in a minute (determines difficulty targets)
 shares_per_minute = 6.0
+
+# Accept every submitted share without validation (TESTING ONLY).
+# Enables simulated miners that exercise vardiff without real hashing.
+# ignore_share_validation = true
 # How many shares do we want to acknowledge in a batch
 share_batch_size = 10
 

@@ -22,7 +22,7 @@ async-channel = { version = "1.5.1", default-features = false }
 corepc-node = { version = "0.7.0", default-features = false, features = ["28_0"] }
 minreq = { version = "2.12.0", default-features = false, features = ["https"] }
 once_cell = { version = "1.19.0", default-features = false }
-tokio = { version="1.44.1", default-features = false,  features = ["tracing"] }
+tokio = { version="1.44.1", default-features = false,  features = ["tracing", "rt-multi-thread", "macros", "time", "net", "sync", "signal"] }
 tokio-util = { version = "0.7", default-features = false }
 tracing = { version = "0.1.41", default-features = false }
 tracing-subscriber = { version = "0.3.19", default-features = false }
@@ -30,6 +30,11 @@ hex = "0.4.3"
 clap = { version = "^4.5.4", features = ["derive"] }
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
+
+# Dependencies for the `vardiff_sim` module and `vardiff-sim` binary.
+toml = "0.8"
+ratatui = "0.29"
+crossterm = "0.28"
 
 # Direct dependencies kept only for the embedded `mining_device` module.
 # Remove this block when removing:
@@ -57,6 +62,11 @@ path = "lib/mod.rs"
 name = "mining_device"
 path = "bin/mining_device.rs"
 
+# Interactive vardiff test harness (simulated miners, no real hashing).
+[[bin]]
+name = "vardiff-sim"
+path = "bin/vardiff_sim/main.rs"
+
 # Bench targets preserved from the former standalone `mining_device` crate.
 # Remove these entries when the embedded `mining_device` module is deprecated.
 [[bench]]
@@ -70,3 +80,6 @@ harness = false
 [[bench]]
 name = "mining_device_scaling_bench"
 harness = false
+
+[patch."https://github.com/stratum-mining/stratum"]
+stratum-core = { path = "../../stratum-vardiff/stratum-core" }
