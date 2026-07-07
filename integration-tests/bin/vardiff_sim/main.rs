@@ -55,7 +55,10 @@ struct Args {
     vardiff_interval: u64,
 
     /// Vardiff algorithm for the spawned pool: "classic", "pid" or "qpid".
-    #[arg(long, default_value = "classic")]
+    /// Defaults to qpid (PID with Q-learning gain scheduling): reacts
+    /// share-driven within seconds, while classic's time-threshold ladder is
+    /// minute-scale by design.
+    #[arg(long, default_value = "qpid")]
     algorithm: String,
 
     /// PID proportional gain (pid algorithm only).
