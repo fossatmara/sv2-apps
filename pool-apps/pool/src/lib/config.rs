@@ -57,10 +57,90 @@ pub struct PoolConfig {
     // How often the vardiff loop re-evaluates every channel's difficulty.
     #[serde(default = "default_vardiff_interval_secs")]
     vardiff_interval_secs: u64,
+    // Which vardiff control algorithm to run, and its tuning.
+    #[serde(default)]
+    vardiff: VardiffConfig,
 }
 
 fn default_vardiff_interval_secs() -> u64 {
     60
+}
+
+/// Vardiff algorithm selection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VardiffAlgorithm {
+    /// Threshold/deadband controller (the historical behavior).
+    #[default]
+    Classic,
+    /// Log-space PID controller.
+    Pid,
+}
+
+/// Vardiff algorithm configuration (`[vardiff]` section).
+///
+/// The gain fields only apply to the `pid` algorithm; see
+/// `channels_sv2::vardiff::pid` for what each one does.
+#[derive(Clone, Copy, Debug, serde::Deserialize)]
+#[serde(default)]
+pub struct VardiffConfig {
+    pub algorithm: VardiffAlgorithm,
+    pub kp: f64,
+    pub ki: f64,
+    pub kd: f64,
+    /// Largest multiplicative difficulty change per update.
+    pub max_step: f64,
+    /// Integral pressure required to emit when no single window is
+    /// individually significant.
+    pub deadband: f64,
+    /// Single-window significance threshold in sigmas (statistical deadband).
+    pub significance_z: f64,
+    /// Back-calculation anti-windup tracking time constant in seconds.
+    pub tracking_secs: f64,
+}
+
+impl Default for VardiffConfig {
+    fn default() -> Self {
+        use stratum_apps::stratum_core::channels_sv2::vardiff::pid;
+        Self {
+            algorithm: VardiffAlgorithm::default(),
+            kp: pid::DEFAULT_KP,
+            ki: pid::DEFAULT_KI,
+            kd: pid::DEFAULT_KD,
+            max_step: pid::DEFAULT_MAX_STEP,
+            deadband: pid::DEFAULT_DEADBAND,
+            significance_z: pid::DEFAULT_SIGNIFICANCE_Z,
+            tracking_secs: pid::DEFAULT_TRACKING_SECS,
+        }
+    }
+}
+
+impl VardiffConfig {
+    /// Instantiates the configured vardiff controller for one channel.
+    pub fn build(
+        &self,
+    ) -> Result<
+        Box<dyn stratum_apps::stratum_core::channels_sv2::Vardiff>,
+        stratum_apps::stratum_core::channels_sv2::vardiff::error::VardiffError,
+    > {
+        use stratum_apps::stratum_core::channels_sv2::{PidParams, PidVardiffState, VardiffState};
+        match self.algorithm {
+            VardiffAlgorithm::Classic => Ok(Box::new(VardiffState::new()?)),
+            VardiffAlgorithm::Pid => {
+                let params = PidParams {
+                    kp: self.kp,
+                    ki: self.ki,
+                    kd: self.kd,
+                    max_step: self.max_step,
+                    deadband: self.deadband,
+                    significance_z: self.significance_z,
+                    tracking_secs: self.tracking_secs,
+                    ..PidParams::default()
+                };
+                Ok(Box::new(PidVardiffState::with_params(params)?))
+            }
+        }
+    }
 }
 
 impl PoolConfig {
@@ -103,6 +183,7 @@ impl PoolConfig {
             jds,
             ignore_share_validation: false,
             vardiff_interval_secs: default_vardiff_interval_secs(),
+            vardiff: VardiffConfig::default(),
         }
     }
 
@@ -174,6 +255,16 @@ impl PoolConfig {
     /// Sets the vardiff re-evaluation interval in seconds.
     pub fn set_vardiff_interval_secs(&mut self, secs: u64) {
         self.vardiff_interval_secs = secs;
+    }
+
+    /// Returns the vardiff algorithm configuration.
+    pub fn vardiff(&self) -> VardiffConfig {
+        self.vardiff
+    }
+
+    /// Sets the vardiff algorithm configuration.
+    pub fn set_vardiff(&mut self, vardiff: VardiffConfig) {
+        self.vardiff = vardiff;
     }
 
     /// Returns the supported extensions.

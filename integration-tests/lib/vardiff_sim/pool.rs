@@ -25,11 +25,14 @@ const AUTHORITY_SECRET_KEY: &str = "mkDLTBBRxdBv998612qipDYoTK3YUrqLe8uWw7gu3iXb
 /// template provider handle (keep both alive for the duration of the run).
 ///
 /// `vardiff_interval_secs` controls how often the pool re-evaluates channel
-/// difficulty. Note the classic algorithm ignores windows of 15s or less, so
-/// values below ~16 have no additional effect.
+/// difficulty. Note the classic algorithm ignores windows of 15s or less
+/// (so values below ~16 have no effect there); the pid algorithm accepts
+/// arbitrarily short intervals and gates on statistical significance
+/// instead.
 pub async fn start_sim_pool(
     shares_per_minute: f32,
     vardiff_interval_secs: u64,
+    vardiff: pool_sv2::config::VardiffConfig,
 ) -> (PoolSv2, SocketAddr, TemplateProvider) {
     let (template_provider, tp_address) = start_template_provider(None, DifficultyLevel::Low);
 
@@ -66,6 +69,7 @@ pub async fn start_sim_pool(
     );
     config.set_ignore_share_validation(true);
     config.set_vardiff_interval_secs(vardiff_interval_secs);
+    config.set_vardiff(vardiff);
 
     let pool = PoolSv2::new(config);
     let pool_clone = pool.clone();
@@ -73,15 +77,23 @@ pub async fn start_sim_pool(
         let _ = pool_clone.start().await;
     });
     // The pool opens its listener only after the first template arrives.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    if !wait_for_pool(listen_address, Duration::from_secs(60)).await {
+        panic!("pool never opened its listener on {listen_address}");
+    }
+    (pool, listen_address, template_provider)
+}
+
+/// Waits until a pool accepts TCP connections on `address`. Returns false if
+/// the timeout expires first.
+pub async fn wait_for_pool(address: SocketAddr, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        match tokio::net::TcpStream::connect(listen_address).await {
-            Ok(_) => break,
+        match tokio::net::TcpStream::connect(address).await {
+            Ok(_) => return true,
             Err(_) if tokio::time::Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
-            Err(e) => panic!("pool never opened its listener on {listen_address}: {e}"),
+            Err(_) => return false,
         }
     }
-    (pool, listen_address, template_provider)
 }

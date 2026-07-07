@@ -5,7 +5,6 @@ use std::{
     collections::{HashMap, VecDeque},
     io::Write,
     net::SocketAddr,
-    time::{Duration, Instant},
 };
 
 use async_channel::{Receiver, Sender};
@@ -14,12 +13,14 @@ use stratum_apps::key_utils::Secp256k1PublicKey;
 use tracing::info;
 
 use super::{
-    expected_shares_per_minute, miner::run_miner, scenario::{Drift, DriftMode},
-    target_le_to_difficulty, MinerCommand, MinerConfig, MinerEvent,
+    clock_speed, expected_shares_per_minute, miner::run_miner,
+    scenario::{Drift, DriftMode},
+    set_clock_speed, target_le_to_difficulty, virtual_now_secs, MinerCommand, MinerConfig,
+    MinerEvent,
 };
 
-/// Window over which the realized share rate is measured.
-const REALIZED_RATE_WINDOW: Duration = Duration::from_secs(60);
+/// Window over which the realized share rate is measured (virtual seconds).
+const REALIZED_RATE_WINDOW_SECS: f64 = 60.0;
 
 pub struct EngineConfig {
     pub pool_address: SocketAddr,
@@ -37,7 +38,8 @@ struct DriftState {
     base_hashrate: f64,
     /// Multiplier accumulated by the random walk.
     walk: f64,
-    last_step: Instant,
+    /// Virtual timestamp of the last drift step.
+    last_step: f64,
 }
 
 /// Live statistics for one miner, updated from its event stream.
@@ -55,21 +57,41 @@ pub struct MinerStats {
     pub target_updates: u64,
     pub disconnects: u64,
     pub last_error: Option<String>,
-    share_times: VecDeque<Instant>,
+    /// Virtual timestamps of recent share submissions.
+    share_times: VecDeque<f64>,
     /// (elapsed_secs, difficulty) at every target change, for plotting.
     pub difficulty_history: Vec<(f64, f64)>,
+    /// Every commanded hashrate change (manual or scenario step; drift
+    /// updates are deliberately excluded so they don't flood chart
+    /// annotations).
+    pub hashrate_changes: Vec<HashrateChange>,
+}
+
+/// A commanded hashrate change, for chart annotations.
+#[derive(Debug, Clone, Copy)]
+pub struct HashrateChange {
+    /// Virtual seconds since engine start.
+    pub at: f64,
+    pub from: f64,
+    pub to: f64,
+}
+
+impl HashrateChange {
+    pub fn is_increase(&self) -> bool {
+        self.to >= self.from
+    }
 }
 
 impl MinerStats {
-    /// Shares per minute over the trailing window.
+    /// Shares per minute over the trailing window (virtual time).
     pub fn realized_spm(&self) -> f64 {
-        let now = Instant::now();
+        let now = virtual_now_secs();
         let in_window = self
             .share_times
             .iter()
-            .filter(|t| now.duration_since(**t) <= REALIZED_RATE_WINDOW)
+            .filter(|t| now - **t <= REALIZED_RATE_WINDOW_SECS)
             .count();
-        in_window as f64 * 60.0 / REALIZED_RATE_WINDOW.as_secs_f64()
+        in_window as f64 * 60.0 / REALIZED_RATE_WINDOW_SECS
     }
 }
 
@@ -79,7 +101,8 @@ pub struct SimEngine {
     pub stats: HashMap<String, MinerStats>,
     events_tx: Sender<(String, MinerEvent)>,
     events_rx: Receiver<(String, MinerEvent)>,
-    started: Instant,
+    /// Virtual timestamp when the engine started.
+    started_virtual: f64,
 }
 
 impl SimEngine {
@@ -91,12 +114,27 @@ impl SimEngine {
             stats: HashMap::new(),
             events_tx,
             events_rx,
-            started: Instant::now(),
+            started_virtual: virtual_now_secs(),
         }
     }
 
+    /// Elapsed virtual seconds since the engine started.
     pub fn elapsed_secs(&self) -> f64 {
-        self.started.elapsed().as_secs_f64()
+        virtual_now_secs() - self.started_virtual
+    }
+
+    /// Current sim clock speed factor (1.0 = real time).
+    pub fn speed(&self) -> f64 {
+        clock_speed()
+    }
+
+    /// Changes the sim clock speed. Miners re-sample their share timers so
+    /// deadlines scheduled at the old speed don't linger.
+    pub fn set_speed(&mut self, speed: f64) {
+        set_clock_speed(speed.clamp(0.25, 64.0));
+        for slot in self.miners.values() {
+            let _ = slot.commands.try_send(MinerCommand::Resample);
+        }
     }
 
     /// Names of all miners ever spawned, sorted for stable display.
@@ -117,7 +155,7 @@ impl SimEngine {
         let drift_state = drift.map(|spec| DriftState {
             base_hashrate: config.hashrate,
             walk: 1.0,
-            last_step: Instant::now(),
+            last_step: virtual_now_secs(),
             spec,
         });
         let slot = MinerSlot {
@@ -142,13 +180,22 @@ impl SimEngine {
     }
 
     pub fn set_hashrate(&mut self, name: &str, hashrate: f64) {
+        let elapsed = self.elapsed_secs();
         if let Some(slot) = self.miners.get_mut(name) {
+            let previous = slot.config.hashrate;
             slot.config.hashrate = hashrate;
             if let Some(drift) = slot.drift.as_mut() {
                 drift.base_hashrate = hashrate;
                 drift.walk = 1.0;
             }
             let _ = slot.commands.try_send(MinerCommand::SetHashrate(hashrate));
+            if let Some(stats) = self.stats.get_mut(name) {
+                stats.hashrate_changes.push(HashrateChange {
+                    at: elapsed,
+                    from: previous,
+                    to: hashrate,
+                });
+            }
         }
     }
 
@@ -216,7 +263,7 @@ impl SimEngine {
                 MinerEvent::NewJob { .. } => {}
                 MinerEvent::ShareSubmitted { .. } => {
                     stats.submitted += 1;
-                    stats.share_times.push_back(Instant::now());
+                    stats.share_times.push_back(virtual_now_secs());
                     while stats.share_times.len() > 10_000 {
                         stats.share_times.pop_front();
                     }
@@ -241,18 +288,20 @@ impl SimEngine {
         }
     }
 
-    /// Applies drift models; call every tick.
+    /// Applies drift models; call every tick. Drift timing runs on the
+    /// virtual clock, so accelerated runs drift proportionally faster.
     pub fn apply_drift(&mut self) {
         let elapsed = self.elapsed_secs();
+        let now_virtual = virtual_now_secs();
         let mut updates: Vec<(String, f64)> = Vec::new();
         for (name, slot) in self.miners.iter_mut() {
             let Some(drift) = slot.drift.as_mut() else {
                 continue;
             };
-            if drift.last_step.elapsed().as_secs_f64() < drift.spec.step_secs {
+            if now_virtual - drift.last_step < drift.spec.step_secs {
                 continue;
             }
-            drift.last_step = Instant::now();
+            drift.last_step = now_virtual;
             let hashrate = match drift.spec.mode {
                 DriftMode::Sine => {
                     let phase = elapsed * std::f64::consts::TAU / drift.spec.period_secs;

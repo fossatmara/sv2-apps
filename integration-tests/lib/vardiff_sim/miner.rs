@@ -148,6 +148,9 @@ async fn run_miner_inner(
                         emit(MinerEvent::HashrateChanged { hashrate: h }).await;
                         next_share_at = state.resample_share_timer();
                     }
+                    Ok(MinerCommand::Resample) => {
+                        next_share_at = state.resample_share_timer();
+                    }
                     Ok(MinerCommand::Disconnect) | Err(_) => {
                         return Ok("disconnect requested".to_string());
                     }

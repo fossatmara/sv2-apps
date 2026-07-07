@@ -20,7 +20,7 @@ use stratum_apps::{
         channels_sv2::{
             extranonce_manager::{bytes_needed, ExtranonceAllocator},
             server::{extended::ExtendedChannel, group::GroupChannel, standard::StandardChannel},
-            Vardiff, VardiffState,
+            Vardiff,
         },
         handlers_sv2::{
             HandleMiningMessagesFromClientAsync, HandleTemplateDistributionMessagesFromServerAsync,
@@ -96,7 +96,7 @@ pub struct ChannelManager {
     downstream_id_factory: Arc<AtomicUsize>,
     // Mapping of `(downstream_id, channel_id)` -> vardiff controller.
     // Each entry manages variable difficulty for a specific downstream channel.
-    pub(crate) vardiff: SharedMap<VardiffKey, VardiffState>,
+    pub(crate) vardiff: SharedMap<VardiffKey, Box<dyn Vardiff>>,
     // Coinbase outputs.
     pub(crate) coinbase_outputs: Vec<u8>,
     // Last new prevhash.
@@ -118,6 +118,8 @@ pub struct ChannelManager {
     ignore_share_validation: bool,
     /// How often the vardiff loop re-evaluates every channel's difficulty.
     vardiff_interval_secs: u64,
+    /// Which vardiff algorithm new channels get, and its tuning.
+    vardiff_config: crate::config::VardiffConfig,
 }
 
 #[cfg_attr(not(test), hotpath::measure_all)]
@@ -201,6 +203,7 @@ impl ChannelManager {
             job_declarator,
             ignore_share_validation: config.ignore_share_validation(),
             vardiff_interval_secs: config.vardiff_interval_secs(),
+            vardiff_config: config.vardiff(),
         };
 
         Ok(channel_manager)
@@ -518,7 +521,7 @@ impl ChannelManager {
         downstream_id: DownstreamId,
         channel_id: ChannelId,
         channel_state: &mut ExtendedChannel<'static>,
-        vardiff_state: &mut VardiffState,
+        vardiff_state: &mut Box<dyn Vardiff>,
         updates: &mut Vec<RouteMessageTo>,
     ) {
         let (hashrate, target, shares_per_minute) = (
@@ -566,7 +569,7 @@ impl ChannelManager {
         downstream_id: DownstreamId,
         channel_id: ChannelId,
         channel: &mut StandardChannel<'static>,
-        vardiff_state: &mut VardiffState,
+        vardiff_state: &mut Box<dyn Vardiff>,
         updates: &mut Vec<RouteMessageTo>,
     ) {
         let hashrate = channel.get_nominal_hashrate();
@@ -614,11 +617,17 @@ impl ChannelManager {
     // - Executes the vardiff cycle every `vardiff_interval_secs` (default 60)
     //   for all downstreams.
     // - Delegates to [`Self::run_vardiff`] on each tick.
+    //
+    // The interval is expressed in vardiff (virtual) seconds: the sim clock
+    // scale is re-read every iteration so a simulator accelerating time in
+    // this process shortens the wall-clock period consistently. At the
+    // default scale of 1.0 this is exactly `vardiff_interval_secs` of wall
+    // time.
     async fn run_vardiff_loop(&self) -> PoolResult<(), error::ChannelManager> {
-        let mut ticker =
-            tokio::time::interval(std::time::Duration::from_secs(self.vardiff_interval_secs));
+        use stratum_apps::stratum_core::channels_sv2::vardiff::sim_clock;
         loop {
-            ticker.tick().await;
+            let wall_secs = (self.vardiff_interval_secs as f64 / sim_clock::scale()).max(0.05);
+            tokio::time::sleep(std::time::Duration::from_secs_f64(wall_secs)).await;
             info!("Starting vardiff loop for downstreams");
 
             if let Err(e) = self.run_vardiff().await {

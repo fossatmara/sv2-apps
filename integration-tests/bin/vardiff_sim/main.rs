@@ -40,15 +40,51 @@ struct Args {
     #[arg(long)]
     spawn_pool: bool,
 
-    /// shares_per_minute for the spawned pool (vardiff setpoint).
-    #[arg(long, default_value_t = 6.0)]
+    /// shares_per_minute for the spawned pool (vardiff setpoint). The
+    /// interactive default is high so each vardiff window carries enough
+    /// shares to react quickly; use production-like values (e.g. 6) when
+    /// testing that regime deliberately.
+    #[arg(long, default_value_t = 60.0)]
     shares_per_minute: f32,
 
     /// How often (seconds) the spawned pool re-evaluates channel difficulty.
-    /// The classic algorithm skips windows of 15s or less, so the effective
-    /// minimum is 16.
-    #[arg(long, default_value_t = 60)]
+    /// The classic algorithm skips windows of 15s or less (effective minimum
+    /// 16); pid accepts any interval and gates on statistical significance.
+    /// The interactive default is snappier than the production default (60).
+    #[arg(long, default_value_t = 20)]
     vardiff_interval: u64,
+
+    /// Vardiff algorithm for the spawned pool: "classic" or "pid".
+    #[arg(long, default_value = "classic")]
+    algorithm: String,
+
+    /// PID proportional gain (pid algorithm only).
+    #[arg(long)]
+    kp: Option<f64>,
+
+    /// PID integral gain per second (pid algorithm only).
+    #[arg(long)]
+    ki: Option<f64>,
+
+    /// PID derivative gain (pid algorithm only).
+    #[arg(long)]
+    kd: Option<f64>,
+
+    /// Largest multiplicative difficulty change per update (pid only).
+    #[arg(long)]
+    max_step: Option<f64>,
+
+    /// Integral-pressure deadband fraction (pid only).
+    #[arg(long)]
+    deadband: Option<f64>,
+
+    /// Single-window significance threshold in sigmas (pid only).
+    #[arg(long)]
+    significance_z: Option<f64>,
+
+    /// Anti-windup tracking time constant in seconds (pid only).
+    #[arg(long)]
+    tracking_secs: Option<f64>,
 
     /// Scenario file (TOML). Required in headless mode.
     #[arg(long)]
@@ -73,6 +109,13 @@ struct Args {
     /// Hashrate (H/s) of the default TUI miners.
     #[arg(long, default_value_t = 100e12)]
     hashrate: f64,
+
+    /// Sim clock speed factor (e.g. 8 = one wall second counts as eight
+    /// simulated seconds). Requires --spawn-pool: the pool's vardiff clock
+    /// must live in this process to stay consistent. In the TUI, 1 and 2
+    /// halve/double the speed live.
+    #[arg(long, default_value_t = 1.0)]
+    speed: f64,
 }
 
 #[tokio::main]
@@ -115,22 +158,81 @@ async fn main() {
     let mut _template_provider: Option<integration_tests_sv2::template_provider::TemplateProvider> =
         None;
     let pool_address: SocketAddr = if args.spawn_pool {
-        eprintln!("starting regtest template provider + pool (ignore_share_validation=true)...");
+        let algorithm = match args.algorithm.as_str() {
+            "classic" => pool_sv2::config::VardiffAlgorithm::Classic,
+            "pid" => pool_sv2::config::VardiffAlgorithm::Pid,
+            other => {
+                eprintln!("error: unknown --algorithm '{other}' (use classic or pid)");
+                std::process::exit(1);
+            }
+        };
+        let mut vardiff = pool_sv2::config::VardiffConfig {
+            algorithm,
+            ..Default::default()
+        };
+        if let Some(v) = args.kp {
+            vardiff.kp = v;
+        }
+        if let Some(v) = args.ki {
+            vardiff.ki = v;
+        }
+        if let Some(v) = args.kd {
+            vardiff.kd = v;
+        }
+        if let Some(v) = args.max_step {
+            vardiff.max_step = v;
+        }
+        if let Some(v) = args.deadband {
+            vardiff.deadband = v;
+        }
+        if let Some(v) = args.significance_z {
+            vardiff.significance_z = v;
+        }
+        if let Some(v) = args.tracking_secs {
+            vardiff.tracking_secs = v;
+        }
+        eprintln!(
+            "starting regtest template provider + pool (ignore_share_validation=true, vardiff={})...",
+            args.algorithm
+        );
         let (pool, address, tp) =
-            start_sim_pool(args.shares_per_minute, args.vardiff_interval).await;
+            start_sim_pool(args.shares_per_minute, args.vardiff_interval, vardiff).await;
         embedded_pool = Some(pool);
         _template_provider = Some(tp);
         eprintln!("pool listening on {address}");
         address
     } else {
-        match args.pool {
+        let address = match args.pool {
             Some(a) => a,
             None => {
                 eprintln!("error: pass --pool <addr> or --spawn-pool");
                 std::process::exit(1);
             }
+        };
+        eprintln!("waiting for pool at {address}...");
+        if !integration_tests_sv2::vardiff_sim::pool::wait_for_pool(
+            address,
+            Duration::from_secs(60),
+        )
+        .await
+        {
+            eprintln!("error: pool at {address} not reachable after 60s");
+            std::process::exit(1);
         }
+        address
     };
+
+    if args.speed != 1.0 {
+        if !args.spawn_pool {
+            eprintln!(
+                "error: --speed needs --spawn-pool (an external pool's vardiff clock \
+                 cannot be accelerated from here, so results would be distorted)"
+            );
+            std::process::exit(1);
+        }
+        integration_tests_sv2::vardiff_sim::set_clock_speed(args.speed);
+        eprintln!("sim clock speed x{:.2}", args.speed);
+    }
 
     let mut engine = SimEngine::new(EngineConfig {
         pool_address,
@@ -151,7 +253,15 @@ async fn main() {
         } else {
             Vec::new()
         };
-        let result = tui::run(engine, driver, default_fleet, csv, shutdown_signal).await;
+        let result = tui::run(
+            engine,
+            driver,
+            default_fleet,
+            csv,
+            shutdown_signal,
+            args.spawn_pool,
+        )
+        .await;
         shutdown_embedded_pool(embedded_pool, _template_provider).await;
         if let Err(e) = result {
             eprintln!("tui error: {e}");
@@ -169,11 +279,13 @@ async fn main() {
         .or(driver.scenario().duration_secs)
         .unwrap_or(300);
 
-    let mut ticker = tokio::time::interval(Duration::from_secs(1));
     let mut last_print = 0u64;
     loop {
+        // One iteration per *virtual* second: at speed 8 the loop runs 8x
+        // faster in wall time, keeping one CSV row per simulated second.
+        let wall_secs = (1.0 / engine.speed()).clamp(0.05, 10.0);
         tokio::select! {
-            _ = ticker.tick() => {}
+            _ = tokio::time::sleep(Duration::from_secs_f64(wall_secs)) => {}
             _ = shutdown_signal.recv() => {
                 println!("signal received, shutting down...");
                 break;

@@ -10,7 +10,6 @@ use stratum_apps::stratum_core::{
             share_accounting::{ShareValidationError, ShareValidationResult},
             standard::StandardChannel,
         },
-        Vardiff, VardiffState,
     },
     extensions_sv2::{
         UserIdentity, EXTENSION_TYPE_WORKER_HASHRATE_TRACKING, TLV_FIELD_TYPE_USER_IDENTITY,
@@ -102,6 +101,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
             client_id.expect("client_id must be present for downstream_id extraction");
 
         info!("Received OpenStandardMiningChannel: {}", msg);
+        let vardiff_config = self.vardiff_config;
 
         let messages = self.with_registered_downstream(downstream_id, |downstream| {
                 if downstream.requires_custom_work.load(Ordering::SeqCst) {
@@ -308,7 +308,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                             PoolError::shutdown(e)
                         })?;
                 }
-                let vardiff = VardiffState::new().map_err(PoolError::shutdown)?;
+                let vardiff = vardiff_config.build().map_err(PoolError::shutdown)?;
                 self.vardiff
                     .insert((downstream_id, channel_id).into(), vardiff);
 
@@ -342,6 +342,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
         let nominal_hash_rate = msg.nominal_hash_rate;
         let requested_max_target = Target::from_le_bytes(msg.max_target.to_array());
         let requested_min_rollable_extranonce_size = msg.min_extranonce_size;
+        let vardiff_config = self.vardiff_config;
 
         let messages = self.with_registered_downstream(downstream_id, |downstream| {
                 if downstream.requires_standard_jobs.load(Ordering::SeqCst) {
@@ -596,7 +597,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                 downstream
                     .extended_channels
                     .insert(channel_id, extended_channel);
-                let vardiff = VardiffState::new().map_err(PoolError::shutdown)?;
+                let vardiff = vardiff_config.build().map_err(PoolError::shutdown)?;
                 self.vardiff
                     .insert((downstream_id, channel_id).into(), vardiff);
 

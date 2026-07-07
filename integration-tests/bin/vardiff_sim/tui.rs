@@ -2,7 +2,8 @@
 //!
 //! Keys: `z` quit, `w`/`s` (or arrows) select miner, `a`/`d` halve/double the
 //! selected miner's hashrate, `f` disconnect, `r` reconnect, `e` add a miner
-//! (100 TH/s), `q` remove the selected miner.
+//! (100 TH/s), `q` remove the selected miner, `1`/`2` halve/double the sim
+//! clock speed (embedded pool only).
 
 use std::{io, time::Duration};
 
@@ -31,6 +32,7 @@ pub async fn run(
     default_fleet: Vec<MinerConfig>,
     mut csv: Option<CsvWriter>,
     shutdown_signal: async_channel::Receiver<()>,
+    speed_control: bool,
 ) -> io::Result<()> {
     for config in default_fleet {
         engine.spawn_miner(config, None);
@@ -61,6 +63,9 @@ pub async fn run(
     let mut added: usize = 0;
     let mut ticker = tokio::time::interval(Duration::from_millis(250));
     let mut last_csv_tick = 0u64;
+    // Latched once every initial miner has an open channel; until then the
+    // pool can't react to anything, so miner keys are held.
+    let mut fleet_ready = false;
     let result = loop {
         tokio::select! {
             _ = ticker.tick() => {}
@@ -71,6 +76,9 @@ pub async fn run(
                 // Raw mode delivers Ctrl-C as a key event, not a SIGINT.
                 if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
                     break Ok(());
+                }
+                if !fleet_ready && !matches!(key.code, KeyCode::Char('z') | KeyCode::Esc) {
+                    continue;
                 }
                 match key.code {
                     KeyCode::Char('z') | KeyCode::Esc => break Ok(()),
@@ -106,6 +114,14 @@ pub async fn run(
                         if let Some(name) = names.get(selected) {
                             engine.reconnect(name);
                         }
+                    }
+                    KeyCode::Char('1') if speed_control => {
+                        let s = engine.speed();
+                        engine.set_speed(s / 2.0);
+                    }
+                    KeyCode::Char('2') if speed_control => {
+                        let s = engine.speed();
+                        engine.set_speed(s * 2.0);
                     }
                     KeyCode::Char('e') => {
                         added += 1;
@@ -144,7 +160,11 @@ pub async fn run(
 
         let names = engine.miner_names();
         selected = selected.min(names.len().saturating_sub(1));
-        terminal.draw(|frame| draw(frame, &engine, &names, selected))?;
+        if !fleet_ready {
+            fleet_ready = !engine.stats.is_empty()
+                && engine.stats.values().all(|s| s.channel_id.is_some());
+        }
+        terminal.draw(|frame| draw(frame, &engine, &names, selected, fleet_ready))?;
     };
 
     disable_raw_mode()?;
@@ -158,6 +178,7 @@ fn draw(
     engine: &SimEngine,
     names: &[String],
     selected: usize,
+    fleet_ready: bool,
 ) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
@@ -215,8 +236,9 @@ fn draw(
         Constraint::Length(8),
     ];
     let title = format!(
-        " vardiff-sim | t={:.0}s | {} miners ",
+        " vardiff-sim | t={:.0}s | speed x{:.2} | {} miners ",
         engine.elapsed_secs(),
+        engine.speed(),
         names.len()
     );
     let table = Table::new(rows, widths)
@@ -240,18 +262,59 @@ fn draw(
             if let Some(&(_, last)) = plotted.last() {
                 plotted.push((x_max, last));
             }
-            let dataset = Dataset::default()
+            // Vertical marker line at each commanded hashrate change:
+            // green when the hashrate went up, red when it went down.
+            let vertical_line = |t: f64| (0..=20).map(move |i| (t, y_max * 1.1 * i as f64 / 20.0));
+            let increases: Vec<(f64, f64)> = s
+                .hashrate_changes
+                .iter()
+                .filter(|c| c.is_increase())
+                .flat_map(|c| vertical_line(c.at))
+                .collect();
+            let decreases: Vec<(f64, f64)> = s
+                .hashrate_changes
+                .iter()
+                .filter(|c| !c.is_increase())
+                .flat_map(|c| vertical_line(c.at))
+                .collect();
+            let up_count = s.hashrate_changes.iter().filter(|c| c.is_increase()).count();
+            let down_count = s.hashrate_changes.len() - up_count;
+            let mut datasets = vec![Dataset::default()
                 .name(format!("difficulty ({name})"))
                 .marker(symbols::Marker::Braille)
                 .graph_type(GraphType::Line)
                 .style(Style::default().fg(Color::Cyan))
-                .data(&plotted);
-            let chart = Chart::new(vec![dataset])
+                .data(&plotted)];
+            if !increases.is_empty() {
+                datasets.push(
+                    Dataset::default()
+                        .name(format!("hashrate increased ({up_count})"))
+                        .marker(symbols::Marker::Dot)
+                        .graph_type(GraphType::Scatter)
+                        .style(Style::default().fg(Color::Green))
+                        .data(&increases),
+                );
+            }
+            if !decreases.is_empty() {
+                datasets.push(
+                    Dataset::default()
+                        .name(format!("hashrate decreased ({down_count})"))
+                        .marker(symbols::Marker::Dot)
+                        .graph_type(GraphType::Scatter)
+                        .style(Style::default().fg(Color::Red))
+                        .data(&decreases),
+                );
+            }
+            let chart = Chart::new(datasets)
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
                         .title(format!(" difficulty history: {name} ")),
                 )
+                .legend_position(Some(ratatui::widgets::LegendPosition::TopRight))
+                // Default legend constraints hide the key when it exceeds 1/4
+                // of the chart; the color key must always be visible.
+                .hidden_legend_constraints((Constraint::Ratio(3, 4), Constraint::Ratio(3, 4)))
                 .x_axis(
                     Axis::default()
                         .bounds([0.0, x_max])
@@ -279,10 +342,25 @@ fn draw(
         }
     }
 
-    let help = Line::from(vec![Span::styled(
-        " z quit | w/s select | a/d hashrate /2 / x2 | f disconnect | r reconnect | e add | q remove",
-        Style::default().fg(Color::DarkGray),
-    )]);
+    let help = if fleet_ready {
+        Line::from(vec![Span::styled(
+            " z quit | w/s select | a/d hashrate /2 x2 | f disc | r reconn | e add | q remove | 1/2 speed",
+            Style::default().fg(Color::DarkGray),
+        )])
+    } else {
+        let open = engine
+            .stats
+            .values()
+            .filter(|s| s.channel_id.is_some())
+            .count();
+        Line::from(vec![Span::styled(
+            format!(
+                " connecting to pool... {open}/{} miner channels open — keys held until ready (z quits)",
+                engine.stats.len()
+            ),
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        )])
+    };
     frame.render_widget(
         ratatui::widgets::Paragraph::new(help),
         layout[2],

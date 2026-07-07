@@ -25,8 +25,28 @@ pub enum MinerCommand {
     /// Change the simulated hashrate (H/s). Takes effect on the next share
     /// interval sample.
     SetHashrate(f64),
+    /// Re-sample the share timer (e.g. after the sim clock speed changed, so
+    /// a deadline scheduled at the old speed doesn't linger).
+    Resample,
     /// Close the connection and end the miner task.
     Disconnect,
+}
+
+/// Current sim clock speed factor (1.0 = real time).
+pub fn clock_speed() -> f64 {
+    stratum_apps::stratum_core::channels_sv2::vardiff::sim_clock::scale()
+}
+
+/// Sets the sim clock speed factor. Affects the vardiff algorithms and the
+/// pool's vardiff loop in this process, so it is only meaningful with an
+/// embedded (`--spawn-pool`) pool.
+pub fn set_clock_speed(speed: f64) {
+    stratum_apps::stratum_core::channels_sv2::vardiff::sim_clock::set_scale(speed);
+}
+
+/// Current virtual time as fractional seconds since the Unix epoch.
+pub fn virtual_now_secs() -> f64 {
+    stratum_apps::stratum_core::channels_sv2::vardiff::sim_clock::now_secs_f64()
 }
 
 /// Events a miner task reports back to the engine.
@@ -91,16 +111,18 @@ pub fn share_probability(target_le: &[u8; 32]) -> f64 {
 }
 
 /// Samples an exponentially distributed share inter-arrival time for a miner
-/// with `hashrate` (H/s) against `target_le`. Returns `None` when the rate is
+/// with `hashrate` (H/s) against `target_le`, in **wall** time (the virtual
+/// interval divided by the sim clock speed). Returns `None` when the rate is
 /// zero (no shares will ever be found).
 pub fn sample_share_interval(hashrate: f64, target_le: &[u8; 32]) -> Option<Duration> {
     use rand::Rng;
-    let lambda = hashrate * share_probability(target_le); // shares per second
+    let lambda = hashrate * share_probability(target_le); // shares per virtual second
     if lambda <= 0.0 || !lambda.is_finite() {
         return None;
     }
     let u: f64 = rand::thread_rng().gen_range(f64::MIN_POSITIVE..1.0);
     let dt = -u.ln() / lambda;
-    // Cap at one hour so a mis-targeted miner still wakes up occasionally.
-    Some(Duration::from_secs_f64(dt.min(3600.0)))
+    // Cap at one virtual hour so a mis-targeted miner still wakes up
+    // occasionally, then convert to wall time.
+    Some(Duration::from_secs_f64(dt.min(3600.0) / clock_speed()))
 }
