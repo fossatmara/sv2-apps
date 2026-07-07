@@ -2,6 +2,7 @@
 //!
 //! - `GET /` — self-contained dashboard page (no external assets)
 //! - `GET /api/stats` — JSON snapshot incl. windowed chart series
+//! - `GET /api/ws` — WebSocket pushing the same snapshots event-driven
 //! - `POST /api/miners` — add a miner `{name?, hashrate?}`
 //! - `POST /api/miners/:name/hashrate` — `{hashrate}` (H/s)
 //! - `POST /api/miners/:name/disconnect|reconnect|remove`
@@ -10,7 +11,10 @@
 use std::sync::{Arc, Mutex};
 
 use axum::{
-    extract::{Path, Request, State},
+    extract::{
+        ws::{Message, WebSocket},
+        Path, Request, State, WebSocketUpgrade,
+    },
     http::{header, StatusCode},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
@@ -30,9 +34,10 @@ pub struct HttpState {
     pub engine: SharedEngine,
     /// Speed control only makes sense with an embedded pool.
     pub speed_control: bool,
-    /// Required on every request (Bearer header or ?token= query) except
-    /// the static chart-library assets.
-    pub token: String,
+    /// When set, required on every request (Bearer header or ?token= query)
+    /// except the static chart-library assets. When None, the dashboard is
+    /// open (bind loopback or front with a proxy if that matters).
+    pub token: Option<String>,
 }
 
 /// Accepts `Authorization: Bearer <token>` or `?token=<token>`; the vendored
@@ -40,6 +45,10 @@ pub struct HttpState {
 /// protect). Comparison is not constant-time; this guards a lab dashboard,
 /// not production credentials.
 async fn auth(State(st): State<HttpState>, req: Request, next: Next) -> Result<Response, StatusCode> {
+    let Some(token) = st.token.as_deref() else {
+        // No token configured: the dashboard is open by choice.
+        return Ok(next.run(req).await);
+    };
     if req.uri().path().starts_with("/assets/") {
         return Ok(next.run(req).await);
     }
@@ -48,15 +57,12 @@ async fn auth(State(st): State<HttpState>, req: Request, next: Next) -> Result<R
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .map(|t| t == st.token)
+        .map(|t| t == token)
         .unwrap_or(false);
     let query_ok = req
         .uri()
         .query()
-        .map(|q| {
-            q.split('&')
-                .any(|kv| kv.strip_prefix("token=") == Some(st.token.as_str()))
-        })
+        .map(|q| q.split('&').any(|kv| kv.strip_prefix("token=") == Some(token)))
         .unwrap_or(false);
     if bearer_ok || query_ok {
         Ok(next.run(req).await)
@@ -114,7 +120,7 @@ async fn index() -> Html<&'static str> {
     Html(include_str!("dashboard.html"))
 }
 
-async fn stats(State(st): State<HttpState>) -> Json<StatsSnapshot> {
+fn build_snapshot(st: &HttpState) -> StatsSnapshot {
     let engine = st.engine.lock().expect("engine lock");
     let elapsed = engine.elapsed_secs();
     let from = (elapsed - WINDOW_SECS).max(0.0);
@@ -159,13 +165,54 @@ async fn stats(State(st): State<HttpState>) -> Json<StatsSnapshot> {
             }
         })
         .collect();
-    Json(StatsSnapshot {
+    StatsSnapshot {
         elapsed_secs: elapsed,
         speed: engine.speed(),
         speed_control: st.speed_control,
         window_secs: WINDOW_SECS,
         miners,
-    })
+    }
+}
+
+async fn stats(State(st): State<HttpState>) -> Json<StatsSnapshot> {
+    Json(build_snapshot(&st))
+}
+
+async fn ws_upgrade(State(st): State<HttpState>, ws: WebSocketUpgrade) -> Response {
+    ws.on_upgrade(move |socket| ws_stream(socket, st))
+}
+
+/// Pushes a snapshot on connect, then again within ~100ms of any engine
+/// change (bursts coalesced) with a 1s heartbeat — the browser never polls.
+async fn ws_stream(mut socket: WebSocket, st: HttpState) {
+    let notify = st
+        .engine
+        .lock()
+        .expect("engine lock")
+        .change_notifier();
+    loop {
+        let json = match serde_json::to_string(&build_snapshot(&st)) {
+            Ok(j) => j,
+            Err(_) => return,
+        };
+        if socket.send(Message::Text(json)).await.is_err() {
+            return;
+        }
+        tokio::select! {
+            _ = notify.notified() => {
+                // Coalesce event bursts into one frame.
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+            // Drain client frames so pings/closes are handled promptly.
+            msg = socket.recv() => {
+                match msg {
+                    None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return,
+                    _ => {}
+                }
+            }
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -273,6 +320,7 @@ pub fn router(state: HttpState) -> Router {
         .route("/assets/uplot.js", get(uplot_js))
         .route("/assets/uplot.css", get(uplot_css))
         .route("/api/stats", get(stats))
+        .route("/api/ws", get(ws_upgrade))
         .route("/api/miners", post(add_miner))
         .route("/api/miners/:name/hashrate", post(set_hashrate))
         .route("/api/miners/:name/disconnect", post(disconnect))
@@ -292,7 +340,10 @@ pub async fn serve(addr: std::net::SocketAddr, state: HttpState) {
             return;
         }
     };
-    eprintln!("dashboard: http://{addr}/?token={}", state.token);
+    match state.token.as_deref() {
+        Some(token) => eprintln!("dashboard: http://{addr}/?token={token}"),
+        None => eprintln!("dashboard: http://{addr}/ (no auth token configured)"),
+    }
     if let Err(e) = axum::serve(listener, router(state)).await {
         eprintln!("http server error: {e}");
     }

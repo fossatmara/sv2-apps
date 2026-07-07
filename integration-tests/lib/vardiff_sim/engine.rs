@@ -103,6 +103,9 @@ pub struct SimEngine {
     events_rx: Receiver<(String, MinerEvent)>,
     /// Virtual timestamp when the engine started.
     started_virtual: f64,
+    /// Notified whenever observable state changes (events drained, miners
+    /// mutated, speed changed); lets push-based frontends skip polling.
+    changed: std::sync::Arc<tokio::sync::Notify>,
 }
 
 impl SimEngine {
@@ -115,7 +118,13 @@ impl SimEngine {
             events_tx,
             events_rx,
             started_virtual: virtual_now_secs(),
+            changed: std::sync::Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    /// Handle that is notified on every observable state change.
+    pub fn change_notifier(&self) -> std::sync::Arc<tokio::sync::Notify> {
+        self.changed.clone()
     }
 
     /// Elapsed virtual seconds since the engine started.
@@ -135,6 +144,7 @@ impl SimEngine {
         for slot in self.miners.values() {
             let _ = slot.commands.try_send(MinerCommand::Resample);
         }
+        self.changed.notify_waiters();
     }
 
     /// Share submission times for a miner as elapsed virtual seconds (the
@@ -191,6 +201,7 @@ impl SimEngine {
             cmd_rx,
             self.events_tx.clone(),
         ));
+        self.changed.notify_waiters();
     }
 
     pub fn set_hashrate(&mut self, name: &str, hashrate: f64) {
@@ -210,6 +221,7 @@ impl SimEngine {
                     to: hashrate,
                 });
             }
+            self.changed.notify_waiters();
         }
     }
 
@@ -233,6 +245,7 @@ impl SimEngine {
             let _ = slot.commands.try_send(MinerCommand::Disconnect);
         }
         self.stats.remove(name);
+        self.changed.notify_waiters();
     }
 
     /// Reconnects a disconnected miner, preserving its config and drift.
@@ -255,7 +268,9 @@ impl SimEngine {
     /// Drains pending miner events into the stats tables. Call every tick.
     pub fn drain_events(&mut self) {
         let elapsed = self.elapsed_secs();
+        let mut any = false;
         while let Ok((name, event)) = self.events_rx.try_recv() {
+            any = true;
             let stats = self.stats.entry(name.clone()).or_default();
             match event {
                 MinerEvent::Connected => {
@@ -299,6 +314,9 @@ impl SimEngine {
                     stats.last_error = Some(reason);
                 }
             }
+        }
+        if any {
+            self.changed.notify_waiters();
         }
     }
 

@@ -219,20 +219,23 @@ window.addEventListener('resize', () => {
   if (chart) chart.setSize({width: document.getElementById('chartwrap').clientWidth - 16, height: 320});
 });
 
-async function tick() {
-  try {
-    const r = await fetch('/api/stats', {headers: AUTH});
-    if (r.status === 401) {
-      document.getElementById('meta').textContent = 'unauthorized — open the URL printed by vardiff-sim (includes ?token=)';
-      return;
-    }
-    render(await r.json());
-  } catch (e) {
-    document.getElementById('meta').textContent = 'disconnected';
-  }
+// Server pushes snapshots over a WebSocket (event-driven, ~100ms after any
+// change, 1s heartbeat); the browser never polls. Reconnects with backoff.
+let retryMs = 1000;
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const ws = new WebSocket(`${proto}://${location.host}/api/ws?token=${encodeURIComponent(TOKEN)}`);
+  ws.onmessage = ev => { retryMs = 1000; render(JSON.parse(ev.data)); };
+  ws.onclose = ev => {
+    document.getElementById('meta').textContent = ev.code === 1008 || ev.code === 1002
+      ? 'unauthorized — open the URL printed by vardiff-sim (includes ?token=)'
+      : `disconnected — retrying in ${(retryMs/1000).toFixed(0)}s`;
+    setTimeout(connect, retryMs);
+    retryMs = Math.min(retryMs * 2, 10000);
+  };
+  ws.onerror = () => ws.close();
 }
-setInterval(tick, 1000);
-tick();
+connect();
 </script>
 </body>
 </html>

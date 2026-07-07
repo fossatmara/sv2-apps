@@ -133,8 +133,8 @@ struct Args {
     #[arg(long)]
     http: Option<SocketAddr>,
 
-    /// Access token for the dashboard and API. Generated (and printed) if
-    /// not provided.
+    /// Access token for the dashboard and API (Bearer header or ?token=
+    /// query). When omitted, the dashboard requires no auth.
     #[arg(long)]
     http_token: Option<String>,
 
@@ -162,8 +162,8 @@ async fn main() {
             std::process::exit(1);
         })
     });
-    if !args.tui && scenario.is_none() {
-        eprintln!("error: headless mode needs --scenario (or use --tui)");
+    if !args.tui && scenario.is_none() && args.http.is_none() {
+        eprintln!("error: headless mode needs --scenario, --http, or --tui");
         std::process::exit(1);
     }
 
@@ -279,17 +279,12 @@ async fn main() {
     let shutdown_signal = spawn_signal_listener();
 
     if let Some(addr) = args.http {
-        let token = args.http_token.clone().unwrap_or_else(|| {
-            use rand::Rng;
-            let mut rng = rand::thread_rng();
-            (0..32).map(|_| format!("{:x}", rng.gen_range(0..16u8))).collect()
-        });
         tokio::spawn(http::serve(
             addr,
             http::HttpState {
                 engine: engine.clone(),
                 speed_control: args.spawn_pool,
-                token,
+                token: args.http_token.clone(),
             },
         ));
     }
@@ -327,14 +322,33 @@ async fn main() {
         std::process::exit(0);
     }
 
-    // Headless mode (--scenario presence was checked before the pool spawned).
-    let scenario = scenario.expect("checked above");
-    println!("running scenario '{}' against {pool_address}", scenario.name);
-    let mut driver = ScenarioDriver::new(scenario);
+    // Headless: scenario-driven, or dashboard-driven when only --http was
+    // given (default fleet, runs until a signal or --duration).
+    let mut driver = scenario.map(|s| {
+        println!("running scenario '{}' against {pool_address}", s.name);
+        ScenarioDriver::new(s)
+    });
+    if driver.is_none() {
+        let mut eng = engine.lock().expect("engine lock");
+        for i in 0..args.miners {
+            eng.spawn_miner(
+                MinerConfig {
+                    name: format!("sim-{i}"),
+                    hashrate: args.hashrate,
+                    reported_hashrate: None,
+                },
+                None,
+            );
+        }
+        println!(
+            "dashboard mode: {} miners against {pool_address}; ctrl-c to stop",
+            args.miners
+        );
+    }
     let duration = args
         .duration
-        .or(driver.scenario().duration_secs)
-        .unwrap_or(300);
+        .or_else(|| driver.as_ref().and_then(|d| d.scenario().duration_secs))
+        .or(if driver.is_some() { Some(300) } else { None });
 
     let mut last_print = 0u64;
     loop {
@@ -351,8 +365,10 @@ async fn main() {
         let mut eng = engine.lock().expect("engine lock");
         let elapsed = eng.elapsed_secs();
         eng.drain_events();
-        for action in driver.due_actions(elapsed) {
-            apply_action(&mut eng, action);
+        if let Some(driver) = driver.as_mut() {
+            for action in driver.due_actions(elapsed) {
+                apply_action(&mut eng, action);
+            }
         }
         eng.apply_drift();
         eng.drain_events();
@@ -370,7 +386,7 @@ async fn main() {
             }
         }
         drop(eng);
-        if elapsed >= duration as f64 {
+        if duration.is_some_and(|d| elapsed >= d as f64) {
             break;
         }
     }
