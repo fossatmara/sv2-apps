@@ -246,39 +246,57 @@ fn draw(
         .block(Block::default().borders(Borders::ALL).title(title));
     frame.render_widget(table, layout[0]);
 
-    // Difficulty-over-time chart for the selected miner.
+    // Difficulty-over-time chart for the selected miner: a sliding window of
+    // the most recent history rather than the whole run condensed.
+    const CHART_WINDOW_SECS: f64 = 300.0;
     if let Some(name) = names.get(selected) {
         let s = &engine.stats[name];
-        let data: Vec<(f64, f64)> = s.difficulty_history.clone();
+        let data: &[(f64, f64)] = &s.difficulty_history;
         if !data.is_empty() {
             let x_max = engine.elapsed_secs().max(1.0);
-            let y_max = data
-                .iter()
-                .map(|(_, d)| *d)
-                .fold(f64::MIN_POSITIVE, f64::max);
+            let x_min = (x_max - CHART_WINDOW_SECS).max(0.0);
+            // Visible points, plus a synthetic entry point holding the value
+            // the series had when it slid past the left edge.
+            let mut plotted: Vec<(f64, f64)> = Vec::new();
+            if let Some(&(_, held)) = data.iter().rev().find(|(t, _)| *t < x_min) {
+                plotted.push((x_min, held));
+            }
+            plotted.extend(data.iter().filter(|(t, _)| *t >= x_min));
             // Step-extend the last difficulty to "now" so the line reads as a
             // held value, not a truncated series.
-            let mut plotted = data;
             if let Some(&(_, last)) = plotted.last() {
                 plotted.push((x_max, last));
             }
-            // Vertical marker line at each commanded hashrate change:
-            // green when the hashrate went up, red when it went down.
+            // Scale the y axis to what is visible, not all-time extremes.
+            let y_max = plotted
+                .iter()
+                .map(|(_, d)| *d)
+                .fold(f64::MIN_POSITIVE, f64::max);
+            // Vertical marker line at each commanded hashrate change inside
+            // the window: green = hashrate up, red = hashrate down.
             let vertical_line = |t: f64| (0..=20).map(move |i| (t, y_max * 1.1 * i as f64 / 20.0));
             let increases: Vec<(f64, f64)> = s
                 .hashrate_changes
                 .iter()
-                .filter(|c| c.is_increase())
+                .filter(|c| c.is_increase() && c.at >= x_min)
                 .flat_map(|c| vertical_line(c.at))
                 .collect();
             let decreases: Vec<(f64, f64)> = s
                 .hashrate_changes
                 .iter()
-                .filter(|c| !c.is_increase())
+                .filter(|c| !c.is_increase() && c.at >= x_min)
                 .flat_map(|c| vertical_line(c.at))
                 .collect();
-            let up_count = s.hashrate_changes.iter().filter(|c| c.is_increase()).count();
-            let down_count = s.hashrate_changes.len() - up_count;
+            let up_count = s
+                .hashrate_changes
+                .iter()
+                .filter(|c| c.is_increase() && c.at >= x_min)
+                .count();
+            let down_count = s
+                .hashrate_changes
+                .iter()
+                .filter(|c| !c.is_increase() && c.at >= x_min)
+                .count();
             let mut datasets = vec![Dataset::default()
                 .name(format!("difficulty ({name})"))
                 .marker(symbols::Marker::Braille)
@@ -309,7 +327,9 @@ fn draw(
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .title(format!(" difficulty history: {name} ")),
+                        .title(format!(
+                            " difficulty history: {name} (last {CHART_WINDOW_SECS:.0}s) "
+                        )),
                 )
                 .legend_position(Some(ratatui::widgets::LegendPosition::TopRight))
                 // Default legend constraints hide the key when it exceeds 1/4
@@ -317,9 +337,10 @@ fn draw(
                 .hidden_legend_constraints((Constraint::Ratio(3, 4), Constraint::Ratio(3, 4)))
                 .x_axis(
                     Axis::default()
-                        .bounds([0.0, x_max])
+                        .bounds([x_min, x_max])
                         .labels(vec![
-                            Span::raw("0s"),
+                            Span::raw(format!("{x_min:.0}s")),
+                            Span::raw(format!("{:.0}s", (x_min + x_max) / 2.0)),
                             Span::raw(format!("{x_max:.0}s")),
                         ]),
                 )
