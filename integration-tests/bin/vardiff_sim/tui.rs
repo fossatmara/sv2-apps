@@ -149,7 +149,7 @@ pub async fn run(
                         }
                         "pid" => {
                             let (kp, ki, kd) = eng.manual_gains();
-                            eng.set_manual_gains(kp / 2.0, ki, kd);
+                            eng.set_manual_gains((kp - 0.1).max(0.01), ki, kd);
                         }
                         _ => {}
                     },
@@ -160,7 +160,7 @@ pub async fn run(
                         }
                         "pid" => {
                             let (kp, ki, kd) = eng.manual_gains();
-                            eng.set_manual_gains(kp * 2.0, ki, kd);
+                            eng.set_manual_gains(kp + 0.1, ki, kd);
                         }
                         _ => {}
                     },
@@ -171,7 +171,7 @@ pub async fn run(
                         }
                         "pid" => {
                             let (kp, ki, kd) = eng.manual_gains();
-                            eng.set_manual_gains(kp, ki / 2.0, kd);
+                            eng.set_manual_gains(kp, (ki - 0.001).max(0.0), kd);
                         }
                         _ => {}
                     },
@@ -182,7 +182,7 @@ pub async fn run(
                         }
                         "pid" => {
                             let (kp, ki, kd) = eng.manual_gains();
-                            eng.set_manual_gains(kp, ki * 2.0, kd);
+                            eng.set_manual_gains(kp, ki + 0.001, kd);
                         }
                         _ => {}
                     },
@@ -193,7 +193,7 @@ pub async fn run(
                         }
                         "pid" => {
                             let (kp, ki, kd) = eng.manual_gains();
-                            eng.set_manual_gains(kp, ki, if kd <= 0.01 { 0.0 } else { kd / 2.0 });
+                            eng.set_manual_gains(kp, ki, (kd - 0.01).max(0.0));
                         }
                         _ => {}
                     },
@@ -204,7 +204,7 @@ pub async fn run(
                         }
                         "pid" => {
                             let (kp, ki, kd) = eng.manual_gains();
-                            eng.set_manual_gains(kp, ki, if kd == 0.0 { 0.01 } else { kd * 2.0 });
+                            eng.set_manual_gains(kp, ki, kd + 0.01);
                         }
                         _ => {}
                     },

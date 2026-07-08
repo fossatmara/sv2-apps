@@ -67,16 +67,16 @@
   <span id="knobs-pid" style="display:none">
     <span style="width:1.5rem;display:inline-block"></span>
     kp: <b id="gkp">0.6</b>
-    <button onclick="setGain('kp',0.5)">÷2</button>
-    <button onclick="setGain('kp',2)">×2</button>
+    <button onclick="setGain('kp',-1)">−.1</button>
+    <button onclick="setGain('kp',1)">+.1</button>
     <span style="width:1rem;display:inline-block"></span>
     ki: <b id="gki">0.005</b>
-    <button onclick="setGain('ki',0.5)">÷2</button>
-    <button onclick="setGain('ki',2)">×2</button>
+    <button onclick="setGain('ki',-1)">−.001</button>
+    <button onclick="setGain('ki',1)">+.001</button>
     <span style="width:1rem;display:inline-block"></span>
     kd: <b id="gkd">0</b>
-    <button onclick="setGain('kd',0.5)">÷2</button>
-    <button onclick="setGain('kd',2)">×2</button>
+    <button onclick="setGain('kd',-1)">−.01</button>
+    <button onclick="setGain('kd',1)">+.01</button>
   </span>
 </div>
 
@@ -127,15 +127,14 @@ async function post(path, body) {
 }
 function setSpeed(mul) { if (last) post('/api/speed', {speed: last.speed * mul}); }
 function setAlgo(name) { post('/api/algorithm', {algorithm: name}); }
-function setGain(which, mul) {
+const GAIN_STEPS = { kp: 0.1, ki: 0.001, kd: 0.01 };
+function setGain(which, dir) {
   if (!last) return;
   let [kp, ki, kd] = last.manual_gains;
-  const step = v => which === 'kd' && v === 0 && mul > 1 ? 0.01
-                  : which === 'kd' && v <= 0.01 && mul < 1 ? 0
-                  : v * mul;
-  if (which === 'kp') kp = step(kp);
-  if (which === 'ki') ki = step(ki);
-  if (which === 'kd') kd = step(kd);
+  const step = dir * GAIN_STEPS[which];
+  if (which === 'kp') kp = Math.max(0.01, kp + step);
+  if (which === 'ki') ki = Math.max(0, ki + step);
+  if (which === 'kd') kd = Math.max(0, kd + step);
   post('/api/gains', {kp, ki, kd});
 }
 function setSpm(mul) {
