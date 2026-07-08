@@ -26,8 +26,8 @@
   .bar { display: flex; gap: .75rem; align-items: center; margin-bottom: .75rem; flex-wrap: wrap; }
   input { background: #010409; color: #c9d1d9; border: 1px solid #30363d;
           border-radius: 4px; padding: .15rem .4rem; width: 8rem; }
-  #chartwrap { background: #010409; border: 1px solid #21262d; border-radius: 6px;
-               padding: .5rem; }
+  #chartwrap, #errwrap { background: #010409; border: 1px solid #21262d;
+               border-radius: 6px; padding: .5rem; }
   .u-legend { color: #c9d1d9; font: 12px ui-monospace, monospace; }
   .u-legend .u-marker { border-radius: 50%; }
   .hint { color: #8b949e; font-size: 12px; margin-top: .25rem; }
@@ -78,6 +78,7 @@
 </div>
 
 <div id="chartwrap"><div id="chart"></div></div>
+<div id="errwrap" style="margin-top:.5rem" class="chartbox"><div id="errchart"></div></div>
 <div class="hint">hover for values · drag to zoom (pauses live) · double-click to reset zoom</div>
 
 <script>
@@ -87,6 +88,7 @@ let selected = null;
 let last = null;
 let live = true;
 let chart = null;
+let errChart = null;
 let chartMiner = null;
 let changes = [];   // hashrate changes of the selected miner, for the draw hook
 
@@ -259,6 +261,46 @@ function drawChangeLines(u) {
   ctx.restore();
 }
 
+// Observed log share-rate error ln(observed/setpoint): the controller's
+// error signal. Zero = on setpoint; the band shows +/-1.
+function makeErrChart(data) {
+  const el = document.getElementById('errchart');
+  el.innerHTML = '';
+  const opts = {
+    width: el.parentElement.clientWidth - 16,
+    height: 140,
+    scales: { x: { time: false },
+              y: { range: (u, min, max) => [Math.min(min, -1.2), Math.max(max, 1.2)] } },
+    series: [
+      { label: 't', value: (u, v) => v == null ? '' : v.toFixed(1) + 's' },
+      { label: 'ln(obs/setpoint)', stroke: '#ff9b6b', width: 1.5, spanGaps: true,
+        points: {show: false}, value: (u, v) => v == null ? '—' : v.toFixed(3) },
+    ],
+    axes: [
+      { stroke: '#8b949e', grid: {stroke: '#21262d'}, ticks: {stroke: '#21262d'},
+        values: (u, vals) => vals.map(v => v.toFixed(0) + 's') },
+      { stroke: '#8b949e', grid: {stroke: '#21262d'}, ticks: {stroke: '#21262d'}, size: 56 },
+    ],
+    cursor: { drag: { x: true, y: false }, sync: { key: 'vdsim' } },
+    hooks: {
+      // Emphasized zero line: converged means hugging it.
+      draw: [u => {
+        const y = u.valToPos(0, 'y', true);
+        u.ctx.save();
+        u.ctx.strokeStyle = '#3d444d';
+        u.ctx.lineWidth = 1;
+        u.ctx.beginPath();
+        u.ctx.moveTo(u.bbox.left, y);
+        u.ctx.lineTo(u.bbox.left + u.bbox.width, y);
+        u.ctx.stroke();
+        u.ctx.restore();
+      }],
+      setSelect: [u => { if (u.select.width > 0 && live) toggleLive(); }],
+    },
+  };
+  errChart = new uPlot(opts, data, el);
+}
+
 function makeChart(data) {
   const el = document.getElementById('chart');
   el.innerHTML = '';
@@ -294,7 +336,7 @@ function makeChart(data) {
       { scale: 'g', side: 1, stroke: '#8b949e', grid: {show: false},
         ticks: {stroke: '#21262d'}, size: 50 },
     ],
-    cursor: { drag: { x: true, y: false } },
+    cursor: { drag: { x: true, y: false }, sync: { key: 'vdsim' } },
     hooks: {
       draw: [drawChangeLines],
       setSelect: [u => { if (u.select.width > 0 && live) toggleLive(); }],
@@ -310,16 +352,21 @@ function updateChart(data, full) {
   const d = buildData(m, data.elapsed_secs, hasSynthetic);
   if (!d) return;
   changes = m.hashrate_changes;
+  const err = m.rate_error || [];
+  const ed = [err.map(([t]) => t), err.map(([, e]) => e)];
   if (!chart || chartMiner !== selected) {
     chartMiner = selected;
     makeChart(d);
+    makeErrChart(ed);
   } else {
     chart.setData(d);
+    errChart.setData(ed);
   }
 }
 
 window.addEventListener('resize', () => {
   if (chart) chart.setSize({width: document.getElementById('chartwrap').clientWidth - 16, height: 320});
+  if (errChart) errChart.setSize({width: document.getElementById('errwrap').clientWidth - 16, height: 140});
 });
 
 // Server pushes snapshots over a WebSocket (event-driven, ~100ms after any

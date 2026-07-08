@@ -112,6 +112,9 @@ struct MinerSnapshot {
     /// (elapsed_secs, kp, ki, kd) gain changes within the window, with a
     /// held entry at the window edge so stepped plots span it.
     gain_changes: Vec<(f64, f64, f64, f64)>,
+    /// (elapsed_secs, ln(observed/setpoint)) rate-error samples within the
+    /// window.
+    rate_error: Vec<(f64, f64)>,
 }
 
 #[derive(Serialize)]
@@ -192,6 +195,12 @@ fn build_snapshot(st: &HttpState, full: bool) -> StatsSnapshot {
                 difficulty_history: history,
                 gains: s.gains,
                 gain_changes,
+                rate_error: s
+                    .rate_error_history
+                    .iter()
+                    .filter(|(t, _)| *t >= from)
+                    .copied()
+                    .collect(),
                 hashrate_changes: s
                     .hashrate_changes
                     .iter()

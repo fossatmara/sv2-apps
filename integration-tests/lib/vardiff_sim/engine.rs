@@ -21,6 +21,8 @@ use super::{
 
 /// Window over which the realized share rate is measured (virtual seconds).
 const REALIZED_RATE_WINDOW_SECS: f64 = 60.0;
+/// Cadence of rate-error samples (virtual seconds).
+const RATE_SAMPLE_SECS: f64 = 10.0;
 
 pub struct EngineConfig {
     pub pool_address: SocketAddr,
@@ -71,6 +73,12 @@ pub struct MinerStats {
     /// (elapsed_secs, kp, ki, kd) at every gain change, for plotting how the
     /// Q-learning schedules gains over time.
     pub gain_changes: Vec<(f64, f64, f64, f64)>,
+    /// (elapsed_secs, ln(observed/setpoint)) sampled every
+    /// [`RATE_SAMPLE_SECS`]: the log share-rate error the controller acts
+    /// on, measured over the trailing rate window.
+    pub rate_error_history: Vec<(f64, f64)>,
+    /// Virtual timestamp of the last rate-error sample.
+    last_rate_sample: f64,
 }
 
 /// A commanded hashrate change, for chart annotations.
@@ -141,6 +149,32 @@ impl SimEngine {
     /// Current sim clock speed factor (1.0 = real time).
     pub fn speed(&self) -> f64 {
         clock_speed()
+    }
+
+    /// Samples each miner's observed log share-rate error (the controller's
+    /// error signal) into its history at a fixed virtual cadence.
+    fn sample_rate_errors(&mut self, elapsed: f64) {
+        let setpoint = super::setpoint_spm();
+        if setpoint <= 0.0 {
+            return;
+        }
+        let now = virtual_now_secs();
+        for stats in self.stats.values_mut() {
+            if elapsed - stats.last_rate_sample < RATE_SAMPLE_SECS {
+                continue;
+            }
+            stats.last_rate_sample = elapsed;
+            let count = stats
+                .share_times
+                .iter()
+                .filter(|t| now - **t <= REALIZED_RATE_WINDOW_SECS)
+                .count();
+            // The controller's zero-share floor of half a share keeps the
+            // log finite; clamp mirrors its +/-3 error cap.
+            let observed = (count as f64).max(0.5) * 60.0 / REALIZED_RATE_WINDOW_SECS;
+            let err = (observed / setpoint).ln().clamp(-3.0, 3.0);
+            stats.rate_error_history.push((elapsed, err));
+        }
     }
 
     /// Polls the embedded pool's gain telemetry and records changes per
@@ -341,6 +375,7 @@ impl SimEngine {
     pub fn drain_events(&mut self) {
         let elapsed = self.elapsed_secs();
         self.poll_gain_telemetry(elapsed);
+        self.sample_rate_errors(elapsed);
         let mut any = false;
         while let Ok((name, event)) = self.events_rx.try_recv() {
             any = true;
