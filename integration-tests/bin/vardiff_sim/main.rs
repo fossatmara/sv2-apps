@@ -131,7 +131,7 @@ struct Args {
     duration: Option<u64>,
 
     /// Number of default miners when starting the TUI without a scenario.
-    #[arg(long, default_value_t = 3)]
+    #[arg(long, default_value_t = 1)]
     miners: usize,
 
     /// Hashrate (H/s) of the default TUI miners.
