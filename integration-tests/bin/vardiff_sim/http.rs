@@ -26,10 +26,11 @@ use serde::{Deserialize, Serialize};
 
 pub type SharedEngine = Arc<Mutex<SimEngine>>;
 
-/// Web chart window base (virtual seconds at speed 1): longer than the
-/// TUI's, and scaled by the sim clock speed at snapshot time so the window
-/// spans a consistent wall-clock viewing time under acceleration.
-const WINDOW_BASE_SECS: f64 = 600.0;
+/// Web chart window base (virtual seconds at speed 1), scaled by the sim
+/// clock speed at snapshot time so the window spans a consistent wall-clock
+/// viewing time under acceleration. Matches the TUI base; the full-history
+/// toggle covers the long view.
+const WINDOW_BASE_SECS: f64 = 300.0;
 
 #[derive(Clone)]
 pub struct HttpState {
