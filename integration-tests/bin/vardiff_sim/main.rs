@@ -199,6 +199,16 @@ async fn main() {
     // The setpoint is always primed so UIs (and the pool's effective-spm
     // reads) start from the CLI value.
     integration_tests_sv2::vardiff_sim::set_setpoint_spm(args.shares_per_minute as f64);
+    // Prime the live algorithm from the CLI so UI switching starts truthful.
+    integration_tests_sv2::vardiff_sim::set_algorithm(&args.algorithm.to_string());
+    if args.kp.is_some() || args.ki.is_some() || args.kd.is_some() {
+        let (dkp, dki, dkd) = integration_tests_sv2::vardiff_sim::manual_gains();
+        integration_tests_sv2::vardiff_sim::set_manual_gains(
+            args.kp.unwrap_or(dkp),
+            args.ki.unwrap_or(dki),
+            args.kd.unwrap_or(dkd),
+        );
+    }
     if let Some(k) = args.confidence_k {
         integration_tests_sv2::vardiff_sim::set_confidence_k(k);
     }

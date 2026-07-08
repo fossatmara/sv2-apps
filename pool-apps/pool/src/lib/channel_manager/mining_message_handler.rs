@@ -855,6 +855,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                                             channel_id,
                                             standard_channel,
                                             vardiff,
+                                            &self.vardiff_factory,
                                             &mut vardiff_messages,
                                         );
                                     },
@@ -1163,6 +1164,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                                             channel_id,
                                             extended_channel,
                                             vardiff,
+                                            &self.vardiff_factory,
                                             &mut vardiff_messages,
                                         );
                                     },

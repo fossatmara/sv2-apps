@@ -122,6 +122,8 @@ struct StatsSnapshot {
     elapsed_secs: f64,
     speed: f64,
     speed_control: bool,
+    algorithm: String,
+    manual_gains: (f64, f64, f64),
     setpoint_spm: f64,
     confidence_k: f64,
     significance_z: f64,
@@ -216,6 +218,8 @@ fn build_snapshot(st: &HttpState, full: bool) -> StatsSnapshot {
         elapsed_secs: elapsed,
         speed: engine.speed(),
         speed_control: st.speed_control,
+        algorithm: engine.algorithm().to_string(),
+        manual_gains: engine.manual_gains(),
         setpoint_spm: engine.setpoint_spm(),
         confidence_k: engine.confidence_k(),
         significance_z: engine.significance_z(),
@@ -293,6 +297,18 @@ struct ConfidenceBody {
 #[derive(Deserialize)]
 struct SpmBody {
     spm: f64,
+}
+
+#[derive(Deserialize)]
+struct AlgorithmBody {
+    algorithm: String,
+}
+
+#[derive(Deserialize)]
+struct GainsBody {
+    kp: f64,
+    ki: f64,
+    kd: f64,
 }
 
 #[derive(Deserialize)]
@@ -405,6 +421,39 @@ async fn set_confidence(State(st): State<HttpState>, Json(body): Json<Confidence
     StatusCode::NO_CONTENT
 }
 
+async fn set_algorithm(
+    State(st): State<HttpState>,
+    Json(body): Json<AlgorithmBody>,
+) -> StatusCode {
+    if !st.speed_control {
+        return StatusCode::FORBIDDEN;
+    }
+    if st
+        .engine
+        .lock()
+        .expect("engine lock")
+        .set_algorithm(&body.algorithm)
+    {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::BAD_REQUEST
+    }
+}
+
+async fn set_gains(State(st): State<HttpState>, Json(body): Json<GainsBody>) -> StatusCode {
+    if !st.speed_control {
+        return StatusCode::FORBIDDEN;
+    }
+    if ![body.kp, body.ki, body.kd].iter().all(|v| v.is_finite()) {
+        return StatusCode::BAD_REQUEST;
+    }
+    st.engine
+        .lock()
+        .expect("engine lock")
+        .set_manual_gains(body.kp, body.ki, body.kd);
+    StatusCode::NO_CONTENT
+}
+
 async fn set_spm(State(st): State<HttpState>, Json(body): Json<SpmBody>) -> StatusCode {
     if !st.speed_control {
         return StatusCode::FORBIDDEN;
@@ -454,6 +503,8 @@ pub fn router(state: HttpState) -> Router {
         .route("/api/confidence", post(set_confidence))
         .route("/api/significance", post(set_significance))
         .route("/api/spm", post(set_spm))
+        .route("/api/algorithm", post(set_algorithm))
+        .route("/api/gains", post(set_gains))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
         .with_state(state)
 }

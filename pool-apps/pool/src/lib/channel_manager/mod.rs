@@ -134,9 +134,24 @@ pub(crate) struct VardiffFactory {
 impl VardiffFactory {
     fn new(config: crate::config::VardiffConfig) -> Self {
         use stratum_apps::stratum_core::channels_sv2::QTable;
-        let qtable = matches!(config.algorithm, crate::config::VardiffAlgorithm::QPid)
-            .then(|| std::sync::Arc::new(std::sync::Mutex::new(QTable::new())));
+        // Always hold a table: the live algorithm override can switch any
+        // pool to qpid at runtime, and the table persists across switches so
+        // learning survives a detour through another algorithm.
+        let qtable = Some(std::sync::Arc::new(std::sync::Mutex::new(QTable::new())));
         Self { config, qtable }
+    }
+
+    /// The algorithm currently in effect: the live override if set (UI
+    /// switchable in simulators), else the configured one.
+    pub(crate) fn effective_kind(
+        &self,
+    ) -> stratum_apps::stratum_core::channels_sv2::vardiff::VardiffKind {
+        use stratum_apps::stratum_core::channels_sv2::vardiff::{tuning, VardiffKind};
+        tuning::algorithm_override().unwrap_or(match self.config.algorithm {
+            crate::config::VardiffAlgorithm::Classic => VardiffKind::Classic,
+            crate::config::VardiffAlgorithm::Pid => VardiffKind::Pid,
+            crate::config::VardiffAlgorithm::QPid => VardiffKind::QPid,
+        })
     }
 
     pub(crate) fn build(
@@ -146,9 +161,9 @@ impl VardiffFactory {
         Box<dyn Vardiff>,
         stratum_apps::stratum_core::channels_sv2::vardiff::error::VardiffError,
     > {
-        use crate::config::VardiffAlgorithm;
         use stratum_apps::stratum_core::channels_sv2::{
-            PidParams, PidVardiffState, QPidParams, QPidVardiffState, VardiffState,
+            vardiff::VardiffKind, PidParams, PidVardiffState, QPidParams, QPidVardiffState,
+            VardiffState,
         };
         let pid_params = PidParams {
             kp: self.config.kp,
@@ -161,14 +176,14 @@ impl VardiffFactory {
             tracking_secs: self.config.tracking_secs,
             ..PidParams::default()
         };
-        match self.config.algorithm {
-            VardiffAlgorithm::Classic => Ok(Box::new(VardiffState::new()?)),
-            VardiffAlgorithm::Pid => {
+        match self.effective_kind() {
+            VardiffKind::Classic => Ok(Box::new(VardiffState::new()?)),
+            VardiffKind::Pid => {
                 let mut state = PidVardiffState::with_params(pid_params)?;
                 state.set_telemetry_key(user_identity.to_string());
                 Ok(Box::new(state))
             }
-            VardiffAlgorithm::QPid => {
+            VardiffKind::QPid => {
                 let table = self
                     .qtable
                     .clone()
@@ -586,8 +601,10 @@ impl ChannelManager {
         channel_id: ChannelId,
         channel_state: &mut ExtendedChannel<'static>,
         vardiff_state: &mut Box<dyn Vardiff>,
+        factory: &VardiffFactory,
         updates: &mut Vec<RouteMessageTo>,
     ) {
+        Self::sync_controller_kind(vardiff_state, factory, channel_state.get_user_identity());
         let shares_per_minute = Self::effective_spm(channel_state.get_shares_per_minute());
         // Keep the channel's baked setpoint in sync so update_channel's
         // hashrate-to-target conversion matches what vardiff optimized.
@@ -631,6 +648,28 @@ impl ChannelManager {
         }
     }
 
+    // Rebuilds a channel's controller when the live algorithm selection no
+    // longer matches its kind. Fresh controller state (windows, integral,
+    // Q-table linkage) starts from the channel's current target.
+    fn sync_controller_kind(
+        vardiff_state: &mut Box<dyn Vardiff>,
+        factory: &VardiffFactory,
+        user_identity: &str,
+    ) {
+        if vardiff_state.kind() != factory.effective_kind() {
+            match factory.build(user_identity) {
+                Ok(new_state) => {
+                    info!(
+                        "vardiff algorithm switch: rebuilding controller for {user_identity} as {:?}",
+                        factory.effective_kind()
+                    );
+                    *vardiff_state = new_state;
+                }
+                Err(e) => warn!("failed to rebuild vardiff controller: {e:?}"),
+            }
+        }
+    }
+
     // The live setpoint override (UI-tunable in simulators) wins over the
     // configured/baked value.
     fn effective_spm(configured: f32) -> f32 {
@@ -645,8 +684,10 @@ impl ChannelManager {
         channel_id: ChannelId,
         channel: &mut StandardChannel<'static>,
         vardiff_state: &mut Box<dyn Vardiff>,
+        factory: &VardiffFactory,
         updates: &mut Vec<RouteMessageTo>,
     ) {
+        Self::sync_controller_kind(vardiff_state, factory, channel.get_user_identity());
         let shares_per_minute = Self::effective_spm(channel.get_shares_per_minute());
         channel.set_shares_per_minute(shares_per_minute);
         let hashrate = channel.get_nominal_hashrate();
@@ -741,6 +782,7 @@ impl ChannelManager {
                                     channel_id,
                                     standard_channel,
                                     vardiff_state,
+                                    &self.vardiff_factory,
                                     &mut messages,
                                 );
                             });
@@ -752,6 +794,7 @@ impl ChannelManager {
                                     channel_id,
                                     extended_channel,
                                     vardiff_state,
+                                    &self.vardiff_factory,
                                     &mut messages,
                                 );
                             });

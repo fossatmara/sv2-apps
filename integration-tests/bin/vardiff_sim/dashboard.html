@@ -37,6 +37,12 @@
 <h1>vardiff-sim <small id="meta">connecting…</small></h1>
 
 <div class="bar" id="speedbar" style="display:none">
+  <span id="algosel">
+    <button id="algo-classic" onclick="setAlgo('classic')">classic</button>
+    <button id="algo-pid" onclick="setAlgo('pid')">pid</button>
+    <button id="algo-qpid" onclick="setAlgo('qpid')">qpid</button>
+  </span>
+  <span style="width:1rem"></span>
   speed: <b id="speed">1</b>x
   <button onclick="setSpeed(0.5)">÷2</button>
   <button onclick="setSpeed(2)">×2</button>
@@ -44,18 +50,34 @@
   spm: <b id="spm">4</b>
   <button onclick="setSpm(0.5)">÷2</button>
   <button onclick="setSpm(2)">×2</button>
-  <span style="width:1.5rem"></span>
-  confidence K: <b id="confk">2</b>
-  <button onclick="setConfK(0.5)">÷2</button>
-  <button onclick="setConfK(2)">×2</button>
-  <span style="width:1.5rem"></span>
-  Z↑: <b id="sigz">2</b>σ
-  <button onclick="setSigZ(-0.5)">−.5</button>
-  <button onclick="setSigZ(0.5)">+.5</button>
-  <span style="width:1rem"></span>
-  Z↓: <b id="sigzd">1.5</b>σ
-  <button onclick="setSigZDown(-0.5)">−.5</button>
-  <button onclick="setSigZDown(0.5)">+.5</button>
+  <span id="knobs-stat" style="display:none">
+    <span style="width:1.5rem;display:inline-block"></span>
+    K: <b id="confk">2</b>
+    <button onclick="setConfK(0.5)">÷2</button>
+    <button onclick="setConfK(2)">×2</button>
+    <span style="width:1rem;display:inline-block"></span>
+    Z↑: <b id="sigz">3</b>σ
+    <button onclick="setSigZ(-0.5)">−.5</button>
+    <button onclick="setSigZ(0.5)">+.5</button>
+    <span style="width:1rem;display:inline-block"></span>
+    Z↓: <b id="sigzd">1.5</b>σ
+    <button onclick="setSigZDown(-0.5)">−.5</button>
+    <button onclick="setSigZDown(0.5)">+.5</button>
+  </span>
+  <span id="knobs-pid" style="display:none">
+    <span style="width:1.5rem;display:inline-block"></span>
+    kp: <b id="gkp">0.6</b>
+    <button onclick="setGain('kp',0.5)">÷2</button>
+    <button onclick="setGain('kp',2)">×2</button>
+    <span style="width:1rem;display:inline-block"></span>
+    ki: <b id="gki">0.005</b>
+    <button onclick="setGain('ki',0.5)">÷2</button>
+    <button onclick="setGain('ki',2)">×2</button>
+    <span style="width:1rem;display:inline-block"></span>
+    kd: <b id="gkd">0</b>
+    <button onclick="setGain('kd',0.5)">÷2</button>
+    <button onclick="setGain('kd',2)">×2</button>
+  </span>
 </div>
 
 <table id="miners">
@@ -104,6 +126,18 @@ async function post(path, body) {
                      body: body ? JSON.stringify(body) : '{}'});
 }
 function setSpeed(mul) { if (last) post('/api/speed', {speed: last.speed * mul}); }
+function setAlgo(name) { post('/api/algorithm', {algorithm: name}); }
+function setGain(which, mul) {
+  if (!last) return;
+  let [kp, ki, kd] = last.manual_gains;
+  const step = v => which === 'kd' && v === 0 && mul > 1 ? 0.01
+                  : which === 'kd' && v <= 0.01 && mul < 1 ? 0
+                  : v * mul;
+  if (which === 'kp') kp = step(kp);
+  if (which === 'ki') ki = step(ki);
+  if (which === 'kd') kd = step(kd);
+  post('/api/gains', {kp, ki, kd});
+}
 function setSpm(mul) {
   if (last) post('/api/spm', {spm: Math.max(0.5, last.setpoint_spm * mul)});
 }
@@ -181,6 +215,16 @@ function render(data) {
   sb.style.display = data.speed_control ? 'flex' : 'none';
   document.getElementById('speed').textContent = data.speed.toFixed(2);
   document.getElementById('spm').textContent = data.setpoint_spm.toFixed(1);
+  for (const a of ['classic', 'pid', 'qpid'])
+    document.getElementById('algo-' + a).classList.toggle('on', data.algorithm === a);
+  // qpid tunes the statistical gates; plain pid tunes the gains by hand;
+  // classic has neither.
+  document.getElementById('knobs-stat').style.display = data.algorithm === 'qpid' ? '' : 'none';
+  document.getElementById('knobs-pid').style.display = data.algorithm === 'pid' ? '' : 'none';
+  const [mkp, mki, mkd] = data.manual_gains;
+  document.getElementById('gkp').textContent = mkp.toFixed(3);
+  document.getElementById('gki').textContent = mki.toFixed(4);
+  document.getElementById('gkd').textContent = mkd.toFixed(3);
   document.getElementById('confk').textContent = data.confidence_k.toFixed(2);
   document.getElementById('sigz').textContent = data.significance_z.toFixed(1);
   document.getElementById('sigzd').textContent = data.significance_z_down.toFixed(1);

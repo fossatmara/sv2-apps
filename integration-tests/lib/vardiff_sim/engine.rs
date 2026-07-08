@@ -182,6 +182,9 @@ impl SimEngine {
     fn poll_gain_telemetry(&mut self, elapsed: f64) {
         for (name, stats) in self.stats.iter_mut() {
             let Some(gains) = super::controller_gains(name) else {
+                // Controller no longer publishes (e.g. switched to classic):
+                // stop showing stale gains, but keep the change history.
+                stats.gains = None;
                 continue;
             };
             if stats.gains != Some(gains) {
@@ -190,6 +193,31 @@ impl SimEngine {
                 stats.gain_changes.push((elapsed, kp, ki, kd));
             }
         }
+    }
+
+    /// Current vardiff algorithm name.
+    pub fn algorithm(&self) -> &'static str {
+        super::algorithm()
+    }
+
+    /// Sets the live vardiff algorithm; returns false for unknown names.
+    pub fn set_algorithm(&mut self, name: &str) -> bool {
+        let ok = super::set_algorithm(name);
+        if ok {
+            self.changed.notify_waiters();
+        }
+        ok
+    }
+
+    /// Current manual pid gains (kp, ki, kd).
+    pub fn manual_gains(&self) -> (f64, f64, f64) {
+        super::manual_gains()
+    }
+
+    /// Sets the manual pid gains (plain pid only).
+    pub fn set_manual_gains(&mut self, kp: f64, ki: f64, kd: f64) {
+        super::set_manual_gains(kp, ki, kd);
+        self.changed.notify_waiters();
     }
 
     /// Current vardiff setpoint (shares per minute).

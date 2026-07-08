@@ -132,30 +132,82 @@ pub async fn run(
                         let s = eng.speed();
                         eng.set_speed(s * 2.0);
                     }
-                    KeyCode::Char('3') if speed_control => {
-                        let k = eng.confidence_k();
-                        eng.set_confidence_k((k / 2.0).max(0.25));
+                    KeyCode::Char('c') if speed_control => {
+                        let next = match eng.algorithm() {
+                            "classic" => "pid",
+                            "pid" => "qpid",
+                            _ => "classic",
+                        };
+                        eng.set_algorithm(next);
                     }
-                    KeyCode::Char('4') if speed_control => {
-                        let k = eng.confidence_k();
-                        eng.set_confidence_k((k * 2.0).max(0.5));
-                    }
-                    KeyCode::Char('5') if speed_control => {
-                        let z = eng.significance_z();
-                        eng.set_significance_z(z - 0.5);
-                    }
-                    KeyCode::Char('6') if speed_control => {
-                        let z = eng.significance_z();
-                        eng.set_significance_z(z + 0.5);
-                    }
-                    KeyCode::Char('7') if speed_control => {
-                        let z = eng.significance_z_down();
-                        eng.set_significance_z_down(z - 0.5);
-                    }
-                    KeyCode::Char('8') if speed_control => {
-                        let z = eng.significance_z_down();
-                        eng.set_significance_z_down(z + 0.5);
-                    }
+                    // 3-8 tune the statistical gates under qpid, the raw
+                    // gains under plain pid.
+                    KeyCode::Char('3') if speed_control => match eng.algorithm() {
+                        "qpid" => {
+                            let k = eng.confidence_k();
+                            eng.set_confidence_k((k / 2.0).max(0.25));
+                        }
+                        "pid" => {
+                            let (kp, ki, kd) = eng.manual_gains();
+                            eng.set_manual_gains(kp / 2.0, ki, kd);
+                        }
+                        _ => {}
+                    },
+                    KeyCode::Char('4') if speed_control => match eng.algorithm() {
+                        "qpid" => {
+                            let k = eng.confidence_k();
+                            eng.set_confidence_k((k * 2.0).max(0.5));
+                        }
+                        "pid" => {
+                            let (kp, ki, kd) = eng.manual_gains();
+                            eng.set_manual_gains(kp * 2.0, ki, kd);
+                        }
+                        _ => {}
+                    },
+                    KeyCode::Char('5') if speed_control => match eng.algorithm() {
+                        "qpid" => {
+                            let z = eng.significance_z();
+                            eng.set_significance_z(z - 0.5);
+                        }
+                        "pid" => {
+                            let (kp, ki, kd) = eng.manual_gains();
+                            eng.set_manual_gains(kp, ki / 2.0, kd);
+                        }
+                        _ => {}
+                    },
+                    KeyCode::Char('6') if speed_control => match eng.algorithm() {
+                        "qpid" => {
+                            let z = eng.significance_z();
+                            eng.set_significance_z(z + 0.5);
+                        }
+                        "pid" => {
+                            let (kp, ki, kd) = eng.manual_gains();
+                            eng.set_manual_gains(kp, ki * 2.0, kd);
+                        }
+                        _ => {}
+                    },
+                    KeyCode::Char('7') if speed_control => match eng.algorithm() {
+                        "qpid" => {
+                            let z = eng.significance_z_down();
+                            eng.set_significance_z_down(z - 0.5);
+                        }
+                        "pid" => {
+                            let (kp, ki, kd) = eng.manual_gains();
+                            eng.set_manual_gains(kp, ki, if kd <= 0.01 { 0.0 } else { kd / 2.0 });
+                        }
+                        _ => {}
+                    },
+                    KeyCode::Char('8') if speed_control => match eng.algorithm() {
+                        "qpid" => {
+                            let z = eng.significance_z_down();
+                            eng.set_significance_z_down(z + 0.5);
+                        }
+                        "pid" => {
+                            let (kp, ki, kd) = eng.manual_gains();
+                            eng.set_manual_gains(kp, ki, if kd == 0.0 { 0.01 } else { kd * 2.0 });
+                        }
+                        _ => {}
+                    },
                     KeyCode::Char('9') if speed_control => {
                         let s = eng.setpoint_spm();
                         eng.set_setpoint_spm(s / 2.0);
@@ -277,14 +329,26 @@ fn draw(
         Constraint::Length(6),
         Constraint::Length(8),
     ];
+    let knobs = match engine.algorithm() {
+        "qpid" => format!(
+            "K={:.2} Z↑={:.1} Z↓={:.1}",
+            engine.confidence_k(),
+            engine.significance_z(),
+            engine.significance_z_down()
+        ),
+        "pid" => {
+            let (kp, ki, kd) = engine.manual_gains();
+            format!("kp={kp:.3} ki={ki:.4} kd={kd:.3}")
+        }
+        _ => String::new(),
+    };
     let title = format!(
-        " vardiff-sim | t={:.0}s | speed x{:.2} | spm={:.1} | conf-K={:.2} | Z↑={:.1} Z↓={:.1} | {} miners ",
+        " vardiff-sim | t={:.0}s | {} | speed x{:.2} | spm={:.1} | {} | {} miners ",
         engine.elapsed_secs(),
+        engine.algorithm(),
         engine.speed(),
         engine.setpoint_spm(),
-        engine.confidence_k(),
-        engine.significance_z(),
-        engine.significance_z_down(),
+        knobs,
         names.len()
     );
     let table = Table::new(rows, widths)
@@ -452,7 +516,7 @@ fn draw(
 
     let help = if fleet_ready {
         Line::from(vec![Span::styled(
-            " z quit | w/s sel | a/d hash | f disc | r reconn | e add | q rm | 1/2 spd | 3/4 K | 5/6 Z↑ | 7/8 Z↓ | 9/0 spm",
+            " z quit | w/s sel | a/d hash | f disc | r reconn | e add | q rm | c algo | 1/2 spd | 9/0 spm | 3-8 knobs",
             Style::default().fg(Color::DarkGray),
         )])
     } else {

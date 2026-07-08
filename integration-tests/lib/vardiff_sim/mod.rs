@@ -97,6 +97,49 @@ pub fn set_setpoint_spm(spm: f64) {
     stratum_apps::stratum_core::channels_sv2::vardiff::tuning::set_shares_per_minute(spm)
 }
 
+/// Current vardiff algorithm as a lowercase name.
+pub fn algorithm() -> &'static str {
+    use stratum_apps::stratum_core::channels_sv2::vardiff::{tuning, VardiffKind};
+    match tuning::algorithm_override() {
+        Some(VardiffKind::Classic) => "classic",
+        Some(VardiffKind::Pid) => "pid",
+        Some(VardiffKind::QPid) | None => "qpid",
+    }
+}
+
+/// Sets the live vardiff algorithm ("classic" | "pid" | "qpid"); existing
+/// channels rebuild their controllers on the next evaluation.
+pub fn set_algorithm(name: &str) -> bool {
+    use stratum_apps::stratum_core::channels_sv2::vardiff::{tuning, VardiffKind};
+    let kind = match name {
+        "classic" => VardiffKind::Classic,
+        "pid" => VardiffKind::Pid,
+        "qpid" => VardiffKind::QPid,
+        _ => return false,
+    };
+    tuning::set_algorithm(kind);
+    true
+}
+
+/// Current manual gain values (override, else pid defaults).
+pub fn manual_gains() -> (f64, f64, f64) {
+    use stratum_apps::stratum_core::channels_sv2::vardiff::{pid, tuning};
+    let (kp, ki, kd) = tuning::gain_overrides();
+    (
+        kp.unwrap_or(pid::DEFAULT_KP),
+        ki.unwrap_or(pid::DEFAULT_KI),
+        kd.unwrap_or(pid::DEFAULT_KD),
+    )
+}
+
+/// Sets the live manual gains (plain pid only; qpid owns its gains).
+pub fn set_manual_gains(kp: f64, ki: f64, kd: f64) {
+    use stratum_apps::stratum_core::channels_sv2::vardiff::tuning;
+    tuning::set_kp(kp);
+    tuning::set_ki(ki);
+    tuning::set_kd(kd);
+}
+
 /// Current controller gains (kp, ki, kd) for a miner's channel, published by
 /// the embedded pool's pid/qpid controller under the miner's user identity.
 pub fn controller_gains(name: &str) -> Option<(f64, f64, f64)> {
