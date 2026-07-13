@@ -1,0 +1,57 @@
+# Duty-cycled miners — behind-the-meter / solar / off-peak fleets.
+#
+# Failure mode: units that cycle ON/OFF on a regular schedule (a repeating
+# square wave), unlike flaky (irregular short flaps) or mass-curtailment (a
+# single event). Two mechanisms are modeled: full disconnect/reconnect cycling,
+# and stay-connected power-gating (hashrate square-wave to a trickle). The
+# regular period can beat against the controller's response time — if it retargets
+# on each ON phase it will thrash every cycle.
+#
+# Watch: does difficulty converge to the ON-phase rate and ride through the OFF
+# phases on the idle backstop, or does it chase each edge and never settle?
+name = "duty-cycled"
+duration_secs = 900
+
+# Solar: connected only during "daylight" windows (~4 min on / ~2 min off).
+[[miners]]
+name = "solar"
+hashrate = 200e12
+[[miners.events]]
+at = 240
+action = "disconnect"
+[[miners.events]]
+at = 360
+action = "reconnect"
+[[miners.events]]
+at = 600
+action = "disconnect"
+[[miners.events]]
+at = 720
+action = "reconnect"
+
+# Off-peak: stays connected but power-gates to a trickle on-schedule (square
+# wave), so the channel never goes silent — a different backstop path.
+[[miners]]
+name = "off-peak"
+hashrate = 150e12
+[[miners.events]]
+at = 180
+action = "set_hashrate"
+hashrate = 15e12
+[[miners.events]]
+at = 360
+action = "set_hashrate"
+hashrate = 150e12
+[[miners.events]]
+at = 540
+action = "set_hashrate"
+hashrate = 15e12
+[[miners.events]]
+at = 720
+action = "set_hashrate"
+hashrate = 150e12
+
+# Always-on control.
+[[miners]]
+name = "baseload"
+hashrate = 100e12

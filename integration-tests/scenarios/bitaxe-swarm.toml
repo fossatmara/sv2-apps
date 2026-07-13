@@ -1,0 +1,37 @@
+# Bitaxe / small-miner swarm — sparse-share Poisson-noise regime.
+#
+# Failure mode: a fleet of tiny miners whose share intervals are dominated by
+# Poisson noise, not signal. This is the ONLY scenario that exercises the
+# champion's PoissonCI boundary branch (it selects PoissonCI when the setpoint
+# is below 6 spm) and the classic ladder's "premature fire on sparse data"
+# weakness. Run it at a LOW setpoint to stay in that regime:
+#   vardiff-sim --spawn-pool --algorithm <a> --shares-per-minute 2 \
+#     --scenario scenarios/bitaxe-swarm.toml
+#
+# Watch: does the controller hold steady on miners that are on-target but noisy,
+# or does it chase single lucky/unlucky share gaps? With only a handful of
+# shares per window, one gap looks like a 2-sigma event ~13% of the time.
+name = "bitaxe-swarm"
+duration_secs = 900
+
+[[miners]]
+name = "bitaxe-1"
+hashrate = 3e12
+[[miners]]
+name = "bitaxe-2"
+hashrate = 2e12
+[[miners]]
+name = "bitaxe-3"
+hashrate = 4e12
+[[miners]]
+name = "bitaxe-4"
+hashrate = 1.5e12
+# One tiny unit that genuinely halves partway through: the controller must
+# catch a real change buried in the sparse noise floor.
+[[miners]]
+name = "bitaxe-fading"
+hashrate = 3e12
+[[miners.events]]
+at = 400
+action = "set_hashrate"
+hashrate = 1.5e12

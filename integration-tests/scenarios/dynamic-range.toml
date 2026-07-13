@@ -1,0 +1,30 @@
+# Extreme dynamic range — one setpoint against a ~1000x hashrate spread.
+#
+# Failure mode: a single pool difficulty policy serving everything from a lone
+# bitaxe to an industrial container simultaneously. The pool's cold-start
+# estimate fits none of them, and each channel must converge to a wildly
+# different difficulty from the same starting point. Spans ~1000x
+# (1 TH/s -> 1 PH/s), far beyond thundering-herd's 10x.
+#
+# Watch: per-channel convergence independence across three orders of magnitude,
+# and whether the small units get starved (difficulty stuck too high) while the
+# large units are still converging down — or vice versa. A shared or coupled
+# controller state would show cross-contamination between the extremes.
+name = "dynamic-range"
+duration_secs = 900
+
+[[miners]]
+name = "nano"
+hashrate = 1e12
+[[miners]]
+name = "small"
+hashrate = 10e12
+[[miners]]
+name = "medium"
+hashrate = 100e12
+[[miners]]
+name = "large"
+hashrate = 300e12
+[[miners]]
+name = "industrial"
+hashrate = 1000e12
