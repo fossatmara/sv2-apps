@@ -265,6 +265,15 @@ async fn ws_stream(mut socket: WebSocket, st: HttpState) {
         .lock()
         .expect("engine lock")
         .change_notifier();
+    // Arm the wakeup BEFORE building/sending each snapshot: notify_waiters()
+    // only wakes tasks already parked in .notified(), so a change that fires
+    // during build/send would otherwise be LOST and the next push would stall
+    // to the 1s heartbeat (a stutter source). enable() registers the waiter
+    // eagerly so such a change wakes the pinned future immediately. We keep
+    // notify_waiters (broadcast to every open tab) rather than notify_one
+    // (which would starve additional dashboards).
+    let mut notified = Box::pin(notify.notified());
+    notified.as_mut().enable();
     loop {
         let json = match serde_json::to_string(&build_snapshot(&st, false)) {
             Ok(j) => j,
@@ -274,11 +283,17 @@ async fn ws_stream(mut socket: WebSocket, st: HttpState) {
             return;
         }
         tokio::select! {
-            _ = notify.notified() => {
-                // Coalesce event bursts into one frame.
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            _ = notified.as_mut() => {
+                // Re-arm immediately so changes during the coalesce window and
+                // the next send are captured, then coalesce bursts into one frame.
+                notified.set(notify.notified());
+                notified.as_mut().enable();
+                tokio::time::sleep(std::time::Duration::from_millis(60)).await;
             }
-            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                notified.set(notify.notified());
+                notified.as_mut().enable();
+            }
             // Drain client frames so pings/closes are handled promptly.
             msg = socket.recv() => {
                 match msg {

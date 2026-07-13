@@ -139,6 +139,12 @@ pub struct SimEngine {
     scenario_name: Option<String>,
     /// Precomputed event points of the loaded scenario, for plotting markers.
     scenario_events: Vec<ScenarioEventPoint>,
+    /// Last elapsed time at which we notified frontends, so a tick that only
+    /// advanced the clock (no share events) still pushes a WS frame — the
+    /// chart's right edge and rate-error samples move every tick, so the live
+    /// view must refresh even between share arrivals. Bounded by the caller's
+    /// drain cadence (~100ms wall); double-drains in one iteration are deduped.
+    last_notified_elapsed: f64,
 }
 
 impl SimEngine {
@@ -155,6 +161,7 @@ impl SimEngine {
             driver: None,
             scenario_name: None,
             scenario_events: Vec::new(),
+            last_notified_elapsed: f64::NEG_INFINITY,
         }
     }
 
@@ -638,7 +645,14 @@ impl SimEngine {
                 }
             }
         }
-        if any {
+        // Notify frontends when share events landed, OR when the clock has
+        // advanced since the last notify (so the streaming chart tracks the
+        // moving right edge / rate-error samples between share arrivals rather
+        // than stalling to the WS heartbeat). The elapsed guard keeps this to
+        // one notify per drain tick even though drain_events is called twice
+        // per loop iteration.
+        if any || elapsed > self.last_notified_elapsed {
+            self.last_notified_elapsed = elapsed;
             self.changed.notify_waiters();
         }
     }

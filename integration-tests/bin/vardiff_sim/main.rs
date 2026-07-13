@@ -452,12 +452,19 @@ async fn main() {
         });
 
     let mut last_print = 0u64;
+    // Last whole virtual second written to CSV, so the CSV keeps exactly one
+    // row per simulated second regardless of the (faster) drain cadence.
+    let mut last_csv_secs: Option<u64> = None;
+    // Drain on a FIXED short WALL interval, decoupled from sim speed: this
+    // advances difficulty points / rate-error samples / the chart's right edge
+    // ~10x/sec so the live dashboard streams smoothly instead of lurching once
+    // per wall second (the old `1/speed` sleep drained only 1x/sec at speed 1).
+    // Every event counter is drained exactly-once and every sampler is
+    // virtual-clock-gated, so a faster wall drain cannot double-count.
+    const DRAIN_INTERVAL: Duration = Duration::from_millis(100);
     loop {
-        // One iteration per *virtual* second: at speed 8 the loop runs 8x
-        // faster in wall time, keeping one CSV row per simulated second.
-        let wall_secs = (1.0 / engine.lock().expect("engine lock").speed()).clamp(0.05, 10.0);
         tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs_f64(wall_secs)) => {}
+            _ = tokio::time::sleep(DRAIN_INTERVAL) => {}
             _ = shutdown_signal.recv() => {
                 println!("signal received, shutting down...");
                 break;
@@ -469,12 +476,17 @@ async fn main() {
         eng.drain_events();
         eng.apply_drift();
         eng.drain_events();
+        // CSV contract: one row per whole virtual second (edge-detected), so
+        // the row cadence is identical at every --speed.
+        let elapsed_whole = elapsed as u64;
         if let Some(csv) = csv.as_mut() {
-            if let Err(e) = csv.write_tick(&eng) {
-                eprintln!("csv write failed: {e}");
+            if last_csv_secs != Some(elapsed_whole) {
+                last_csv_secs = Some(elapsed_whole);
+                if let Err(e) = csv.write_tick(&eng) {
+                    eprintln!("csv write failed: {e}");
+                }
             }
         }
-        let elapsed_whole = elapsed as u64;
         if elapsed_whole >= last_print + 10 {
             last_print = elapsed_whole;
             println!("--- t={elapsed_whole}s");

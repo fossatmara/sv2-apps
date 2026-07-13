@@ -26,11 +26,21 @@
   .bar { display: flex; gap: .75rem; align-items: center; margin-bottom: .75rem; flex-wrap: wrap; }
   input { background: #010409; color: #c9d1d9; border: 1px solid #30363d;
           border-radius: 4px; padding: .15rem .4rem; width: 8rem; }
-  #chartwrap, #errwrap { background: #010409; border: 1px solid #21262d;
-               border-radius: 6px; padding: .5rem; }
   .u-legend { color: #c9d1d9; font: 12px ui-monospace, monospace; }
   .u-legend .u-marker { border-radius: 50%; }
   .hint { color: #8b949e; font-size: 12px; margin-top: .25rem; }
+  /* Per-miner chart group: a labeled header + difficulty chart + error chart. */
+  #grid { display: flex; flex-direction: column; gap: .75rem; }
+  .mg { background: #010409; border: 1px solid #21262d; border-radius: 6px; padding: .5rem .5rem .25rem; }
+  .mg.down { border-color: #5a2321; }
+  .mg-head { display: flex; align-items: baseline; gap: .5rem; margin-bottom: .25rem; }
+  .mg-head b { font-size: 1rem; color: #58a6ff; }
+  .mg-head .badge { font-size: 11px; padding: 0 .35rem; border-radius: 3px; }
+  .badge.up { background: #12331d; color: #3fb950; }
+  .badge.down { background: #3d1d1c; color: #f85149; }
+  .mg-stats { color: #8b949e; font-size: 12px; }
+  .mg-err { margin-top: .25rem; }
+  #pagebar b { color: #c9d1d9; }
 </style>
 </head>
 <body>
@@ -109,21 +119,37 @@
   <button id="live" class="on" onclick="toggleLive()">live</button>
 </div>
 
-<div id="chartwrap"><div id="chart"></div></div>
-<div id="errwrap" style="margin-top:.5rem" class="chartbox"><div id="errchart"></div></div>
-<div class="hint">hover for values · drag to zoom (pauses live) · double-click to reset zoom</div>
+<div class="bar" id="pagebar" style="display:none">
+  page <b id="pageinfo">1/1</b>
+  <button onclick="pagePrev()">◀ prev</button>
+  <button onclick="pageNext()">next ▶</button>
+  <span style="margin-left:.5rem" class="hint">per page:</span>
+  <button onclick="setPerPage(4)">4</button>
+  <button onclick="setPerPage(8)">8</button>
+  <button onclick="setPerPage(16)">16</button>
+  <span style="flex:1"></span>
+  <span class="hint">hover for values · drag to zoom (pauses live) · double-click to reset</span>
+</div>
+
+<!-- One labeled group per visible miner: difficulty chart + error chart. -->
+<div id="grid"></div>
 
 <script>
 const TOKEN = new URLSearchParams(location.search).get('token') || '';
 const AUTH = { 'authorization': 'Bearer ' + TOKEN };
-let selected = null;
 let last = null;
 let live = true;
-let chart = null;
-let errChart = null;
-let chartMiner = null;
-let changes = [];          // hashrate changes of the selected miner, for the draw hook
-let scenarioEvents = [];   // scenario event points {at, miner, label} for the draw hook
+let scenarioEvents = [];   // scenario event points {at, miner, label} for the draw hooks
+// One pane per visible miner: { diff: uPlot, err: uPlot, root, headEls }.
+// Panes are created/destroyed only when the visible miner SET changes, never
+// per message — steady-state updates are just setData, so the DOM is stable.
+const panes = new Map();
+// Pagination for large fleets: only `perPage` miners get live charts.
+let page = 0;
+let perPage = 8;
+// Device-pixel ratio for legible canvas text (uPlot draw hooks run in device
+// space; a raw 10px font would be ~5 CSS px on a 2x display).
+const DPR = Math.max(1, Math.round(window.devicePixelRatio || 1));
 
 function fmtHash(h) {
   const u = [[1e15,'PH/s'],[1e12,'TH/s'],[1e9,'GH/s'],[1e6,'MH/s'],[1e3,'kH/s']];
@@ -189,14 +215,15 @@ function addMiner() {
 function toggleLive() {
   live = !live;
   document.getElementById('live').classList.toggle('on', live);
-  if (live && last) refreshChart();
+  if (live) refreshChart();
 }
 
 let showGains = true;
 function toggleGains() {
   showGains = !showGains;
   document.getElementById('gains').classList.toggle('on', showGains);
-  if (chart) [4, 5, 6].forEach(i => chart.setSeries(i, {show: showGains}));
+  // Toggle the three gain series (indices 4,5,6) on every live pane.
+  for (const p of panes.values()) [4, 5, 6].forEach(i => p.diff.setSeries(i, {show: showGains}));
 }
 
 let fullMode = false;
@@ -207,30 +234,28 @@ async function fetchFull() {
     const r = await fetch('/api/stats?full=1', {headers: AUTH});
     if (r.ok) {
       lastFull = await r.json();
-      if (live) updateChart(lastFull, true);
+      if (live) syncPanes(lastFull);
     }
   } catch (e) {}
 }
 function toggleFull() {
   fullMode = !fullMode;
   document.getElementById('full').classList.toggle('on', fullMode);
-  chartMiner = null; // force chart rebuild for the new x-range
+  // Rebuild panes so the x-range reflects the new (full vs windowed) source.
+  destroyAllPanes();
   if (fullMode) {
     fetchFull();
     fullTimer = setInterval(fetchFull, 3000);
   } else {
     clearInterval(fullTimer);
     fullTimer = null;
-    if (last) refreshChart();
+    if (last) syncPanes(last);
   }
 }
-/// Chart from the right source for the current mode.
+/// Redraw panes from the right source for the current mode.
 function refreshChart() {
-  if (fullMode) {
-    if (lastFull) updateChart(lastFull, true);
-  } else if (last) {
-    updateChart(last, false);
-  }
+  if (fullMode) { if (lastFull) syncPanes(lastFull); }
+  else if (last) syncPanes(last);
 }
 
 function render(data) {
@@ -267,14 +292,14 @@ function render(data) {
   document.getElementById('sigz').textContent = data.significance_z.toFixed(1);
   document.getElementById('sigzd').textContent = data.significance_z_down.toFixed(1);
 
-  if (!selected && data.miners.length) selected = data.miners[0].name;
+  // Control table (rebuilt each render — small, and only the visible fleet has
+  // charts). Clicking a row pages to that miner's chart group.
   const tb = document.querySelector('#miners tbody');
   tb.innerHTML = '';
-  for (const m of data.miners) {
+  data.miners.forEach((m, i) => {
     const tr = document.createElement('tr');
-    if (m.name === selected) tr.classList.add('sel');
     if (!m.connected) tr.classList.add('down');
-    tr.onclick = () => { selected = m.name; chartMiner = null; render(last); refreshChart(); };
+    tr.onclick = () => { page = Math.floor(i / perPage); syncPanes(data); };
     tr.innerHTML = `<td>${m.name}</td><td>${m.connected ? 'up' : 'down'}</td>` +
       `<td>${fmtHash(m.hashrate)}</td><td>${m.difficulty.toFixed(2)}</td>` +
       `<td>${m.expected_spm.toFixed(2)}</td><td>${m.realized_spm.toFixed(2)}</td>` +
@@ -285,12 +310,24 @@ function render(data) {
       `<button onclick="event.stopPropagation();act('${m.name}','${m.connected ? 'disconnect' : 'reconnect'}')">${m.connected ? 'disc' : 'reconn'}</button>` +
       `<button onclick="event.stopPropagation();act('${m.name}','remove')">✕</button></td>`;
     tb.appendChild(tr);
-  }
-  if (live && !fullMode) updateChart(data, false);
+  });
+
+  // Pagination bar.
+  const pages = Math.max(1, Math.ceil(data.miners.length / perPage));
+  if (page >= pages) page = pages - 1;
+  document.getElementById('pagebar').style.display = data.miners.length ? 'flex' : 'none';
+  document.getElementById('pageinfo').textContent = `${page + 1}/${pages}`;
+
+  if (live && !fullMode) syncPanes(data);
+}
+
+/// Which miners are shown on the current page.
+function visibleMiners(data) {
+  return data.miners.slice(page * perPage, page * perPage + perPage);
 }
 
 // Merge the event-based series onto one x axis (uPlot needs aligned arrays).
-function buildData(m, x2, hasSynthetic) {
+function buildDiffData(m, x2, hasSynthetic) {
   const hist = m.difficulty_history;
   if (!hist.length) return null;
   const gainHist = m.gain_changes || [];
@@ -327,95 +364,80 @@ function buildData(m, x2, hasSynthetic) {
   return [x, diff, fire, rug, gkp, gki, gkd];
 }
 
-function drawChangeLines(u) {
-  const ctx = u.ctx;
-  ctx.save();
-  ctx.lineWidth = 1.5;
-  for (const [t, from, to] of changes) {
-    const x = u.valToPos(t, 'x', true);
-    if (x < u.bbox.left || x > u.bbox.left + u.bbox.width) continue;
-    ctx.strokeStyle = to >= from ? '#3fb950' : '#f85149';
-    ctx.beginPath();
-    ctx.moveTo(x, u.bbox.top);
-    ctx.lineTo(x, u.bbox.top + u.bbox.height);
-    ctx.stroke();
-  }
-  ctx.restore();
-}
+// Legible, DPR-scaled marker text. uPlot draw hooks run in device-pixel space
+// (valToPos(..,true) and bbox are device px), so a raw 10px font renders at
+// ~10 device px = ~5 CSS px on a 2x display. Scale by DPR for ~13px CSS, add a
+// dark backing box for contrast over chart lines, and stagger labels that fall
+// close together so they don't overprint.
+function labelFont(px) { return `600 ${px * DPR}px ui-monospace, monospace`; }
 
-// Scheduled scenario events: dashed amber verticals with a label, so users can
-// see what changes and when. Shows events for the selected miner plus global
-// events (empty miner name, e.g. spm changes).
-function drawScenarioEvents(u) {
-  if (!scenarioEvents.length) return;
-  const ctx = u.ctx;
-  ctx.save();
-  ctx.setLineDash([4, 3]);
-  ctx.lineWidth = 1;
-  ctx.font = '10px ui-monospace, monospace';
-  ctx.textAlign = 'left';
-  for (const [at, miner, label] of scenarioEvents) {
-    if (miner && miner !== selected) continue;
-    const x = u.valToPos(at, 'x', true);
-    if (x < u.bbox.left || x > u.bbox.left + u.bbox.width) continue;
-    const global = !miner;
-    ctx.strokeStyle = global ? '#58a6ff' : '#d29922';
-    ctx.beginPath();
-    ctx.moveTo(x, u.bbox.top);
-    ctx.lineTo(x, u.bbox.top + u.bbox.height);
-    ctx.stroke();
-    ctx.fillStyle = global ? '#58a6ff' : '#d29922';
-    ctx.fillText(label, x + 2, u.bbox.top + 10);
-  }
-  ctx.restore();
-}
-
-// Observed log share-rate error ln(observed/setpoint): the controller's
-// error signal. Zero = on setpoint; the band shows +/-1.
-function makeErrChart(data) {
-  const el = document.getElementById('errchart');
-  el.innerHTML = '';
-  const opts = {
-    width: el.parentElement.clientWidth - 16,
-    height: 140,
-    scales: { x: { time: false },
-              y: { range: (u, min, max) => [Math.min(min, -1.2), Math.max(max, 1.2)] } },
-    series: [
-      { label: 't', value: (u, v) => v == null ? '' : v.toFixed(1) + 's' },
-      { label: 'ln(obs/setpoint)', stroke: '#ff9b6b', width: 1.5, spanGaps: true,
-        points: {show: false}, value: (u, v) => v == null ? '—' : v.toFixed(3) },
-    ],
-    axes: [
-      { stroke: '#8b949e', grid: {stroke: '#21262d'}, ticks: {stroke: '#21262d'},
-        values: (u, vals) => vals.map(v => v.toFixed(0) + 's') },
-      { stroke: '#8b949e', grid: {stroke: '#21262d'}, ticks: {stroke: '#21262d'}, size: 56 },
-    ],
-    cursor: { drag: { x: true, y: false }, sync: { key: 'vdsim' } },
-    hooks: {
-      // Emphasized zero line: converged means hugging it.
-      draw: [u => {
-        const y = u.valToPos(0, 'y', true);
-        u.ctx.save();
-        u.ctx.strokeStyle = '#3d444d';
-        u.ctx.lineWidth = 1;
-        u.ctx.beginPath();
-        u.ctx.moveTo(u.bbox.left, y);
-        u.ctx.lineTo(u.bbox.left + u.bbox.width, y);
-        u.ctx.stroke();
-        u.ctx.restore();
-      }],
-      setSelect: [u => { if (u.select.width > 0 && live) toggleLive(); }],
-    },
+function makeDrawChangeLines(paneMinerName) {
+  return u => {
+    const m = last && last.miners.find(x => x.name === paneMinerName);
+    if (!m) return;
+    const ctx = u.ctx;
+    ctx.save();
+    ctx.lineWidth = 1.5 * DPR;
+    for (const [t, from, to] of (m.hashrate_changes || [])) {
+      const x = u.valToPos(t, 'x', true);
+      if (x < u.bbox.left || x > u.bbox.left + u.bbox.width) continue;
+      ctx.strokeStyle = to >= from ? '#3fb950' : '#f85149';
+      ctx.beginPath();
+      ctx.moveTo(x, u.bbox.top);
+      ctx.lineTo(x, u.bbox.top + u.bbox.height);
+      ctx.stroke();
+    }
+    ctx.restore();
   };
-  errChart = new uPlot(opts, data, el);
 }
 
-function makeChart(data) {
-  const el = document.getElementById('chart');
-  el.innerHTML = '';
-  const opts = {
-    width: el.parentElement.clientWidth - 16,
-    height: 320,
+// Scheduled scenario events for THIS pane's miner (plus global events). Dashed
+// verticals with a legible, backed, vertically-staggered label.
+function makeDrawScenarioEvents(paneMinerName) {
+  return u => {
+    if (!scenarioEvents.length) return;
+    const ctx = u.ctx;
+    ctx.save();
+    ctx.lineWidth = 1 * DPR;
+    ctx.font = labelFont(13);
+    ctx.textBaseline = 'top';
+    const fontPx = 13 * DPR;
+    // Track recent label x-positions to stagger overlapping labels down a row.
+    let lastX = -1e9, row = 0;
+    for (const [at, miner, label] of scenarioEvents) {
+      if (miner && miner !== paneMinerName) continue;
+      const x = u.valToPos(at, 'x', true);
+      if (x < u.bbox.left || x > u.bbox.left + u.bbox.width) continue;
+      const global = !miner;
+      const color = global ? '#79c0ff' : '#e3b341';
+      ctx.setLineDash([5 * DPR, 3 * DPR]);
+      ctx.strokeStyle = color;
+      ctx.beginPath();
+      ctx.moveTo(x, u.bbox.top);
+      ctx.lineTo(x, u.bbox.top + u.bbox.height);
+      ctx.stroke();
+      // Stagger if within a label-width of the previous one.
+      if (x - lastX < 60 * DPR) { row = (row + 1) % 4; } else { row = 0; }
+      lastX = x;
+      const ty = u.bbox.top + 3 * DPR + row * (fontPx + 3 * DPR);
+      const tw = ctx.measureText(label).width;
+      ctx.setLineDash([]);
+      ctx.fillStyle = 'rgba(1,4,9,0.78)';
+      ctx.fillRect(x + 2 * DPR, ty, tw + 5 * DPR, fontPx + 3 * DPR);
+      ctx.fillStyle = color;
+      ctx.fillText(label, x + 4 * DPR, ty + 1 * DPR);
+    }
+    ctx.restore();
+  };
+}
+
+const DIFF_HEIGHT = 240, ERR_HEIGHT = 110;
+
+// Build a difficulty-chart uPlot for one miner pane.
+function makeDiffChart(el, paneMinerName, data) {
+  return new uPlot({
+    width: el.clientWidth || 600,
+    height: DIFF_HEIGHT,
     scales: { x: { time: false }, y: {}, r: { range: [0, 12] }, g: {} },
     series: [
       { label: 't', value: (u, v) => v == null ? '' : v.toFixed(1) + 's' },
@@ -441,50 +463,150 @@ function makeChart(data) {
     axes: [
       { stroke: '#8b949e', grid: {stroke: '#21262d'}, ticks: {stroke: '#21262d'},
         values: (u, vals) => vals.map(v => v.toFixed(0) + 's') },
-      { stroke: '#8b949e', grid: {stroke: '#21262d'}, ticks: {stroke: '#21262d'}, size: 76 },
+      { stroke: '#8b949e', grid: {stroke: '#21262d'}, ticks: {stroke: '#21262d'}, size: 68 },
       { scale: 'g', side: 1, stroke: '#8b949e', grid: {show: false},
-        ticks: {stroke: '#21262d'}, size: 50 },
+        ticks: {stroke: '#21262d'}, size: 46 },
     ],
-    cursor: { drag: { x: true, y: false }, sync: { key: 'vdsim' } },
+    cursor: { drag: { x: true, y: false } },
     hooks: {
-      draw: [drawChangeLines, drawScenarioEvents],
+      draw: [makeDrawChangeLines(paneMinerName), makeDrawScenarioEvents(paneMinerName)],
       setSelect: [u => { if (u.select.width > 0 && live) toggleLive(); }],
     },
-  };
-  chart = new uPlot(opts, data, el);
+  }, data, el);
 }
 
-function updateChart(data, full) {
-  const m = data.miners.find(m => m.name === selected);
-  if (!m) return;
-  const hasSynthetic = !full && data.elapsed_secs > data.window_secs;
-  const d = buildData(m, data.elapsed_secs, hasSynthetic);
-  if (!d) return;
-  changes = m.hashrate_changes;
+// Build an error-chart uPlot for one miner pane.
+function makeErrChart(el, data) {
+  return new uPlot({
+    width: el.clientWidth || 600,
+    height: ERR_HEIGHT,
+    scales: { x: { time: false },
+              y: { range: (u, min, max) => [Math.min(min, -1.2), Math.max(max, 1.2)] } },
+    series: [
+      { label: 't', value: (u, v) => v == null ? '' : v.toFixed(1) + 's' },
+      { label: 'ln(obs/setpoint)', stroke: '#ff9b6b', width: 1.5, spanGaps: true,
+        points: {show: false}, value: (u, v) => v == null ? '—' : v.toFixed(3) },
+    ],
+    axes: [
+      { stroke: '#8b949e', grid: {stroke: '#21262d'}, ticks: {stroke: '#21262d'},
+        values: (u, vals) => vals.map(v => v.toFixed(0) + 's') },
+      { stroke: '#8b949e', grid: {stroke: '#21262d'}, ticks: {stroke: '#21262d'}, size: 48 },
+    ],
+    cursor: { drag: { x: true, y: false } },
+    hooks: {
+      draw: [u => {
+        const y = u.valToPos(0, 'y', true);
+        u.ctx.save();
+        u.ctx.strokeStyle = '#3d444d';
+        u.ctx.lineWidth = 1 * DPR;
+        u.ctx.beginPath();
+        u.ctx.moveTo(u.bbox.left, y);
+        u.ctx.lineTo(u.bbox.left + u.bbox.width, y);
+        u.ctx.stroke();
+        u.ctx.restore();
+      }],
+      setSelect: [u => { if (u.select.width > 0 && live) toggleLive(); }],
+    },
+  }, data, el);
+}
+
+function errData(m) {
   const err = m.rate_error || [];
-  const ed = [err.map(([t]) => t), err.map(([, e]) => e)];
-  if (!chart || chartMiner !== selected) {
-    chartMiner = selected;
-    makeChart(d);
-    makeErrChart(ed);
-  } else {
-    chart.setData(d);
-    errChart.setData(ed);
+  return [err.map(([t]) => t), err.map(([, e]) => e)];
+}
+
+// Create the DOM + two uPlots for one miner pane.
+function createPane(m) {
+  const root = document.createElement('div');
+  root.className = 'mg';
+  const head = document.createElement('div');
+  head.className = 'mg-head';
+  const nameEl = document.createElement('b');
+  const badge = document.createElement('span');
+  const stats = document.createElement('span');
+  stats.className = 'mg-stats';
+  head.append(nameEl, badge, stats);
+  const diffEl = document.createElement('div');
+  const errEl = document.createElement('div');
+  errEl.className = 'mg-err';
+  root.append(head, diffEl, errEl);
+  document.getElementById('grid').appendChild(root);
+  const diff = makeDiffChart(diffEl, m.name, [[0], [0], [null], [null], [null], [null], [null]]);
+  const err = makeErrChart(errEl, [[0], [null]]);
+  return { root, nameEl, badge, stats, diff, err, diffEl, errEl };
+}
+
+// Reconcile the set of panes to the current page's miners: create/destroy only
+// on set changes, otherwise just setData — so steady-state has zero DOM churn.
+function syncPanes(data) {
+  const vis = visibleMiners(data);
+  const wanted = new Set(vis.map(m => m.name));
+  // Destroy panes no longer visible.
+  for (const [name, p] of panes) {
+    if (!wanted.has(name)) { p.diff.destroy(); p.err.destroy(); p.root.remove(); panes.delete(name); }
   }
+  // Create/reorder + update.
+  const grid = document.getElementById('grid');
+  vis.forEach((m, i) => {
+    let p = panes.get(m.name);
+    if (!p) { p = createPane(m); panes.set(m.name, p); }
+    // Keep DOM order matching page order.
+    if (grid.children[i] !== p.root) grid.insertBefore(p.root, grid.children[i] || null);
+    updatePane(p, m, data);
+  });
+}
+
+// setData both charts for a pane (no DOM rebuild).
+function updatePane(p, m, data) {
+  const full = fullMode;
+  const hasSynthetic = !full && data.elapsed_secs > data.window_secs;
+  p.nameEl.textContent = m.name;
+  p.badge.className = 'badge ' + (m.connected ? 'up' : 'down');
+  p.badge.textContent = m.connected ? 'up' : 'down';
+  p.stats.textContent =
+    `${fmtHash(m.hashrate)} · diff ${m.difficulty.toFixed(0)} · ` +
+    `${m.realized_spm.toFixed(1)}/${m.expected_spm.toFixed(1)} spm · ` +
+    `acc ${m.accepted}${m.rejected ? ` · rej ${m.rejected}` : ''} · ${m.target_updates} updates`;
+  p.root.classList.toggle('down', !m.connected);
+  const d = buildDiffData(m, data.elapsed_secs, hasSynthetic);
+  if (d) p.diff.setData(d);
+  p.err.setData(errData(m));
 }
 
 window.addEventListener('resize', () => {
-  if (chart) chart.setSize({width: document.getElementById('chartwrap').clientWidth - 16, height: 320});
-  if (errChart) errChart.setSize({width: document.getElementById('errwrap').clientWidth - 16, height: 140});
+  for (const p of panes.values()) {
+    p.diff.setSize({ width: p.diffEl.clientWidth || 600, height: DIFF_HEIGHT });
+    p.err.setSize({ width: p.errEl.clientWidth || 600, height: ERR_HEIGHT });
+  }
 });
 
-// Server pushes snapshots over a WebSocket (event-driven, ~100ms after any
-// change, 1s heartbeat); the browser never polls. Reconnects with backoff.
+function pagePrev() { if (last && page > 0) { page--; syncPanes(last); } }
+function pageNext() {
+  if (!last) return;
+  const pages = Math.ceil(last.miners.length / perPage);
+  if (page + 1 < pages) { page++; syncPanes(last); }
+}
+function setPerPage(n) { perPage = n; page = 0; if (last) { destroyAllPanes(); syncPanes(last); } }
+function destroyAllPanes() {
+  for (const p of panes.values()) { p.diff.destroy(); p.err.destroy(); p.root.remove(); }
+  panes.clear();
+}
+
+// Server pushes snapshots over a WebSocket; the browser never polls. Messages
+// are coalesced into a single requestAnimationFrame so a burst renders once
+// (and rendering is aligned to the display refresh for smoothness). Reconnects
+// with backoff.
 let retryMs = 1000;
+let pendingFrame = null;
+function scheduleRender(data) {
+  last = data;
+  if (pendingFrame) return;
+  pendingFrame = requestAnimationFrame(() => { pendingFrame = null; render(last); });
+}
 function connect() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const ws = new WebSocket(`${proto}://${location.host}/api/ws?token=${encodeURIComponent(TOKEN)}`);
-  ws.onmessage = ev => { retryMs = 1000; render(JSON.parse(ev.data)); };
+  ws.onmessage = ev => { retryMs = 1000; scheduleRender(JSON.parse(ev.data)); };
   ws.onclose = ev => {
     document.getElementById('meta').textContent = ev.code === 1008 || ev.code === 1002
       ? 'unauthorized — open the URL printed by vardiff-sim (includes ?token=)'
