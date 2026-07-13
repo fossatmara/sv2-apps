@@ -1,0 +1,40 @@
+# Network latency and jitter — miners behind slow/batching links.
+#
+# Failure mode (needs the harness's latency_ms / latency_jitter_ms): shares are
+# produced at a steady Poisson rate but DELIVERED to the pool with delay and
+# jitter, so the pool observes bursty/clumped arrivals. An estimator that keys
+# off inter-arrival timing (rather than counts over a window) can be fooled into
+# reading a momentary lull-then-burst as a rate change. The true share RATE is
+# unchanged — only the pool's observation timing is distorted.
+#
+# Watch: SetTarget churn and difficulty drift on the laggy miners vs the local
+# control, even though all have the same true hashrate. A window-counting
+# controller should be nearly immune; a timing-sensitive one will churn.
+name = "laggy-network"
+duration_secs = 900
+
+# High steady latency (2s one-way), low jitter — a distant but stable link.
+[[miners]]
+name = "far-stable"
+hashrate = 120e12
+latency_ms = 2000
+latency_jitter_ms = 200
+
+# Heavy jitter (bursty proxy): mean 1s but +/-3s, so shares clump.
+[[miners]]
+name = "bursty"
+hashrate = 120e12
+latency_ms = 1000
+latency_jitter_ms = 3000
+
+# Satellite-style: very high latency and very high jitter.
+[[miners]]
+name = "satellite"
+hashrate = 120e12
+latency_ms = 5000
+latency_jitter_ms = 4000
+
+# Local control: no added latency, same hashrate.
+[[miners]]
+name = "local"
+hashrate = 120e12

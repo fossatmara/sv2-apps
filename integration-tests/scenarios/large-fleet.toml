@@ -1,0 +1,518 @@
+# Large fleet — 100 miners on one pool: breadth stress, not shape.
+#
+# Failure mode class distinct from every other scenario (all <=6 miners):
+# this exercises the SHARED qpid Q-table under real fleet pressure, per-
+# channel vardiff state at scale, and lock/map contention in the pool's
+# share path. A realistic size distribution (many small, few large) spanning
+# ~200x, with a slice churning and a slice drifting so the fleet is never
+# quiescent. Generated deterministically (seed 2188).
+#
+# Watch: does per-channel difficulty stay independent across 100 channels,
+# and does the shared Q-table converge to a sane policy under this load
+# rather than thrashing between many miners' conflicting states?
+name = "large-fleet"
+duration_secs = 900
+
+[[miners]]
+name = "m001"
+hashrate = 8.491e+12
+
+[[miners]]
+name = "m002"
+hashrate = 5.213e+12
+[miners.drift]
+mode = "random_walk"
+amplitude = 0.39
+step_secs = 5
+
+[[miners]]
+name = "m003"
+hashrate = 5.705e+12
+[[miners.events]]
+at = 276
+action = "disconnect"
+[[miners.events]]
+at = 509
+action = "reconnect"
+
+[[miners]]
+name = "m004"
+hashrate = 4.088e+12
+
+[[miners]]
+name = "m005"
+hashrate = 4.825e+12
+
+[[miners]]
+name = "m006"
+hashrate = 8.073e+12
+
+[[miners]]
+name = "m007"
+hashrate = 9.440e+12
+
+[[miners]]
+name = "m008"
+hashrate = 7.524e+12
+
+[[miners]]
+name = "m009"
+hashrate = 4.170e+12
+
+[[miners]]
+name = "m010"
+hashrate = 6.377e+12
+
+[[miners]]
+name = "m011"
+hashrate = 9.906e+12
+[[miners.events]]
+at = 205
+action = "disconnect"
+[[miners.events]]
+at = 444
+action = "reconnect"
+
+[[miners]]
+name = "m012"
+hashrate = 4.717e+12
+[miners.drift]
+mode = "random_walk"
+amplitude = 0.30
+step_secs = 5
+
+[[miners]]
+name = "m013"
+hashrate = 9.752e+12
+[miners.drift]
+mode = "random_walk"
+amplitude = 0.24
+step_secs = 5
+
+[[miners]]
+name = "m014"
+hashrate = 9.111e+12
+
+[[miners]]
+name = "m015"
+hashrate = 4.746e+12
+
+[[miners]]
+name = "m016"
+hashrate = 7.318e+12
+[miners.drift]
+mode = "random_walk"
+amplitude = 0.18
+step_secs = 5
+
+[[miners]]
+name = "m017"
+hashrate = 7.120e+12
+[[miners.events]]
+at = 264
+action = "disconnect"
+[[miners.events]]
+at = 467
+action = "reconnect"
+
+[[miners]]
+name = "m018"
+hashrate = 7.250e+12
+
+[[miners]]
+name = "m019"
+hashrate = 3.760e+12
+[miners.drift]
+mode = "sine"
+amplitude = 0.39
+period_secs = 300
+step_secs = 5
+
+[[miners]]
+name = "m020"
+hashrate = 8.786e+12
+
+[[miners]]
+name = "m021"
+hashrate = 3.934e+12
+
+[[miners]]
+name = "m022"
+hashrate = 6.528e+12
+
+[[miners]]
+name = "m023"
+hashrate = 5.729e+12
+
+[[miners]]
+name = "m024"
+hashrate = 3.060e+12
+
+[[miners]]
+name = "m025"
+hashrate = 5.777e+12
+
+[[miners]]
+name = "m026"
+hashrate = 6.525e+12
+
+[[miners]]
+name = "m027"
+hashrate = 8.983e+12
+
+[[miners]]
+name = "m028"
+hashrate = 9.511e+12
+
+[[miners]]
+name = "m029"
+hashrate = 8.940e+12
+[miners.drift]
+mode = "sine"
+amplitude = 0.19
+period_secs = 180
+step_secs = 5
+
+[[miners]]
+name = "m030"
+hashrate = 6.415e+12
+
+[[miners]]
+name = "m031"
+hashrate = 6.513e+12
+
+[[miners]]
+name = "m032"
+hashrate = 9.614e+12
+
+[[miners]]
+name = "m033"
+hashrate = 8.023e+12
+
+[[miners]]
+name = "m034"
+hashrate = 3.297e+12
+
+[[miners]]
+name = "m035"
+hashrate = 7.460e+12
+
+[[miners]]
+name = "m036"
+hashrate = 9.312e+12
+
+[[miners]]
+name = "m037"
+hashrate = 5.037e+12
+[[miners.events]]
+at = 194
+action = "disconnect"
+[[miners.events]]
+at = 449
+action = "reconnect"
+
+[[miners]]
+name = "m038"
+hashrate = 9.906e+12
+
+[[miners]]
+name = "m039"
+hashrate = 3.736e+12
+
+[[miners]]
+name = "m040"
+hashrate = 9.365e+12
+
+[[miners]]
+name = "m041"
+hashrate = 5.956e+12
+
+[[miners]]
+name = "m042"
+hashrate = 3.279e+12
+
+[[miners]]
+name = "m043"
+hashrate = 9.349e+12
+
+[[miners]]
+name = "m044"
+hashrate = 9.214e+12
+
+[[miners]]
+name = "m045"
+hashrate = 7.238e+12
+
+[[miners]]
+name = "m046"
+hashrate = 4.875e+13
+
+[[miners]]
+name = "m047"
+hashrate = 4.881e+13
+
+[[miners]]
+name = "m048"
+hashrate = 4.162e+13
+
+[[miners]]
+name = "m049"
+hashrate = 4.140e+13
+[miners.drift]
+mode = "sine"
+amplitude = 0.19
+period_secs = 180
+step_secs = 5
+
+[[miners]]
+name = "m050"
+hashrate = 1.625e+13
+
+[[miners]]
+name = "m051"
+hashrate = 1.664e+13
+
+[[miners]]
+name = "m052"
+hashrate = 3.802e+13
+
+[[miners]]
+name = "m053"
+hashrate = 1.696e+13
+
+[[miners]]
+name = "m054"
+hashrate = 1.929e+13
+
+[[miners]]
+name = "m055"
+hashrate = 1.544e+13
+[miners.drift]
+mode = "sine"
+amplitude = 0.31
+period_secs = 300
+step_secs = 5
+
+[[miners]]
+name = "m056"
+hashrate = 3.921e+13
+[[miners.events]]
+at = 236
+action = "disconnect"
+[[miners.events]]
+at = 370
+action = "reconnect"
+
+[[miners]]
+name = "m057"
+hashrate = 3.785e+13
+[miners.drift]
+mode = "random_walk"
+amplitude = 0.22
+step_secs = 5
+
+[[miners]]
+name = "m058"
+hashrate = 1.507e+13
+
+[[miners]]
+name = "m059"
+hashrate = 1.660e+13
+
+[[miners]]
+name = "m060"
+hashrate = 3.766e+13
+[miners.drift]
+mode = "sine"
+amplitude = 0.16
+period_secs = 300
+step_secs = 5
+
+[[miners]]
+name = "m061"
+hashrate = 1.245e+13
+
+[[miners]]
+name = "m062"
+hashrate = 3.918e+13
+[miners.drift]
+mode = "random_walk"
+amplitude = 0.30
+step_secs = 5
+
+[[miners]]
+name = "m063"
+hashrate = 4.858e+13
+
+[[miners]]
+name = "m064"
+hashrate = 1.666e+13
+[miners.drift]
+mode = "sine"
+amplitude = 0.39
+period_secs = 180
+step_secs = 5
+
+[[miners]]
+name = "m065"
+hashrate = 4.181e+13
+
+[[miners]]
+name = "m066"
+hashrate = 2.246e+13
+
+[[miners]]
+name = "m067"
+hashrate = 4.710e+13
+
+[[miners]]
+name = "m068"
+hashrate = 4.885e+13
+
+[[miners]]
+name = "m069"
+hashrate = 3.555e+13
+
+[[miners]]
+name = "m070"
+hashrate = 2.806e+13
+
+[[miners]]
+name = "m071"
+hashrate = 1.153e+13
+
+[[miners]]
+name = "m072"
+hashrate = 2.911e+13
+[miners.drift]
+mode = "sine"
+amplitude = 0.16
+period_secs = 180
+step_secs = 5
+
+[[miners]]
+name = "m073"
+hashrate = 2.631e+13
+
+[[miners]]
+name = "m074"
+hashrate = 1.892e+13
+
+[[miners]]
+name = "m075"
+hashrate = 1.578e+13
+
+[[miners]]
+name = "m076"
+hashrate = 1.184e+14
+
+[[miners]]
+name = "m077"
+hashrate = 9.759e+13
+
+[[miners]]
+name = "m078"
+hashrate = 1.160e+14
+
+[[miners]]
+name = "m079"
+hashrate = 8.453e+13
+
+[[miners]]
+name = "m080"
+hashrate = 1.204e+14
+
+[[miners]]
+name = "m081"
+hashrate = 1.106e+14
+
+[[miners]]
+name = "m082"
+hashrate = 1.254e+14
+[miners.drift]
+mode = "random_walk"
+amplitude = 0.18
+step_secs = 5
+
+[[miners]]
+name = "m083"
+hashrate = 1.471e+14
+
+[[miners]]
+name = "m084"
+hashrate = 1.018e+14
+
+[[miners]]
+name = "m085"
+hashrate = 5.704e+13
+
+[[miners]]
+name = "m086"
+hashrate = 1.275e+14
+
+[[miners]]
+name = "m087"
+hashrate = 1.113e+14
+
+[[miners]]
+name = "m088"
+hashrate = 1.182e+14
+[[miners.events]]
+at = 297
+action = "disconnect"
+[[miners.events]]
+at = 596
+action = "reconnect"
+
+[[miners]]
+name = "m089"
+hashrate = 1.291e+14
+
+[[miners]]
+name = "m090"
+hashrate = 7.668e+13
+
+[[miners]]
+name = "m091"
+hashrate = 1.750e+14
+
+[[miners]]
+name = "m092"
+hashrate = 2.333e+14
+
+[[miners]]
+name = "m093"
+hashrate = 3.815e+14
+
+[[miners]]
+name = "m094"
+hashrate = 4.081e+14
+
+[[miners]]
+name = "m095"
+hashrate = 3.972e+14
+[miners.drift]
+mode = "random_walk"
+amplitude = 0.31
+step_secs = 5
+
+[[miners]]
+name = "m096"
+hashrate = 2.400e+14
+
+[[miners]]
+name = "m097"
+hashrate = 3.507e+14
+
+[[miners]]
+name = "m098"
+hashrate = 4.301e+14
+
+[[miners]]
+name = "m099"
+hashrate = 1.029e+15
+
+[[miners]]
+name = "m100"
+hashrate = 1.134e+15
+

@@ -101,6 +101,9 @@ async fn run_miner_inner(
     let mut state = MinerState {
         hashrate: config.hashrate,
         bad_share_fraction: config.bad_share_fraction.clamp(0.0, 1.0),
+        duplicate_share_fraction: config.duplicate_share_fraction.clamp(0.0, 1.0),
+        latency_ms: config.latency_ms,
+        latency_jitter_ms: config.latency_jitter_ms,
         channel_id: None,
         target_le: None,
         active_job: None,
@@ -156,6 +159,10 @@ async fn run_miner_inner(
                         info!("{name}: bad_share_fraction {} -> {}", state.bad_share_fraction, f);
                         state.bad_share_fraction = f.clamp(0.0, 1.0);
                     }
+                    Ok(MinerCommand::SetDuplicateShareFraction(f)) => {
+                        info!("{name}: duplicate_share_fraction {} -> {}", state.duplicate_share_fraction, f);
+                        state.duplicate_share_fraction = f.clamp(0.0, 1.0);
+                    }
                     Ok(MinerCommand::Disconnect) | Err(_) => {
                         return Ok("disconnect requested".to_string());
                     }
@@ -164,6 +171,14 @@ async fn run_miner_inner(
             _ = share_timer => {
                 if let Some(share) = state.build_share() {
                     let sequence = share.sequence_number;
+                    // Model delivery latency: sleep the (virtual) delay,
+                    // converted to wall time by the sim clock scale, before the
+                    // share reaches the pool. A laggy/batching link delays the
+                    // pool's observation of the share without changing the rate
+                    // the miner produces them.
+                    if let Some(delay) = state.delivery_delay() {
+                        tokio::time::sleep(delay).await;
+                    }
                     send_mining(&sender, Mining::SubmitSharesStandard(share)).await?;
                     emit(MinerEvent::ShareSubmitted { sequence }).await;
                 }
@@ -178,6 +193,11 @@ struct MinerState {
     /// Fraction of shares stamped invalid (BAD_SHARE_JOB_ID) for the pool to
     /// reject. Models stale/faulty hardware output.
     bad_share_fraction: f64,
+    /// Fraction of shares stamped as duplicates (DUPLICATE_SHARE_JOB_ID).
+    duplicate_share_fraction: f64,
+    /// One-way delivery latency (virtual ms) and its +/- jitter.
+    latency_ms: u64,
+    latency_jitter_ms: u64,
     channel_id: Option<u32>,
     target_le: Option<[u8; 32]>,
     /// (job_id, version) of the currently active job.
@@ -200,16 +220,43 @@ impl MinerState {
         sample_share_interval(self.hashrate, target).map(|dt| Instant::now() + dt)
     }
 
+    /// Wall-clock delay to apply before a share reaches the pool, from the
+    /// configured virtual latency +/- jitter (converted by the sim clock
+    /// scale). `None` when no latency is configured.
+    fn delivery_delay(&self) -> Option<std::time::Duration> {
+        if self.latency_ms == 0 && self.latency_jitter_ms == 0 {
+            return None;
+        }
+        let base = self.latency_ms as f64;
+        let jitter = if self.latency_jitter_ms > 0 {
+            let j = self.latency_jitter_ms as f64;
+            rand::thread_rng().gen_range(-j..=j)
+        } else {
+            0.0
+        };
+        let virtual_ms = (base + jitter).max(0.0);
+        // virtual ms -> wall ms via the clock scale (scale 8 => 1 wall ms per
+        // 8 virtual ms), matching how share intervals are converted.
+        let wall_secs = (virtual_ms / 1000.0) / super::clock_speed();
+        Some(std::time::Duration::from_secs_f64(wall_secs))
+    }
+
     fn build_share(&mut self) -> Option<SubmitSharesStandard> {
         let channel_id = self.channel_id?;
         let (job_id, version) = self.active_job?;
         self.sequence += 1;
-        // A configured fraction of shares are marked invalid with the sentinel
-        // job id so the pool rejects them (modeling stale/faulty submissions).
+        // A share is (at most) one of: invalid, duplicate, or good. Invalid
+        // takes precedence, then duplicate; each is marked with its sentinel
+        // job id so the pool rejects it under the validation bypass.
+        let mut rng = rand::thread_rng();
         let job_id = if self.bad_share_fraction > 0.0
-            && rand::thread_rng().gen::<f64>() < self.bad_share_fraction
+            && rng.gen::<f64>() < self.bad_share_fraction
         {
             super::BAD_SHARE_JOB_ID
+        } else if self.duplicate_share_fraction > 0.0
+            && rng.gen::<f64>() < self.duplicate_share_fraction
+        {
+            super::DUPLICATE_SHARE_JOB_ID
         } else {
             job_id
         };

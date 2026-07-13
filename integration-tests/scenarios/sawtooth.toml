@@ -1,0 +1,96 @@
+# Sawtooth / hard oscillation — the controller-instability trap.
+#
+# Failure mode: miners that SNAP between two hashrates on a sharp, regular cycle
+# (abrupt set_hashrate toggles), unlike the smooth sine/random_walk drift of
+# noisy-fleet or churn-and-drift. A square wave whose period is near the
+# controller's response window can beat against it and induce sustained SetTarget
+# churn — the controller chases each edge and never settles between them.
+#
+# Two periods bracket the likely response window (fast ~60s, slow ~180s) plus a
+# staircase that ratchets one way then resets. Unlike duty-cycled (which gates to
+# a near-silent trickle), both levels here are fully productive, so the channel
+# never goes idle — the controller must actively choose not to chase.
+#
+# Watch: target_updates on the oscillators (churn) vs the steady control. A good
+# controller rides the average; a twitchy one fires on every edge.
+name = "sawtooth"
+duration_secs = 900
+
+# Fast square wave: 2x <-> 0.5x every ~60s (near the response window).
+[[miners]]
+name = "fast-square"
+hashrate = 200e12
+[[miners.events]]
+at = 60
+action = "set_hashrate"
+hashrate = 50e12
+[[miners.events]]
+at = 120
+action = "set_hashrate"
+hashrate = 200e12
+[[miners.events]]
+at = 180
+action = "set_hashrate"
+hashrate = 50e12
+[[miners.events]]
+at = 240
+action = "set_hashrate"
+hashrate = 200e12
+[[miners.events]]
+at = 300
+action = "set_hashrate"
+hashrate = 50e12
+[[miners.events]]
+at = 360
+action = "set_hashrate"
+hashrate = 200e12
+[[miners.events]]
+at = 420
+action = "set_hashrate"
+hashrate = 50e12
+[[miners.events]]
+at = 480
+action = "set_hashrate"
+hashrate = 200e12
+[[miners.events]]
+at = 540
+action = "set_hashrate"
+hashrate = 50e12
+[[miners.events]]
+at = 600
+action = "set_hashrate"
+hashrate = 200e12
+[[miners.events]]
+at = 660
+action = "set_hashrate"
+hashrate = 50e12
+[[miners.events]]
+at = 720
+action = "set_hashrate"
+hashrate = 200e12
+
+# Slow square wave: 3x <-> 1x every ~180s.
+[[miners]]
+name = "slow-square"
+hashrate = 300e12
+[[miners.events]]
+at = 180
+action = "set_hashrate"
+hashrate = 100e12
+[[miners.events]]
+at = 360
+action = "set_hashrate"
+hashrate = 300e12
+[[miners.events]]
+at = 540
+action = "set_hashrate"
+hashrate = 100e12
+[[miners.events]]
+at = 720
+action = "set_hashrate"
+hashrate = 300e12
+
+# Steady control: any target churn here is noise, not signal.
+[[miners]]
+name = "steady"
+hashrate = 100e12

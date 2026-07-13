@@ -1,0 +1,39 @@
+# Duplicate / replayed shares — resubmitting clients and replay noise.
+#
+# Failure mode (needs the harness's duplicate_share_fraction): a miner resends
+# shares it already submitted — a jammed client retrying, a proxy replaying
+# work, or a buggy autotuner. Distinct from bad-shares (invalid work): these
+# would be VALID except they're duplicates. The pool must reject them as
+# duplicates and, like invalids, NOT count them toward vardiff — difficulty
+# should match a clean miner of the same true hashrate.
+#
+# Watch: rejected column climbs (duplicate-share), accepted tracks the valid
+# rate, difficulty converges to the clean control's.
+name = "duplicate-shares"
+duration_secs = 900
+
+# Steadily resubmitting: ~40% of shares are replays.
+[[miners]]
+name = "resubmitter"
+hashrate = 150e12
+duplicate_share_fraction = 0.4
+
+# Proxy replay storm: 70% duplicates.
+[[miners]]
+name = "replay-proxy"
+hashrate = 150e12
+duplicate_share_fraction = 0.7
+
+# Starts clean, jams into a replay loop mid-run.
+[[miners]]
+name = "jams-mid-run"
+hashrate = 150e12
+[[miners.events]]
+at = 300
+action = "set_duplicate_share_fraction"
+fraction = 0.6
+
+# Clean control at equal hashrate: the target the others should converge to.
+[[miners]]
+name = "clean"
+hashrate = 150e12

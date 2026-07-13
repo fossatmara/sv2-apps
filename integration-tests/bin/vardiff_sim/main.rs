@@ -561,6 +561,14 @@ pub(crate) fn apply_action(engine: &mut SimEngine, action: DueAction) {
             EventAction::SetBadShareFraction { fraction } => {
                 engine.set_bad_share_fraction(&miner, fraction)
             }
+            EventAction::SetDuplicateShareFraction { fraction } => {
+                engine.set_duplicate_share_fraction(&miner, fraction)
+            }
+            // The setpoint is a process-global override, not per-miner, so
+            // `miner` is intentionally ignored here.
+            EventAction::SetSpm { spm } => {
+                integration_tests_sv2::vardiff_sim::set_setpoint_spm(spm)
+            }
         },
     }
 }
@@ -572,6 +580,9 @@ pub(crate) fn start_scenario_miner(engine: &mut SimEngine, m: &ScenarioMiner) {
             hashrate: m.hashrate,
             reported_hashrate: m.reported_hashrate,
             bad_share_fraction: m.bad_share_fraction,
+            duplicate_share_fraction: m.duplicate_share_fraction,
+            latency_ms: m.latency_ms,
+            latency_jitter_ms: m.latency_jitter_ms,
         },
         m.drift.clone(),
     );

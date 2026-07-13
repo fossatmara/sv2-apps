@@ -62,6 +62,20 @@ pub struct ScenarioMiner {
     /// the *valid* share rate and not be fooled by the rejected volume.
     #[serde(default)]
     pub bad_share_fraction: f64,
+    /// Fraction of submitted shares that are duplicates/replays of the prior
+    /// share (0.0..=1.0). Marked so the pool rejects them as duplicates; like
+    /// bad shares they must not feed vardiff.
+    #[serde(default)]
+    pub duplicate_share_fraction: f64,
+    /// One-way network latency (ms of virtual time) added before each share
+    /// reaches the pool. Models a laggy/batching proxy; a naive estimator that
+    /// keys off inter-arrival timing can be fooled by the jitter.
+    #[serde(default)]
+    pub latency_ms: u64,
+    /// Latency jitter (ms): each share's delay is `latency_ms +/- jitter_ms`,
+    /// uniform. Bursty delivery when large relative to the share interval.
+    #[serde(default)]
+    pub latency_jitter_ms: u64,
     #[serde(default)]
     pub drift: Option<Drift>,
     #[serde(default)]
@@ -112,6 +126,11 @@ pub enum EventAction {
     Reconnect,
     /// Change the fraction of invalid/stale shares mid-run (0.0..=1.0).
     SetBadShareFraction { fraction: f64 },
+    /// Change the fraction of duplicate/replayed shares mid-run (0.0..=1.0).
+    SetDuplicateShareFraction { fraction: f64 },
+    /// Change the pool's vardiff setpoint (shares/minute) mid-run — a global
+    /// policy change under a running fleet, not per-miner.
+    SetSpm { spm: f64 },
 }
 
 impl Scenario {

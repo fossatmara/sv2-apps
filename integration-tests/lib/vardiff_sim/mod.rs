@@ -25,6 +25,11 @@ use std::time::Duration;
 /// can never collide with it.
 pub const BAD_SHARE_JOB_ID: u32 = u32::MAX;
 
+/// Sentinel `job_id` a simulated miner stamps on a duplicate/replayed share so
+/// the pool can reject it as a duplicate under the validation bypass. One less
+/// than [`BAD_SHARE_JOB_ID`], and likewise never issued by the pool.
+pub const DUPLICATE_SHARE_JOB_ID: u32 = u32::MAX - 1;
+
 /// Commands the engine sends to a running miner task.
 #[derive(Debug, Clone)]
 pub enum MinerCommand {
@@ -36,6 +41,8 @@ pub enum MinerCommand {
     Resample,
     /// Change the fraction of submitted shares that are invalid/stale.
     SetBadShareFraction(f64),
+    /// Change the fraction of submitted shares that are duplicates/replays.
+    SetDuplicateShareFraction(f64),
     /// Close the connection and end the miner task.
     Disconnect,
 }
@@ -183,6 +190,13 @@ pub struct MinerConfig {
     /// Fraction of submitted shares that are invalid/stale (0.0..=1.0). Bad
     /// shares are marked with [`BAD_SHARE_JOB_ID`] so the pool rejects them.
     pub bad_share_fraction: f64,
+    /// Fraction of submitted shares that are duplicates/replays (0.0..=1.0),
+    /// marked with [`DUPLICATE_SHARE_JOB_ID`] so the pool rejects them.
+    pub duplicate_share_fraction: f64,
+    /// One-way share-delivery latency in ms of virtual time (0 = instant).
+    pub latency_ms: u64,
+    /// Uniform +/- jitter (ms) on the delivery latency.
+    pub latency_jitter_ms: u64,
 }
 
 impl MinerConfig {
