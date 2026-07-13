@@ -387,7 +387,7 @@ async fn main() {
                 .map(|i| MinerConfig {
                     name: format!("sim-{i}"),
                     hashrate: args.hashrate,
-                    reported_hashrate: None,
+                    ..Default::default()
                 })
                 .collect()
         } else {
@@ -426,7 +426,7 @@ async fn main() {
                 MinerConfig {
                     name: format!("sim-{i}"),
                     hashrate: args.hashrate,
-                    reported_hashrate: None,
+                    ..Default::default()
                 },
                 None,
             );
@@ -558,6 +558,9 @@ pub(crate) fn apply_action(engine: &mut SimEngine, action: DueAction) {
             EventAction::SetHashrate { hashrate } => engine.set_hashrate(&miner, hashrate),
             EventAction::Disconnect => engine.disconnect(&miner),
             EventAction::Reconnect => engine.reconnect(&miner),
+            EventAction::SetBadShareFraction { fraction } => {
+                engine.set_bad_share_fraction(&miner, fraction)
+            }
         },
     }
 }
@@ -568,6 +571,7 @@ pub(crate) fn start_scenario_miner(engine: &mut SimEngine, m: &ScenarioMiner) {
             name: m.name.clone(),
             hashrate: m.hashrate,
             reported_hashrate: m.reported_hashrate,
+            bad_share_fraction: m.bad_share_fraction,
         },
         m.drift.clone(),
     );

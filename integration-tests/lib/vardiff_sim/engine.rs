@@ -359,6 +359,17 @@ impl SimEngine {
         }
     }
 
+    /// Sets the fraction of invalid/stale shares the miner submits.
+    pub fn set_bad_share_fraction(&mut self, name: &str, fraction: f64) {
+        if let Some(slot) = self.miners.get_mut(name) {
+            slot.config.bad_share_fraction = fraction.clamp(0.0, 1.0);
+            let _ = slot
+                .commands
+                .try_send(MinerCommand::SetBadShareFraction(fraction));
+            self.changed.notify_waiters();
+        }
+    }
+
     /// Multiplies the miner's base hashrate (used by TUI +/- keys).
     pub fn scale_hashrate(&mut self, name: &str, factor: f64) {
         let current = self.miners.get(name).map(|s| s.config.hashrate);

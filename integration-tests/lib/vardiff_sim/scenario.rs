@@ -57,6 +57,11 @@ pub struct ScenarioMiner {
     /// Seconds after scenario start at which this miner connects.
     #[serde(default)]
     pub start_at: u64,
+    /// Fraction of submitted shares that are invalid/stale (0.0..=1.0). The
+    /// miner marks these so the pool rejects them; a sound vardiff must track
+    /// the *valid* share rate and not be fooled by the rejected volume.
+    #[serde(default)]
+    pub bad_share_fraction: f64,
     #[serde(default)]
     pub drift: Option<Drift>,
     #[serde(default)]
@@ -105,6 +110,8 @@ pub enum EventAction {
     SetHashrate { hashrate: f64 },
     Disconnect,
     Reconnect,
+    /// Change the fraction of invalid/stale shares mid-run (0.0..=1.0).
+    SetBadShareFraction { fraction: f64 },
 }
 
 impl Scenario {

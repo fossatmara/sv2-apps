@@ -632,6 +632,13 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
 
         let channel_id = msg.channel_id;
         let vardiff_key = (downstream_id, channel_id).into();
+        // Simulation-only: a miner marks an invalid/stale share with the
+        // sentinel job id u32::MAX (the pool never issues that). Under the
+        // validation bypass we still reject it, and — crucially — it must NOT
+        // feed the vardiff controller, so vardiff tracks the *valid* rate. In
+        // production (ignore_share_validation = false) real validation catches
+        // a bad job id on its own, so this shortcut is bypass-only.
+        let is_bad_sim_share = ignore_share_validation && msg.job_id == u32::MAX;
         let messages = self.with_registered_downstream(downstream_id, |downstream| {
                 let messages = if !downstream.standard_channels.contains_key(&channel_id) {
                     let error = SubmitSharesError {
@@ -660,6 +667,24 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                             .with_mut(&channel_id, |standard_channel| {
                                 let mut messages: Vec<RouteMessageTo> = Vec::new();
                                 if ignore_share_validation {
+                                    // Reject a simulated invalid/stale share
+                                    // (sentinel job id) without counting it.
+                                    if is_bad_sim_share {
+                                        let error = SubmitSharesError {
+                                            channel_id,
+                                            sequence_number: msg.sequence_number,
+                                            error_code:
+                                                ERROR_CODE_SUBMIT_SHARES_INVALID_JOB_ID
+                                                    .to_string()
+                                                    .try_into()
+                                                    .expect("error code must be valid string"),
+                                        };
+                                        messages.push(
+                                            (downstream_id, Mining::SubmitSharesError(error))
+                                                .into(),
+                                        );
+                                        return Ok(messages);
+                                    }
                                     let share_work =
                                         standard_channel.get_target().difficulty_float();
                                     let success = SubmitSharesSuccess {
@@ -845,22 +870,26 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                             // order (vardiff, then channel) matches
                             // run_vardiff.
                             let mut vardiff_messages: Vec<RouteMessageTo> = Vec::new();
-                            self.vardiff.with_mut(&vardiff_key, |vardiff| {
-                                vardiff.increment_shares_since_last_update();
-                                downstream.standard_channels.with_mut(
-                                    &channel_id,
-                                    |standard_channel| {
-                                        Self::run_vardiff_on_standard_channel(
-                                            downstream_id,
-                                            channel_id,
-                                            standard_channel,
-                                            vardiff,
-                                            &self.vardiff_factory,
-                                            &mut vardiff_messages,
-                                        );
-                                    },
-                                );
-                            });
+                            // A rejected (invalid/stale) share is not evidence
+                            // of hashrate, so it must not advance vardiff.
+                            if !is_bad_sim_share {
+                                self.vardiff.with_mut(&vardiff_key, |vardiff| {
+                                    vardiff.increment_shares_since_last_update();
+                                    downstream.standard_channels.with_mut(
+                                        &channel_id,
+                                        |standard_channel| {
+                                            Self::run_vardiff_on_standard_channel(
+                                                downstream_id,
+                                                channel_id,
+                                                standard_channel,
+                                                vardiff,
+                                                &self.vardiff_factory,
+                                                &mut vardiff_messages,
+                                            );
+                                        },
+                                    );
+                                });
+                            }
                             let mut messages = validation?;
                             messages.extend(vardiff_messages);
                             messages

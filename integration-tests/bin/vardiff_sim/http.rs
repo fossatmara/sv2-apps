@@ -387,7 +387,7 @@ async fn add_miner(State(st): State<HttpState>, Json(body): Json<AddBody>) -> St
         MinerConfig {
             name,
             hashrate: body.hashrate.unwrap_or(100e12),
-            reported_hashrate: None,
+            ..Default::default()
         },
         None,
     );

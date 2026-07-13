@@ -100,6 +100,7 @@ async fn run_miner_inner(
 
     let mut state = MinerState {
         hashrate: config.hashrate,
+        bad_share_fraction: config.bad_share_fraction.clamp(0.0, 1.0),
         channel_id: None,
         target_le: None,
         active_job: None,
@@ -151,6 +152,10 @@ async fn run_miner_inner(
                     Ok(MinerCommand::Resample) => {
                         next_share_at = state.resample_share_timer();
                     }
+                    Ok(MinerCommand::SetBadShareFraction(f)) => {
+                        info!("{name}: bad_share_fraction {} -> {}", state.bad_share_fraction, f);
+                        state.bad_share_fraction = f.clamp(0.0, 1.0);
+                    }
                     Ok(MinerCommand::Disconnect) | Err(_) => {
                         return Ok("disconnect requested".to_string());
                     }
@@ -170,6 +175,9 @@ async fn run_miner_inner(
 
 struct MinerState {
     hashrate: f64,
+    /// Fraction of shares stamped invalid (BAD_SHARE_JOB_ID) for the pool to
+    /// reject. Models stale/faulty hardware output.
+    bad_share_fraction: f64,
     channel_id: Option<u32>,
     target_le: Option<[u8; 32]>,
     /// (job_id, version) of the currently active job.
@@ -196,6 +204,15 @@ impl MinerState {
         let channel_id = self.channel_id?;
         let (job_id, version) = self.active_job?;
         self.sequence += 1;
+        // A configured fraction of shares are marked invalid with the sentinel
+        // job id so the pool rejects them (modeling stale/faulty submissions).
+        let job_id = if self.bad_share_fraction > 0.0
+            && rand::thread_rng().gen::<f64>() < self.bad_share_fraction
+        {
+            super::BAD_SHARE_JOB_ID
+        } else {
+            job_id
+        };
         Some(SubmitSharesStandard {
             channel_id,
             sequence_number: self.sequence,

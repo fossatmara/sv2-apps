@@ -1,0 +1,42 @@
+# Invalid / stale share submission — faulty and misbehaving hardware.
+#
+# Failure mode (only expressible since the harness gained bad_share_fraction):
+# miners submit a fraction of shares the pool REJECTS. A rejected share is not
+# evidence of hashrate, so a correct vardiff must track the VALID share rate and
+# ignore the rejected volume — its difficulty should match a clean miner of the
+# same true hashrate. A naive controller keying off total submissions (accepted
+# + rejected) would over-tighten these channels.
+#
+# Watch: does `difficulty` on the faulty miners converge to the same level as
+# the clean control at equal hashrate? The `rejected` CSV column should climb on
+# the faulty units while `accepted` tracks the valid rate. `submitted` =
+# accepted + rejected.
+name = "bad-shares"
+duration_secs = 900
+
+# Steadily faulty: ~30% of shares stale (bad firmware / marginal chips).
+[[miners]]
+name = "faulty-30pct"
+hashrate = 150e12
+bad_share_fraction = 0.3
+
+# Severely faulty: half its shares are junk.
+[[miners]]
+name = "faulty-50pct"
+hashrate = 150e12
+bad_share_fraction = 0.5
+
+# Goes bad mid-run: healthy until t=300, then a fault develops (60% stale).
+# The controller must NOT chase the sudden burst of rejected volume.
+[[miners]]
+name = "degrades-to-faulty"
+hashrate = 150e12
+[[miners.events]]
+at = 300
+action = "set_bad_share_fraction"
+fraction = 0.6
+
+# Clean control at the same true hashrate: faulty miners should converge here.
+[[miners]]
+name = "clean"
+hashrate = 150e12

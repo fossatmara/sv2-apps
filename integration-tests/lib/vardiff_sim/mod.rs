@@ -19,6 +19,12 @@ pub mod scenario;
 
 use std::time::Duration;
 
+/// Sentinel `job_id` a simulated miner stamps on an invalid/stale share so
+/// the pool (running with `ignore_share_validation`) can reject it without
+/// real proof-of-work. The pool never issues this job id, so a genuine share
+/// can never collide with it.
+pub const BAD_SHARE_JOB_ID: u32 = u32::MAX;
+
 /// Commands the engine sends to a running miner task.
 #[derive(Debug, Clone)]
 pub enum MinerCommand {
@@ -28,6 +34,8 @@ pub enum MinerCommand {
     /// Re-sample the share timer (e.g. after the sim clock speed changed, so
     /// a deadline scheduled at the old speed doesn't linger).
     Resample,
+    /// Change the fraction of submitted shares that are invalid/stale.
+    SetBadShareFraction(f64),
     /// Close the connection and end the miner task.
     Disconnect,
 }
@@ -163,7 +171,7 @@ pub enum MinerEvent {
 }
 
 /// Static configuration for one simulated miner.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct MinerConfig {
     pub name: String,
     /// Simulated hashrate (H/s) used for the Poisson share model.
@@ -172,6 +180,9 @@ pub struct MinerConfig {
     /// to `hashrate`; set it differently to test vardiff convergence from a
     /// wrong initial estimate.
     pub reported_hashrate: Option<f64>,
+    /// Fraction of submitted shares that are invalid/stale (0.0..=1.0). Bad
+    /// shares are marked with [`BAD_SHARE_JOB_ID`] so the pool rejects them.
+    pub bad_share_fraction: f64,
 }
 
 impl MinerConfig {

@@ -1,0 +1,41 @@
+# Invalid-share flood — a broken or hostile miner spraying rejects.
+#
+# Failure mode: a miner whose VALID hashrate is small but which submits a huge
+# volume of shares, almost all invalid (stale/malformed) — a jammed autotuner
+# resubmitting, a misconfigured proxy replaying work, or a crude difficulty-
+# inflation attempt. The true (accepted) rate is what the difficulty should
+# reflect; the reject flood must not pull it anywhere.
+#
+# This isolates the accepted-vs-submitted distinction hard: `submitted` is
+# enormous, `accepted` is tiny, and correct difficulty follows `accepted`. The
+# flooder is set to a very high raw hashrate so its RAW submission rate is huge,
+# but 95% of those are rejected, leaving a modest valid rate.
+name = "share-flood"
+duration_secs = 720
+
+# High submission rate, 95% junk -> modest valid rate. Difficulty should settle
+# for the ~5% that are valid, not for the raw flood.
+[[miners]]
+name = "flooder"
+hashrate = 600e12
+bad_share_fraction = 0.95
+
+# Intermittent flood: clean, then a 90% burst t=180-420, then clean again.
+# Two events bracket the burst so we see difficulty stay put through it and not
+# get stranded after it clears.
+[[miners]]
+name = "bursty-flooder"
+hashrate = 300e12
+[[miners.events]]
+at = 180
+action = "set_bad_share_fraction"
+fraction = 0.9
+[[miners.events]]
+at = 420
+action = "set_bad_share_fraction"
+fraction = 0.0
+
+# Clean control.
+[[miners]]
+name = "clean"
+hashrate = 100e12

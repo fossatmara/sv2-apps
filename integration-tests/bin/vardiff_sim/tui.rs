@@ -223,7 +223,7 @@ pub async fn run(
                             MinerConfig {
                                 name: format!("added-{added}"),
                                 hashrate: 100e12,
-                                reported_hashrate: None,
+                                ..Default::default()
                             },
                             None,
                         );
