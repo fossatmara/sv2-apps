@@ -81,6 +81,8 @@ pub enum VardiffAlgorithm {
     /// PID with Q-learning gain scheduling (shared table per pool).
     #[serde(rename = "qpid")]
     QPid,
+    /// Decline-safe adaptive EWMA algorithm (stratum-mining/stratum#2188).
+    Champion,
 }
 
 /// Vardiff algorithm configuration (`[vardiff]` section).

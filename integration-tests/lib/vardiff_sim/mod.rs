@@ -103,18 +103,20 @@ pub fn algorithm() -> &'static str {
     match tuning::algorithm_override() {
         Some(VardiffKind::Classic) => "classic",
         Some(VardiffKind::Pid) => "pid",
+        Some(VardiffKind::Champion) => "champion",
         Some(VardiffKind::QPid) | None => "qpid",
     }
 }
 
-/// Sets the live vardiff algorithm ("classic" | "pid" | "qpid"); existing
-/// channels rebuild their controllers on the next evaluation.
+/// Sets the live vardiff algorithm ("classic" | "pid" | "qpid" | "champion");
+/// existing channels rebuild their controllers on the next evaluation.
 pub fn set_algorithm(name: &str) -> bool {
     use stratum_apps::stratum_core::channels_sv2::vardiff::{tuning, VardiffKind};
     let kind = match name {
         "classic" => VardiffKind::Classic,
         "pid" => VardiffKind::Pid,
         "qpid" => VardiffKind::QPid,
+        "champion" => VardiffKind::Champion,
         _ => return false,
     };
     tuning::set_algorithm(kind);

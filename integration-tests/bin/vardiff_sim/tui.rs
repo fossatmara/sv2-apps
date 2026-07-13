@@ -136,6 +136,7 @@ pub async fn run(
                         let next = match eng.algorithm() {
                             "classic" => "pid",
                             "pid" => "qpid",
+                            "qpid" => "champion",
                             _ => "classic",
                         };
                         eng.set_algorithm(next);

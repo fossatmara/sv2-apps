@@ -41,6 +41,7 @@
     <button id="algo-classic" onclick="setAlgo('classic')">classic</button>
     <button id="algo-pid" onclick="setAlgo('pid')">pid</button>
     <button id="algo-qpid" onclick="setAlgo('qpid')">qpid</button>
+    <button id="algo-champion" onclick="setAlgo('champion')">champion</button>
   </span>
   <span style="width:1rem"></span>
   speed: <b id="speed">1</b>x
@@ -214,10 +215,10 @@ function render(data) {
   sb.style.display = data.speed_control ? 'flex' : 'none';
   document.getElementById('speed').textContent = data.speed.toFixed(2);
   document.getElementById('spm').textContent = data.setpoint_spm.toFixed(1);
-  for (const a of ['classic', 'pid', 'qpid'])
+  for (const a of ['classic', 'pid', 'qpid', 'champion'])
     document.getElementById('algo-' + a).classList.toggle('on', data.algorithm === a);
   // qpid tunes the statistical gates; plain pid tunes the gains by hand;
-  // classic has neither.
+  // classic and champion have neither (champion self-tunes, decline-safety-fixed).
   document.getElementById('knobs-stat').style.display = data.algorithm === 'qpid' ? '' : 'none';
   document.getElementById('knobs-pid').style.display = data.algorithm === 'pid' ? '' : 'none';
   const [mkp, mki, mkd] = data.manual_gains;

@@ -151,6 +151,7 @@ impl VardiffFactory {
             crate::config::VardiffAlgorithm::Classic => VardiffKind::Classic,
             crate::config::VardiffAlgorithm::Pid => VardiffKind::Pid,
             crate::config::VardiffAlgorithm::QPid => VardiffKind::QPid,
+            crate::config::VardiffAlgorithm::Champion => VardiffKind::Champion,
         })
     }
 
@@ -162,8 +163,8 @@ impl VardiffFactory {
         stratum_apps::stratum_core::channels_sv2::vardiff::error::VardiffError,
     > {
         use stratum_apps::stratum_core::channels_sv2::{
-            vardiff::VardiffKind, PidParams, PidVardiffState, QPidParams, QPidVardiffState,
-            VardiffState,
+            vardiff::VardiffKind, ChampionVardiffState, PidParams, PidVardiffState, QPidParams,
+            QPidVardiffState, VardiffState,
         };
         let pid_params = PidParams {
             kp: self.config.kp,
@@ -197,6 +198,9 @@ impl VardiffFactory {
                 state.set_telemetry_key(user_identity.to_string());
                 Ok(Box::new(state))
             }
+            // The champion carries no configurable gains and self-regulates its
+            // own 60s tick; the min-hashrate floor is its only knob here.
+            VardiffKind::Champion => Ok(Box::new(ChampionVardiffState::new()?)),
         }
     }
 }

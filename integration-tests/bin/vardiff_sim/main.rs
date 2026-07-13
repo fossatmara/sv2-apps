@@ -57,10 +57,11 @@ struct Args {
     #[arg(long, default_value_t = 10)]
     vardiff_interval: u64,
 
-    /// Vardiff algorithm for the spawned pool: "classic", "pid" or "qpid".
-    /// Defaults to qpid (PID with Q-learning gain scheduling): reacts
-    /// share-driven within seconds, while classic's time-threshold ladder is
-    /// minute-scale by design.
+    /// Vardiff algorithm for the spawned pool: "classic", "pid", "qpid" or
+    /// "champion". Defaults to qpid (PID with Q-learning gain scheduling):
+    /// reacts share-driven within seconds, while classic's time-threshold
+    /// ladder is minute-scale by design. "champion" is the decline-safe
+    /// adaptive EWMA from stratum#2188 (fixed 60s tick, decline-safety-tuned).
     #[arg(long, default_value = "qpid")]
     algorithm: String,
 
@@ -274,8 +275,11 @@ async fn main() {
             "classic" => pool_sv2::config::VardiffAlgorithm::Classic,
             "pid" => pool_sv2::config::VardiffAlgorithm::Pid,
             "qpid" => pool_sv2::config::VardiffAlgorithm::QPid,
+            "champion" => pool_sv2::config::VardiffAlgorithm::Champion,
             other => {
-                eprintln!("error: unknown --algorithm '{other}' (use classic, pid or qpid)");
+                eprintln!(
+                    "error: unknown --algorithm '{other}' (use classic, pid, qpid or champion)"
+                );
                 std::process::exit(1);
             }
         };
