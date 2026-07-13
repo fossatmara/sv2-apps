@@ -130,6 +130,10 @@ struct StatsSnapshot {
     significance_z: f64,
     significance_z_down: f64,
     window_secs: f64,
+    /// Loaded scenario name (empty string = free-running default fleet).
+    scenario: String,
+    /// Scenario event points (elapsed secs, miner, label) for plotting markers.
+    scenario_events: Vec<(f64, String, String)>,
     miners: Vec<MinerSnapshot>,
 }
 
@@ -226,6 +230,12 @@ fn build_snapshot(st: &HttpState, full: bool) -> StatsSnapshot {
         significance_z: engine.significance_z(),
         significance_z_down: engine.significance_z_down(),
         window_secs: window,
+        scenario: engine.scenario_name().unwrap_or("").to_string(),
+        scenario_events: engine
+            .scenario_events()
+            .iter()
+            .map(|e| (e.at, e.miner.clone(), e.label.clone()))
+            .collect(),
         miners,
     }
 }
@@ -441,6 +451,39 @@ async fn set_algorithm(
     }
 }
 
+/// Lists the bundled scenario names (for the dashboard selector).
+async fn list_scenarios() -> Json<Vec<&'static str>> {
+    Json(integration_tests_sv2::vardiff_sim::scenario::catalog::names())
+}
+
+#[derive(Deserialize)]
+struct ScenarioBody {
+    /// Scenario name to load; empty / "none" returns to the free-running fleet.
+    name: String,
+}
+
+/// Loads a bundled scenario by name (or clears back to a free fleet). Resets
+/// the fleet and re-anchors virtual time so event offsets start now.
+async fn load_scenario(State(st): State<HttpState>, Json(body): Json<ScenarioBody>) -> StatusCode {
+    if !st.speed_control {
+        return StatusCode::FORBIDDEN;
+    }
+    if body.name.is_empty() || body.name == "none" {
+        st.engine.lock().expect("engine lock").clear_scenario();
+        return StatusCode::NO_CONTENT;
+    }
+    let Some(toml) = integration_tests_sv2::vardiff_sim::scenario::catalog::get(&body.name) else {
+        return StatusCode::NOT_FOUND;
+    };
+    match integration_tests_sv2::vardiff_sim::scenario::Scenario::parse(toml) {
+        Ok(scenario) => {
+            st.engine.lock().expect("engine lock").load_scenario(scenario);
+            StatusCode::NO_CONTENT
+        }
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
 async fn set_gains(State(st): State<HttpState>, Json(body): Json<GainsBody>) -> StatusCode {
     if !st.speed_control {
         return StatusCode::FORBIDDEN;
@@ -500,6 +543,8 @@ pub fn router(state: HttpState) -> Router {
         .route("/api/miners/:name/disconnect", post(disconnect))
         .route("/api/miners/:name/reconnect", post(reconnect))
         .route("/api/miners/:name/remove", post(remove))
+        .route("/api/scenarios", get(list_scenarios))
+        .route("/api/scenario", post(load_scenario))
         .route("/api/speed", post(set_speed))
         .route("/api/confidence", post(set_confidence))
         .route("/api/significance", post(set_significance))

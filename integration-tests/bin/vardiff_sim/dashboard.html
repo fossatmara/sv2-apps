@@ -36,6 +36,15 @@
 <body>
 <h1>vardiff-sim <small id="meta">connecting…</small></h1>
 
+<div class="bar" id="scenariobar" style="display:none">
+  scenario:
+  <select id="scenario" onchange="loadScenario(this.value)">
+    <option value="none">— free-running fleet —</option>
+  </select>
+  <b id="scenario-name" style="color:#58a6ff"></b>
+  <span class="hint" style="margin-left:.5rem">loading a scenario replaces the fleet and restarts the clock</span>
+</div>
+
 <div class="bar" id="speedbar" style="display:none">
   <span id="algosel">
     <button id="algo-classic" onclick="setAlgo('classic')">classic</button>
@@ -113,7 +122,8 @@ let live = true;
 let chart = null;
 let errChart = null;
 let chartMiner = null;
-let changes = [];   // hashrate changes of the selected miner, for the draw hook
+let changes = [];          // hashrate changes of the selected miner, for the draw hook
+let scenarioEvents = [];   // scenario event points {at, miner, label} for the draw hook
 
 function fmtHash(h) {
   const u = [[1e15,'PH/s'],[1e12,'TH/s'],[1e9,'GH/s'],[1e6,'MH/s'],[1e3,'kH/s']];
@@ -128,6 +138,22 @@ async function post(path, body) {
 }
 function setSpeed(mul) { if (last) post('/api/speed', {speed: last.speed * mul}); }
 function setAlgo(name) { post('/api/algorithm', {algorithm: name}); }
+function loadScenario(name) { post('/api/scenario', {name}); }
+
+// Populate the scenario dropdown once from the catalog.
+async function populateScenarios() {
+  try {
+    const r = await fetch('/api/scenarios', {headers: AUTH});
+    if (!r.ok) return;
+    const names = await r.json();
+    const sel = document.getElementById('scenario');
+    for (const n of names) {
+      const opt = document.createElement('option');
+      opt.value = n; opt.textContent = n;
+      sel.appendChild(opt);
+    }
+  } catch (e) {}
+}
 const GAIN_STEPS = { kp: 0.1, ki: 0.001, kd: 0.01 };
 function setGain(which, dir) {
   if (!last) return;
@@ -209,10 +235,22 @@ function refreshChart() {
 
 function render(data) {
   last = data;
+  const scenLabel = data.scenario ? ` | scenario: ${data.scenario}` : '';
   document.getElementById('meta').textContent =
-    `t=${data.elapsed_secs.toFixed(0)}s | ${data.miners.length} miners | window ${data.window_secs}s`;
+    `t=${data.elapsed_secs.toFixed(0)}s | ${data.miners.length} miners | window ${data.window_secs}s${scenLabel}`;
   const sb = document.getElementById('speedbar');
   sb.style.display = data.speed_control ? 'flex' : 'none';
+  // Scenario bar: only meaningful with an embedded pool (speed_control).
+  document.getElementById('scenariobar').style.display = data.speed_control ? 'flex' : 'none';
+  document.getElementById('scenario-name').textContent = data.scenario || '';
+  // Keep the dropdown in sync with the loaded scenario (e.g. after a live swap).
+  const sel = document.getElementById('scenario');
+  if (sel.value !== (data.scenario || 'none') && document.activeElement !== sel) {
+    sel.value = data.scenario || 'none';
+  }
+  // Cache event points for the chart draw hook (only for the selected miner
+  // plus global events).
+  scenarioEvents = data.scenario_events || [];
   document.getElementById('speed').textContent = data.speed.toFixed(2);
   document.getElementById('spm').textContent = data.setpoint_spm.toFixed(1);
   for (const a of ['classic', 'pid', 'qpid', 'champion'])
@@ -305,6 +343,33 @@ function drawChangeLines(u) {
   ctx.restore();
 }
 
+// Scheduled scenario events: dashed amber verticals with a label, so users can
+// see what changes and when. Shows events for the selected miner plus global
+// events (empty miner name, e.g. spm changes).
+function drawScenarioEvents(u) {
+  if (!scenarioEvents.length) return;
+  const ctx = u.ctx;
+  ctx.save();
+  ctx.setLineDash([4, 3]);
+  ctx.lineWidth = 1;
+  ctx.font = '10px ui-monospace, monospace';
+  ctx.textAlign = 'left';
+  for (const [at, miner, label] of scenarioEvents) {
+    if (miner && miner !== selected) continue;
+    const x = u.valToPos(at, 'x', true);
+    if (x < u.bbox.left || x > u.bbox.left + u.bbox.width) continue;
+    const global = !miner;
+    ctx.strokeStyle = global ? '#58a6ff' : '#d29922';
+    ctx.beginPath();
+    ctx.moveTo(x, u.bbox.top);
+    ctx.lineTo(x, u.bbox.top + u.bbox.height);
+    ctx.stroke();
+    ctx.fillStyle = global ? '#58a6ff' : '#d29922';
+    ctx.fillText(label, x + 2, u.bbox.top + 10);
+  }
+  ctx.restore();
+}
+
 // Observed log share-rate error ln(observed/setpoint): the controller's
 // error signal. Zero = on setpoint; the band shows +/-1.
 function makeErrChart(data) {
@@ -382,7 +447,7 @@ function makeChart(data) {
     ],
     cursor: { drag: { x: true, y: false }, sync: { key: 'vdsim' } },
     hooks: {
-      draw: [drawChangeLines],
+      draw: [drawChangeLines, drawScenarioEvents],
       setSelect: [u => { if (u.select.width > 0 && live) toggleLive(); }],
     },
   };
@@ -429,6 +494,7 @@ function connect() {
   };
   ws.onerror = () => ws.close();
 }
+populateScenarios();
 connect();
 </script>
 </body>

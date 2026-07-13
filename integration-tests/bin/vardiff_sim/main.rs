@@ -22,7 +22,7 @@ use clap::Parser;
 use integration_tests_sv2::vardiff_sim::{
     engine::{CsvWriter, EngineConfig, SimEngine},
     pool::{start_sim_pool, AUTHORITY_PUBLIC_KEY},
-    scenario::{DueAction, EventAction, Scenario, ScenarioDriver, ScenarioMiner},
+    scenario::Scenario,
     MinerConfig,
 };
 use stratum_apps::key_utils::Secp256k1PublicKey;
@@ -381,8 +381,12 @@ async fn main() {
     }
 
     if args.tui {
-        let driver = scenario.map(ScenarioDriver::new);
-        let default_fleet = if driver.is_none() {
+        // A --scenario is loaded into the engine (which drives it); otherwise
+        // spawn the default fleet. The TUI can also load scenarios live via 'l'.
+        let default_fleet = if let Some(s) = scenario {
+            engine.lock().expect("engine lock").load_scenario(s);
+            Vec::new()
+        } else {
             (0..args.miners)
                 .map(|i| MinerConfig {
                     name: format!("sim-{i}"),
@@ -390,12 +394,9 @@ async fn main() {
                     ..Default::default()
                 })
                 .collect()
-        } else {
-            Vec::new()
         };
         let result = tui::run(
             engine.clone(),
-            driver,
             default_fleet,
             csv,
             shutdown_signal,
@@ -414,12 +415,15 @@ async fn main() {
     }
 
     // Headless: scenario-driven, or dashboard-driven when only --http was
-    // given (default fleet, runs until a signal or --duration).
-    let mut driver = scenario.map(|s| {
+    // given (default fleet, runs until a signal or --duration). The engine now
+    // owns the scenario driver, so the loop just ticks it via drain_events and
+    // the HTTP dashboard can swap scenarios at runtime through the same path.
+    let scenario_loaded = scenario.is_some();
+    let scenario_duration = scenario.as_ref().and_then(|s| s.duration_secs);
+    if let Some(s) = scenario {
         println!("running scenario '{}' against {pool_address}", s.name);
-        ScenarioDriver::new(s)
-    });
-    if driver.is_none() {
+        engine.lock().expect("engine lock").load_scenario(s);
+    } else {
         let mut eng = engine.lock().expect("engine lock");
         for i in 0..args.miners {
             eng.spawn_miner(
@@ -436,10 +440,16 @@ async fn main() {
             args.miners
         );
     }
+    // With --http the dashboard drives scenario selection, so an HTTP session
+    // runs until a signal even when it started scenario-driven.
     let duration = args
         .duration
-        .or_else(|| driver.as_ref().and_then(|d| d.scenario().duration_secs))
-        .or(if driver.is_some() { Some(300) } else { None });
+        .or(scenario_duration.filter(|_| args.http.is_none()))
+        .or(if scenario_loaded && args.http.is_none() {
+            Some(300)
+        } else {
+            None
+        });
 
     let mut last_print = 0u64;
     loop {
@@ -455,12 +465,8 @@ async fn main() {
         }
         let mut eng = engine.lock().expect("engine lock");
         let elapsed = eng.elapsed_secs();
+        // drain_events advances the engine's scenario driver (if any).
         eng.drain_events();
-        if let Some(driver) = driver.as_mut() {
-            for action in driver.due_actions(elapsed) {
-                apply_action(&mut eng, action);
-            }
-        }
         eng.apply_drift();
         eng.drain_events();
         if let Some(csv) = csv.as_mut() {
@@ -551,39 +557,3 @@ async fn shutdown_embedded_pool(
     }
 }
 
-pub(crate) fn apply_action(engine: &mut SimEngine, action: DueAction) {
-    match action {
-        DueAction::Start(m) => start_scenario_miner(engine, &m),
-        DueAction::Apply { miner, action } => match action {
-            EventAction::SetHashrate { hashrate } => engine.set_hashrate(&miner, hashrate),
-            EventAction::Disconnect => engine.disconnect(&miner),
-            EventAction::Reconnect => engine.reconnect(&miner),
-            EventAction::SetBadShareFraction { fraction } => {
-                engine.set_bad_share_fraction(&miner, fraction)
-            }
-            EventAction::SetDuplicateShareFraction { fraction } => {
-                engine.set_duplicate_share_fraction(&miner, fraction)
-            }
-            // The setpoint is a process-global override, not per-miner, so
-            // `miner` is intentionally ignored here.
-            EventAction::SetSpm { spm } => {
-                integration_tests_sv2::vardiff_sim::set_setpoint_spm(spm)
-            }
-        },
-    }
-}
-
-pub(crate) fn start_scenario_miner(engine: &mut SimEngine, m: &ScenarioMiner) {
-    engine.spawn_miner(
-        MinerConfig {
-            name: m.name.clone(),
-            hashrate: m.hashrate,
-            reported_hashrate: m.reported_hashrate,
-            bad_share_fraction: m.bad_share_fraction,
-            duplicate_share_fraction: m.duplicate_share_fraction,
-            latency_ms: m.latency_ms,
-            latency_jitter_ms: m.latency_jitter_ms,
-        },
-        m.drift.clone(),
-    );
-}

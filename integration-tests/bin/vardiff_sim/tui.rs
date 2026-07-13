@@ -19,7 +19,6 @@ use crossterm::{
 };
 use integration_tests_sv2::vardiff_sim::{
     engine::{format_hashrate, CsvWriter, SimEngine},
-    scenario::ScenarioDriver,
     MinerConfig,
 };
 use ratatui::{
@@ -33,13 +32,14 @@ use ratatui::{
 
 pub async fn run(
     engine: Arc<Mutex<SimEngine>>,
-    mut driver: Option<ScenarioDriver>,
     default_fleet: Vec<MinerConfig>,
     mut csv: Option<CsvWriter>,
     shutdown_signal: async_channel::Receiver<()>,
     speed_control: bool,
 ) -> io::Result<()> {
     {
+        // A scenario, if any, was already loaded into the engine by main; the
+        // default fleet is spawned only when no scenario is driving.
         let mut eng = engine.lock().expect("engine lock");
         for config in default_fleet {
             eng.spawn_miner(config, None);
@@ -141,6 +141,35 @@ pub async fn run(
                         };
                         eng.set_algorithm(next);
                     }
+                    // 'l' cycles to the next bundled scenario (wrapping back to
+                    // the free-running fleet); 'L' clears to free-running.
+                    KeyCode::Char('l') if speed_control => {
+                        let names = scenario_catalog();
+                        let cur = eng.scenario_name().map(|s| s.to_string());
+                        let next_idx = match cur
+                            .as_deref()
+                            .and_then(|c| names.iter().position(|n| *n == c))
+                        {
+                            Some(i) if i + 1 < names.len() => Some(i + 1),
+                            Some(_) => None, // last -> free-running
+                            None => {
+                                if names.is_empty() {
+                                    None
+                                } else {
+                                    Some(0)
+                                }
+                            }
+                        };
+                        match next_idx {
+                            Some(i) => load_scenario_by_name(&mut eng, names[i]),
+                            None => eng.clear_scenario(),
+                        }
+                        selected = 0;
+                    }
+                    KeyCode::Char('L') if speed_control => {
+                        eng.clear_scenario();
+                        selected = 0;
+                    }
                     // 3-8 tune the statistical gates under qpid, the raw
                     // gains under plain pid.
                     KeyCode::Char('3') if speed_control => match eng.algorithm() {
@@ -234,13 +263,10 @@ pub async fn run(
         }
 
         let mut eng = engine.lock().expect("engine lock");
+        // drain_events advances the engine's scenario driver (if a scenario is
+        // loaded); no separate driver handling needed here.
         eng.drain_events();
         let elapsed = eng.elapsed_secs();
-        if let Some(driver) = driver.as_mut() {
-            for action in driver.due_actions(elapsed) {
-                crate::apply_action(&mut eng, action);
-            }
-        }
         eng.apply_drift();
         eng.drain_events();
 
@@ -343,8 +369,12 @@ fn draw(
         }
         _ => String::new(),
     };
+    let scenario = engine
+        .scenario_name()
+        .map(|s| format!("scenario:{s}"))
+        .unwrap_or_else(|| "free-fleet".to_string());
     let title = format!(
-        " vardiff-sim | t={:.0}s | {} | speed x{:.2} | spm={:.1} | {} | {} miners ",
+        " vardiff-sim | t={:.0}s | {scenario} | {} | speed x{:.2} | spm={:.1} | {} | {} miners ",
         engine.elapsed_secs(),
         engine.algorithm(),
         engine.speed(),
@@ -517,7 +547,7 @@ fn draw(
 
     let help = if fleet_ready {
         Line::from(vec![Span::styled(
-            " z quit | w/s sel | a/d hash | f disc | r reconn | e add | q rm | c algo | 1/2 spd | 9/0 spm | 3-8 knobs",
+            " z quit | w/s sel | a/d hash | f disc | r reconn | e add | q rm | c algo | l scenario | 1/2 spd | 9/0 spm | 3-8 knobs",
             Style::default().fg(Color::DarkGray),
         )])
     } else {
@@ -538,4 +568,18 @@ fn draw(
         ratatui::widgets::Paragraph::new(help),
         layout[2],
     );
+}
+
+/// Bundled scenario names, for the TUI's `l` cycle.
+fn scenario_catalog() -> Vec<&'static str> {
+    integration_tests_sv2::vardiff_sim::scenario::catalog::names()
+}
+
+/// Loads a bundled scenario into the engine by name (no-op if unknown).
+fn load_scenario_by_name(eng: &mut SimEngine, name: &str) {
+    if let Some(toml) = integration_tests_sv2::vardiff_sim::scenario::catalog::get(name) {
+        if let Ok(scenario) = integration_tests_sv2::vardiff_sim::scenario::Scenario::parse(toml) {
+            eng.load_scenario(scenario);
+        }
+    }
 }

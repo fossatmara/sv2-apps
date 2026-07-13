@@ -14,10 +14,21 @@ use tracing::info;
 
 use super::{
     clock_speed, expected_shares_per_minute, miner::run_miner,
-    scenario::{Drift, DriftMode},
-    set_clock_speed, target_le_to_difficulty, virtual_now_secs, MinerCommand, MinerConfig,
-    MinerEvent,
+    scenario::{Drift, DriftMode, DueAction, EventAction, Scenario, ScenarioDriver, ScenarioMiner},
+    set_clock_speed, set_setpoint_spm, target_le_to_difficulty, virtual_now_secs, MinerCommand,
+    MinerConfig, MinerEvent,
 };
+
+/// A scheduled scenario event, precomputed on load so a UI can plot markers
+/// showing what changes and when (elapsed virtual seconds since load).
+#[derive(Debug, Clone)]
+pub struct ScenarioEventPoint {
+    pub at: f64,
+    /// Miner the event targets (empty for global events like set_spm).
+    pub miner: String,
+    /// Short human label, e.g. "10x" / "disconnect" / "spm=12".
+    pub label: String,
+}
 
 /// Window over which the realized share rate is measured (virtual seconds).
 const REALIZED_RATE_WINDOW_SECS: f64 = 60.0;
@@ -115,11 +126,19 @@ pub struct SimEngine {
     pub stats: HashMap<String, MinerStats>,
     events_tx: Sender<(String, MinerEvent)>,
     events_rx: Receiver<(String, MinerEvent)>,
-    /// Virtual timestamp when the engine started.
+    /// Virtual timestamp when the engine started (re-anchored on scenario load
+    /// so scenario event offsets are measured from the load instant).
     started_virtual: f64,
     /// Notified whenever observable state changes (events drained, miners
     /// mutated, speed changed); lets push-based frontends skip polling.
     changed: std::sync::Arc<tokio::sync::Notify>,
+    /// Active scenario driver, when a scenario is loaded (None = free-running
+    /// default fleet). The engine advances it each `drain_events`.
+    driver: Option<ScenarioDriver>,
+    /// Name of the loaded scenario, for display (None = no scenario).
+    scenario_name: Option<String>,
+    /// Precomputed event points of the loaded scenario, for plotting markers.
+    scenario_events: Vec<ScenarioEventPoint>,
 }
 
 impl SimEngine {
@@ -133,12 +152,140 @@ impl SimEngine {
             events_rx,
             started_virtual: virtual_now_secs(),
             changed: std::sync::Arc::new(tokio::sync::Notify::new()),
+            driver: None,
+            scenario_name: None,
+            scenario_events: Vec::new(),
         }
     }
 
     /// Handle that is notified on every observable state change.
     pub fn change_notifier(&self) -> std::sync::Arc<tokio::sync::Notify> {
         self.changed.clone()
+    }
+
+    /// Name of the loaded scenario, if any.
+    pub fn scenario_name(&self) -> Option<&str> {
+        self.scenario_name.as_deref()
+    }
+
+    /// Precomputed scenario event points (for plotting "what changes when").
+    pub fn scenario_events(&self) -> &[ScenarioEventPoint] {
+        &self.scenario_events
+    }
+
+    /// Whether a scenario is currently driving the fleet.
+    pub fn has_scenario(&self) -> bool {
+        self.driver.is_some()
+    }
+
+    /// Removes every miner and clears the stats table (used before loading a
+    /// scenario or returning to a fresh default fleet).
+    pub fn clear_fleet(&mut self) {
+        for slot in self.miners.values() {
+            let _ = slot.commands.try_send(MinerCommand::Disconnect);
+        }
+        self.miners.clear();
+        self.stats.clear();
+        self.changed.notify_waiters();
+    }
+
+    /// Loads a scenario, replacing the current fleet: clears all miners,
+    /// re-anchors virtual time to zero so event offsets are measured from now,
+    /// resets any live setpoint override the previous scenario may have set,
+    /// and precomputes the event points for plotting. Miners spawn as the
+    /// driver's start times come due in `drain_events`.
+    pub fn load_scenario(&mut self, scenario: Scenario) {
+        self.clear_fleet();
+        self.scenario_name = Some(scenario.name.clone());
+        self.scenario_events = Self::event_points(&scenario);
+        self.driver = Some(ScenarioDriver::new(scenario));
+        // Re-anchor: elapsed_secs() now reads ~0 at the load instant.
+        self.started_virtual = virtual_now_secs();
+        self.changed.notify_waiters();
+    }
+
+    /// Returns to a free-running fleet (no scenario), clearing everything.
+    pub fn clear_scenario(&mut self) {
+        self.clear_fleet();
+        self.driver = None;
+        self.scenario_name = None;
+        self.scenario_events.clear();
+        self.started_virtual = virtual_now_secs();
+        self.changed.notify_waiters();
+    }
+
+    /// True once the loaded scenario's duration has elapsed (always false when
+    /// no scenario, or the scenario has no duration).
+    pub fn scenario_finished(&self) -> bool {
+        self.driver
+            .as_ref()
+            .is_some_and(|d| d.finished(self.elapsed_secs()))
+    }
+
+    /// Precompute plottable event points from a scenario's miners/events.
+    fn event_points(scenario: &Scenario) -> Vec<ScenarioEventPoint> {
+        let mut pts = Vec::new();
+        for m in &scenario.miners {
+            if m.start_at > 0 {
+                pts.push(ScenarioEventPoint {
+                    at: m.start_at as f64,
+                    miner: m.name.clone(),
+                    label: "join".to_string(),
+                });
+            }
+            for ev in &m.events {
+                let label = match &ev.action {
+                    EventAction::SetHashrate { hashrate } => {
+                        // Express relative to the miner's base rate.
+                        let ratio = hashrate / m.hashrate;
+                        if ratio >= 1.0 {
+                            format!("{ratio:.0}x")
+                        } else {
+                            format!("/{:.0}", 1.0 / ratio)
+                        }
+                    }
+                    EventAction::Disconnect => "disconnect".to_string(),
+                    EventAction::Reconnect => "reconnect".to_string(),
+                    EventAction::SetBadShareFraction { fraction } => {
+                        format!("bad={:.0}%", fraction * 100.0)
+                    }
+                    EventAction::SetDuplicateShareFraction { fraction } => {
+                        format!("dup={:.0}%", fraction * 100.0)
+                    }
+                    EventAction::SetSpm { spm } => format!("spm={spm:.0}"),
+                };
+                pts.push(ScenarioEventPoint {
+                    at: ev.at as f64,
+                    miner: m.name.clone(),
+                    label,
+                });
+            }
+        }
+        pts.sort_by(|a, b| a.at.total_cmp(&b.at));
+        pts
+    }
+
+    /// Applies one due scenario action to the fleet.
+    fn apply_due(&mut self, action: DueAction) {
+        match action {
+            DueAction::Start(m) => {
+                let drift = m.drift.clone();
+                self.spawn_miner(scenario_miner_to_config(&m), drift);
+            }
+            DueAction::Apply { miner, action } => match action {
+                EventAction::SetHashrate { hashrate } => self.set_hashrate(&miner, hashrate),
+                EventAction::Disconnect => self.disconnect(&miner),
+                EventAction::Reconnect => self.reconnect(&miner),
+                EventAction::SetBadShareFraction { fraction } => {
+                    self.set_bad_share_fraction(&miner, fraction)
+                }
+                EventAction::SetDuplicateShareFraction { fraction } => {
+                    self.set_duplicate_share_fraction(&miner, fraction)
+                }
+                // Global override, not per-miner.
+                EventAction::SetSpm { spm } => set_setpoint_spm(spm),
+            },
+        }
     }
 
     /// Elapsed virtual seconds since the engine started.
@@ -424,6 +571,19 @@ impl SimEngine {
     /// Drains pending miner events into the stats tables. Call every tick.
     pub fn drain_events(&mut self) {
         let elapsed = self.elapsed_secs();
+        // Advance a loaded scenario: apply any actions now due. Done here so
+        // every run mode (TUI, HTTP dashboard, hub child) drives scenarios
+        // through the one path they all call each tick.
+        if self.driver.is_some() {
+            let due = self
+                .driver
+                .as_mut()
+                .map(|d| d.due_actions(elapsed))
+                .unwrap_or_default();
+            for action in due {
+                self.apply_due(action);
+            }
+        }
         self.poll_gain_telemetry(elapsed);
         self.sample_rate_errors(elapsed);
         let mut any = false;
@@ -545,6 +705,19 @@ impl SimEngine {
                     .unwrap_or_default()
             })
             .collect()
+    }
+}
+
+/// Maps a scenario miner definition to the engine's miner config.
+fn scenario_miner_to_config(m: &ScenarioMiner) -> MinerConfig {
+    MinerConfig {
+        name: m.name.clone(),
+        hashrate: m.hashrate,
+        reported_hashrate: m.reported_hashrate,
+        bad_share_fraction: m.bad_share_fraction,
+        duplicate_share_fraction: m.duplicate_share_fraction,
+        latency_ms: m.latency_ms,
+        latency_jitter_ms: m.latency_jitter_ms,
     }
 }
 

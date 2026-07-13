@@ -137,7 +137,33 @@ impl Scenario {
     pub fn load(path: &Path) -> Result<Self, String> {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        toml::from_str(&raw).map_err(|e| format!("cannot parse {}: {e}", path.display()))
+        Self::parse(&raw)
+    }
+
+    /// Parses a scenario from TOML text (used for the embedded catalog, where
+    /// there is no file to read).
+    pub fn parse(toml_str: &str) -> Result<Self, String> {
+        toml::from_str(toml_str).map_err(|e| format!("cannot parse scenario: {e}"))
+    }
+}
+
+/// Embedded scenario catalog: `(name, toml_contents)` for every scenario file,
+/// generated at build time by `build.rs` so the binary can list and load them
+/// with no filesystem access.
+pub mod catalog {
+    include!(concat!(env!("OUT_DIR"), "/scenario_catalog.rs"));
+
+    /// Names of all bundled scenarios, sorted.
+    pub fn names() -> Vec<&'static str> {
+        SCENARIO_CATALOG.iter().map(|(n, _)| *n).collect()
+    }
+
+    /// The TOML contents of a bundled scenario by name, if present.
+    pub fn get(name: &str) -> Option<&'static str> {
+        SCENARIO_CATALOG
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, toml)| *toml)
     }
 }
 
