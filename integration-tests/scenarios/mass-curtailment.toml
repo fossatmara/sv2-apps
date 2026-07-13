@@ -1,0 +1,69 @@
+# Fleet-wide power curtailment (grid demand-response) — the canonical MARA
+# failure mode and the correlated-decline "death spiral" test.
+#
+# At t=180 a demand-response event curtails the WHOLE fleet to ~10% at once;
+# it holds through the peak-price window, then the entire fleet restores
+# simultaneously at t=540. Two things to watch:
+#   1. Correlated DECLINE (t=180): every channel goes slow at once. This is the
+#      safe (loosening) direction; a sound controller must NOT talk itself into
+#      raising difficulty on a falling miner (the spiral the champion resists).
+#   2. Correlated RESTORE (t=540): every channel speeds up at once and the pool
+#      must tighten all of them together — the dangerous direction where the
+#      champion is deliberately slow. Expect a large, sustained over-target
+#      excursion across the fleet here.
+name = "mass-curtailment"
+duration_secs = 900
+
+[[miners]]
+name = "farm-a"
+hashrate = 200e12
+[[miners.events]]
+at = 180
+action = "set_hashrate"
+hashrate = 20e12
+[[miners.events]]
+at = 540
+action = "set_hashrate"
+hashrate = 200e12
+
+[[miners]]
+name = "farm-b"
+hashrate = 150e12
+[[miners.events]]
+at = 180
+action = "set_hashrate"
+hashrate = 15e12
+[[miners.events]]
+at = 540
+action = "set_hashrate"
+hashrate = 150e12
+
+[[miners]]
+name = "farm-c"
+hashrate = 300e12
+[[miners.events]]
+at = 180
+action = "set_hashrate"
+hashrate = 30e12
+[[miners.events]]
+at = 540
+action = "set_hashrate"
+hashrate = 300e12
+
+[[miners]]
+name = "farm-d"
+hashrate = 100e12
+[[miners.events]]
+at = 180
+action = "set_hashrate"
+hashrate = 10e12
+[[miners.events]]
+at = 540
+action = "set_hashrate"
+hashrate = 100e12
+
+# Uncurtailed unit (e.g. behind-the-meter): stays flat throughout, so any
+# difficulty movement on it is pure cross-contamination / noise-chasing.
+[[miners]]
+name = "always-on"
+hashrate = 120e12
