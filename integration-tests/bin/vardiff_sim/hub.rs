@@ -379,12 +379,29 @@ async fn reaper(st: HubState) {
     }
 }
 
-/// Terminates every session child (hub shutdown path).
-fn terminate_all(st: &HubState) {
+/// Terminates every session child (hub shutdown path). Returns their pids so
+/// the caller can escalate to SIGKILL for any that outlive the grace window.
+fn terminate_all(st: &HubState) -> Vec<u32> {
     let sessions = st.sessions.lock().expect("sessions lock");
+    let mut pids = Vec::new();
     for (sid, s) in sessions.iter() {
         eprintln!("hub: terminating session {sid} (pid {})", s.pid);
         terminate(s.pid);
+        pids.push(s.pid);
+    }
+    pids
+}
+
+/// SIGKILLs any of `pids` still alive. `kill(pid, 0)` probes existence without
+/// sending a signal. Prevents a child whose graceful teardown wedged (a stuck
+/// bitcoind) from outliving the hub and holding the k8s pod in Terminating.
+fn force_kill_survivors(pids: &[u32]) {
+    for &pid in pids {
+        let alive = unsafe { libc::kill(pid as i32, 0) } == 0;
+        if alive {
+            eprintln!("hub: session pid {pid} still alive after grace; SIGKILL");
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        }
     }
 }
 
@@ -422,8 +439,11 @@ pub async fn serve(cfg: HubConfig, shutdown: async_channel::Receiver<()>) {
             eprintln!("hub: signal received, terminating sessions...");
         }
     }
-    terminate_all(&state);
+    let pids = terminate_all(&state);
     // Children run a bounded graceful teardown (pool + template provider);
-    // give it room before the hub exits.
+    // give it room, then SIGKILL any straggler so the hub (and its k8s pod)
+    // can exit promptly instead of hanging in Terminating.
     tokio::time::sleep(Duration::from_secs(8)).await;
+    force_kill_survivors(&pids);
+    tokio::time::sleep(Duration::from_millis(500)).await;
 }

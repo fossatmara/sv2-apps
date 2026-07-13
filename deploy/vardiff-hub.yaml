@@ -34,6 +34,11 @@ spec:
         app: marapool
         marapool-svc: vardiff-hub
     spec:
+      # The hub SIGTERMs its session children, waits ~8s for their graceful
+      # pool/bitcoind teardown, then SIGKILLs stragglers. Give the pod enough
+      # grace to cover that (plus margin) so it isn't force-killed mid-cleanup
+      # and left stuck Terminating.
+      terminationGracePeriodSeconds: 45
       containers:
         - name: vardiff-hub
           image: 047385673162.dkr.ecr.us-east-2.amazonaws.com/vardiff-hub:latest
