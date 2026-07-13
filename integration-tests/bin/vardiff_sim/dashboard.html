@@ -402,8 +402,12 @@ function makeDrawScenarioEvents(paneMinerName) {
     ctx.font = labelFont(13);
     ctx.textBaseline = 'top';
     const fontPx = 13 * DPR;
-    // Track recent label x-positions to stagger overlapping labels down a row.
-    let lastX = -1e9, row = 0;
+    const rowH = fontPx + 3 * DPR;
+    const pad = 5 * DPR;
+    // Claimed right-edge per row: place each label in the first row whose last
+    // label ends left of this one, so clusters of ANY size never overprint
+    // (the old fixed-gap %4 heuristic wrapped the 5th member back onto row 0).
+    const rowRight = [];
     for (const [at, miner, label] of scenarioEvents) {
       if (miner && miner !== paneMinerName) continue;
       const x = u.valToPos(at, 'x', true);
@@ -416,16 +420,17 @@ function makeDrawScenarioEvents(paneMinerName) {
       ctx.moveTo(x, u.bbox.top);
       ctx.lineTo(x, u.bbox.top + u.bbox.height);
       ctx.stroke();
-      // Stagger if within a label-width of the previous one.
-      if (x - lastX < 60 * DPR) { row = (row + 1) % 4; } else { row = 0; }
-      lastX = x;
-      const ty = u.bbox.top + 3 * DPR + row * (fontPx + 3 * DPR);
       const tw = ctx.measureText(label).width;
+      const boxL = x + 2 * DPR;
+      let row = rowRight.findIndex(r => r <= boxL);
+      if (row === -1) { row = rowRight.length; }
+      rowRight[row] = boxL + tw + pad;
+      const ty = u.bbox.top + 3 * DPR + row * rowH;
       ctx.setLineDash([]);
-      ctx.fillStyle = 'rgba(1,4,9,0.78)';
-      ctx.fillRect(x + 2 * DPR, ty, tw + 5 * DPR, fontPx + 3 * DPR);
+      ctx.fillStyle = 'rgba(1,4,9,0.82)';
+      ctx.fillRect(boxL, ty, tw + pad, rowH);
       ctx.fillStyle = color;
-      ctx.fillText(label, x + 4 * DPR, ty + 1 * DPR);
+      ctx.fillText(label, boxL + 2 * DPR, ty + 1 * DPR);
     }
     ctx.restore();
   };

@@ -752,7 +752,14 @@ impl CsvWriter {
     }
 
     pub fn write_tick(&mut self, engine: &SimEngine) -> std::io::Result<()> {
-        let t = engine.elapsed_secs();
+        self.write_tick_at(engine, engine.elapsed_secs())
+    }
+
+    /// Writes a row per miner stamped with an explicit `t_secs`. Lets the run
+    /// loop emit one row per whole virtual second even when the (faster, or at
+    /// high --speed slower-than-virtual) wall drain skips integer seconds — a
+    /// catch-up loop calls this for each skipped second with the current stats.
+    pub fn write_tick_at(&mut self, engine: &SimEngine, t: f64) -> std::io::Result<()> {
         for name in engine.miner_names() {
             let s = &engine.stats[&name];
             writeln!(

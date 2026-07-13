@@ -452,8 +452,11 @@ async fn main() {
         });
 
     let mut last_print = 0u64;
-    // Last whole virtual second written to CSV, so the CSV keeps exactly one
-    // row per simulated second regardless of the (faster) drain cadence.
+    // Last whole virtual second written to CSV. The CSV keeps exactly one row
+    // per simulated second regardless of the drain cadence: when a tick skips
+    // integer seconds (either faster wall drain, or --speed > ~10 where one
+    // 100ms wall tick spans several virtual seconds) we catch up and emit a
+    // row for each skipped second, so downstream analysis sees no gaps.
     let mut last_csv_secs: Option<u64> = None;
     // Drain on a FIXED short WALL interval, decoupled from sim speed: this
     // advances difficulty points / rate-error samples / the chart's right edge
@@ -476,16 +479,19 @@ async fn main() {
         eng.drain_events();
         eng.apply_drift();
         eng.drain_events();
-        // CSV contract: one row per whole virtual second (edge-detected), so
-        // the row cadence is identical at every --speed.
+        // CSV contract: one row per whole virtual second, with no gaps even
+        // when a tick skips seconds — emit each skipped second with the
+        // current stats (they didn't change between drains).
         let elapsed_whole = elapsed as u64;
         if let Some(csv) = csv.as_mut() {
-            if last_csv_secs != Some(elapsed_whole) {
-                last_csv_secs = Some(elapsed_whole);
-                if let Err(e) = csv.write_tick(&eng) {
+            let next = last_csv_secs.map(|s| s + 1).unwrap_or(0);
+            for sec in next..=elapsed_whole {
+                if let Err(e) = csv.write_tick_at(&eng, sec as f64) {
                     eprintln!("csv write failed: {e}");
+                    break;
                 }
             }
+            last_csv_secs = Some(elapsed_whole);
         }
         if elapsed_whole >= last_print + 10 {
             last_print = elapsed_whole;
