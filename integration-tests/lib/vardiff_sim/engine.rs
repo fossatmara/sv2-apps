@@ -33,7 +33,11 @@ pub struct ScenarioEventPoint {
 /// Window over which the realized share rate is measured (virtual seconds).
 const REALIZED_RATE_WINDOW_SECS: f64 = 60.0;
 /// Cadence of rate-error samples (virtual seconds).
-const RATE_SAMPLE_SECS: f64 = 10.0;
+const RATE_SAMPLE_SECS: f64 = 2.0;
+/// Cap on retained rate-error samples per miner. The HTTP snapshot only sends
+/// the visible window; this bounds memory over a long free-running session
+/// (at 2s sampling, 20k samples ≈ 11 hours of virtual time).
+const RATE_ERROR_HISTORY_CAP: usize = 20_000;
 
 pub struct EngineConfig {
     pub pool_address: SocketAddr,
@@ -328,6 +332,10 @@ impl SimEngine {
             let observed = (count as f64).max(0.5) * 60.0 / REALIZED_RATE_WINDOW_SECS;
             let err = (observed / setpoint).ln().clamp(-3.0, 3.0);
             stats.rate_error_history.push((elapsed, err));
+            if stats.rate_error_history.len() > RATE_ERROR_HISTORY_CAP {
+                let excess = stats.rate_error_history.len() - RATE_ERROR_HISTORY_CAP;
+                stats.rate_error_history.drain(..excess);
+            }
         }
     }
 

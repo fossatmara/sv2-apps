@@ -515,9 +515,20 @@ function makeErrChart(el, data) {
   }, data, el);
 }
 
-function errData(m) {
+function errData(m, x2) {
   const err = m.rate_error || [];
-  return [err.map(([t]) => t), err.map(([, e]) => e)];
+  const xs = err.map(([t]) => t);
+  const ys = err.map(([, e]) => e);
+  // Pin a trailing point at the current time holding the last sample's value,
+  // so the error chart's right edge advances every push (smooth scroll) —
+  // mirroring the difficulty chart's synthetic edge point. Without it the
+  // x-extent only grows when a new rate-error sample lands (every
+  // RATE_SAMPLE_SECS), so the whole chart froze between samples = stutter.
+  if (xs.length && x2 != null && x2 > xs[xs.length - 1]) {
+    xs.push(x2);
+    ys.push(ys[ys.length - 1]);
+  }
+  return [xs, ys];
 }
 
 // Create the DOM + two uPlots for one miner pane.
@@ -575,7 +586,7 @@ function updatePane(p, m, data) {
   p.root.classList.toggle('down', !m.connected);
   const d = buildDiffData(m, data.elapsed_secs, hasSynthetic);
   if (d) p.diff.setData(d);
-  p.err.setData(errData(m));
+  p.err.setData(errData(m, data.elapsed_secs));
 }
 
 window.addEventListener('resize', () => {
