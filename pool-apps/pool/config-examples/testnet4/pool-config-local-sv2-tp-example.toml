@@ -53,3 +53,7 @@ address = "127.0.0.1:48442"
 # alpha = 0.15         # qpid: Q-learning rate
 # gamma = 0.7          # qpid: discount factor
 # epsilon = 0.1        # qpid: exploration rate
+# qtable_path = "/var/lib/pool/qpid-qtable.bin" # qpid: persist the learned
+#                     # gain-scheduling policy across restarts. Loaded on start,
+#                     # saved every ~5 min and on shutdown. A missing/incompatible
+#                     # file is ignored (fresh table). Omit to keep it in-memory.

@@ -137,8 +137,82 @@ impl VardiffFactory {
         // Always hold a table: the live algorithm override can switch any
         // pool to qpid at runtime, and the table persists across switches so
         // learning survives a detour through another algorithm.
-        let qtable = Some(std::sync::Arc::new(std::sync::Mutex::new(QTable::new())));
+        //
+        // When a `qtable_path` is configured, seed the table from a prior run
+        // so the Q-learning policy accrues experience across restarts instead
+        // of cold-starting (a cold table means near-full random exploration
+        // for thousands of decisions). A missing, unreadable, or incompatible
+        // file falls back to a fresh table.
+        let table = config
+            .qtable_path
+            .as_deref()
+            .and_then(|path| match std::fs::read(path) {
+                Ok(bytes) => match QTable::decode(&bytes) {
+                    Ok(table) => {
+                        info!(
+                            "loaded qpid Q-table from {} ({} recorded decisions)",
+                            path.display(),
+                            table.total_visits()
+                        );
+                        Some(table)
+                    }
+                    Err(e) => {
+                        warn!(
+                            "ignoring qpid Q-table at {} (incompatible/corrupt: {e:?}); \
+                             starting fresh",
+                            path.display()
+                        );
+                        None
+                    }
+                },
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    info!(
+                        "no qpid Q-table at {} yet; starting fresh",
+                        path.display()
+                    );
+                    None
+                }
+                Err(e) => {
+                    warn!(
+                        "failed to read qpid Q-table at {} ({e}); starting fresh",
+                        path.display()
+                    );
+                    None
+                }
+            })
+            .unwrap_or_default();
+        let qtable = Some(std::sync::Arc::new(std::sync::Mutex::new(table)));
         Self { config, qtable }
+    }
+
+    /// Persists the shared qpid Q-table to the configured `qtable_path`, if
+    /// any, so a restart resumes the learned policy. Written atomically (temp
+    /// file + rename) so a crash mid-write can't leave a truncated blob that
+    /// would be rejected on the next load. No-op when no path is configured or
+    /// the table lock is poisoned.
+    pub(crate) fn save_qtable(&self) {
+        let Some(path) = self.config.qtable_path.as_deref() else {
+            return;
+        };
+        let Some(table) = self.qtable.as_ref() else {
+            return;
+        };
+        let bytes = match table.lock() {
+            Ok(t) => t.encode(),
+            Err(_) => {
+                warn!("qpid Q-table lock poisoned; skipping persist");
+                return;
+            }
+        };
+        let tmp = path.with_extension("qtable.tmp");
+        let result = std::fs::write(&tmp, &bytes).and_then(|_| std::fs::rename(&tmp, path));
+        match result {
+            Ok(()) => info!("persisted qpid Q-table to {}", path.display()),
+            Err(e) => {
+                warn!("failed to persist qpid Q-table to {}: {e}", path.display());
+                let _ = std::fs::remove_file(&tmp);
+            }
+        }
     }
 
     /// The algorithm currently in effect: the live override if set (UI
@@ -554,6 +628,9 @@ impl ChannelManager {
                     }
                 }
             }
+            // Persist the learned qpid policy on clean shutdown so the next
+            // start resumes it (no-op unless a qtable_path is configured).
+            self.vardiff_factory.save_qtable();
             self.channel_manager_io.close();
         });
         Ok(())
@@ -751,6 +828,11 @@ impl ChannelManager {
     // time.
     async fn run_vardiff_loop(&self) -> PoolResult<(), error::ChannelManager> {
         use stratum_apps::stratum_core::channels_sv2::vardiff::sim_clock;
+        // Persist the qpid Q-table roughly every 5 minutes of vardiff ticks so
+        // a crash (no clean shutdown) loses at most a few minutes of learning.
+        // A no-op unless a `qtable_path` is configured.
+        let save_every_ticks = (300 / self.vardiff_interval_secs.max(1)).max(1);
+        let mut ticks: u64 = 0;
         loop {
             let wall_secs = (self.vardiff_interval_secs as f64 / sim_clock::scale()).max(0.05);
             tokio::time::sleep(std::time::Duration::from_secs_f64(wall_secs)).await;
@@ -758,6 +840,11 @@ impl ChannelManager {
 
             if let Err(e) = self.run_vardiff().await {
                 error!(error = ?e, "Vardiff iteration failed");
+            }
+
+            ticks += 1;
+            if ticks % save_every_ticks == 0 {
+                self.vardiff_factory.save_qtable();
             }
         }
     }

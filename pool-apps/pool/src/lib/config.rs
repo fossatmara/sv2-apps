@@ -89,7 +89,7 @@ pub enum VardiffAlgorithm {
 ///
 /// The gain fields only apply to the `pid` algorithm; see
 /// `channels_sv2::vardiff::pid` for what each one does.
-#[derive(Clone, Copy, Debug, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Deserialize)]
 #[serde(default)]
 pub struct VardiffConfig {
     pub algorithm: VardiffAlgorithm,
@@ -114,6 +114,13 @@ pub struct VardiffConfig {
     pub gamma: f64,
     /// Q-learning exploration rate (qpid only).
     pub epsilon: f64,
+    /// Path to persist the qpid Q-learning table (qpid only). When set, the
+    /// pool loads a prior policy on startup and saves it on shutdown so
+    /// learning accrues across restarts instead of cold-starting every boot.
+    /// A missing, stale, or incompatible file is ignored (fresh table). No
+    /// effect for non-qpid algorithms.
+    #[serde(default, deserialize_with = "opt_path_from_toml")]
+    pub qtable_path: Option<PathBuf>,
 }
 
 impl Default for VardiffConfig {
@@ -132,6 +139,7 @@ impl Default for VardiffConfig {
             alpha: qpid::DEFAULT_ALPHA,
             gamma: qpid::DEFAULT_GAMMA,
             epsilon: qpid::DEFAULT_EPSILON,
+            qtable_path: None,
         }
     }
 }
@@ -253,7 +261,7 @@ impl PoolConfig {
 
     /// Returns the vardiff algorithm configuration.
     pub fn vardiff(&self) -> VardiffConfig {
-        self.vardiff
+        self.vardiff.clone()
     }
 
     /// Sets the vardiff algorithm configuration.
