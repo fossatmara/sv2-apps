@@ -45,16 +45,15 @@ fn decode(bin: &[u8]) -> TemplateDistribution<'static> {
 /// (e.g. `CoinbaseOutputConstraints`, `RequestTransactionData`) are drained and
 /// ignored — the static template never changes.
 ///
-/// Returns a task handle; drop it (or let the process exit) to stop the mock.
-pub fn spawn(addr: SocketAddr) -> tokio::task::JoinHandle<()> {
+/// Binds the listener synchronously (so the caller can spawn the pool without
+/// racing the mock's startup — no "connection refused" retry), then serves on
+/// a spawned task. Returns the task handle; drop it (or let the process exit)
+/// to stop the mock.
+pub async fn spawn(addr: SocketAddr) -> tokio::task::JoinHandle<()> {
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .unwrap_or_else(|e| panic!("mock-tp: bind {addr} failed: {e}"));
     tokio::spawn(async move {
-        let listener = match tokio::net::TcpListener::bind(addr).await {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("mock-tp: bind {addr} failed: {e}");
-                return;
-            }
-        };
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 continue;

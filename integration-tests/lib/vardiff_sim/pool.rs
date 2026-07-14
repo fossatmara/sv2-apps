@@ -49,7 +49,7 @@ pub async fn start_sim_pool(
     // Spawn the in-process mock TP on its own port; the pool connects to it as
     // an ordinary SV2 template provider.
     let tp_address = get_available_address();
-    let mock = mock_tp::spawn(tp_address);
+    let mock = mock_tp::spawn(tp_address).await;
 
     let listen_address = get_available_address();
     let authority_public_key = Secp256k1PublicKey::try_from(AUTHORITY_PUBLIC_KEY.to_string())

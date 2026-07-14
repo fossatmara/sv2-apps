@@ -320,7 +320,7 @@ async fn main() {
             vardiff.epsilon = v;
         }
         eprintln!(
-            "starting regtest template provider + pool (ignore_share_validation=true, vardiff={})...",
+            "starting mock template provider + pool (ignore_share_validation=true, vardiff={})...",
             args.algorithm
         );
         let (pool, address, tp) =

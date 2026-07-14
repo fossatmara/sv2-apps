@@ -2,8 +2,12 @@
 # vardiff-sim session hub
 #
 # Serves the multi-session vardiff dashboard: every browser session gets its
-# own fully isolated child sim (pool + template provider + miners) inside the
-# container, managed and proxied by the hub process.
+# own fully isolated child sim (pool + in-process mock template provider +
+# miners) inside the container, managed and proxied by the hub process.
+#
+# The sim runs the pool with ignore_share_validation, so it needs no chain: an
+# in-process mock template provider replays a captured template. bitcoind and
+# sv2-tp are therefore NOT bundled (no ~400 MB download, faster child startup).
 #
 # Build from the repo root:
 #   docker build -f docker/Dockerfile.vardiff-hub \
@@ -33,24 +37,8 @@ RUN cargo build --release \
     --target-dir ./build
 
 ###
-# ---- Template-provider binaries ----
-# Baked into the image so session children never download at runtime.
-# Versions must match integration-tests/lib/template_provider.rs.
-###
-FROM debian:bookworm-slim AS tp-binaries
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl ca-certificates && \
-    rm -rf /var/lib/apt/lists/*
-
-WORKDIR /tp
-ARG BITCOIN_CORE_VERSION=31.0
-ARG SV2_TP_VERSION=1.1.0
-RUN curl -fsSL "https://bitcoincore.org/bin/bitcoin-core-${BITCOIN_CORE_VERSION}/bitcoin-${BITCOIN_CORE_VERSION}-x86_64-linux-gnu.tar.gz" | tar xz && \
-    curl -fsSL "https://github.com/stratum-mining/sv2-tp/releases/download/v${SV2_TP_VERSION}/sv2-tp-${SV2_TP_VERSION}-x86_64-linux-gnu.tar.gz" | tar xz
-
-###
 # ---- Runtime Stage ----
+# No bitcoind/sv2-tp: the vardiff sim uses an in-process mock template provider.
 ###
 FROM debian:bookworm-slim AS runtime
 
@@ -62,8 +50,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 COPY --from=builder /app/build/release/vardiff-sim /usr/local/bin/vardiff-sim
-# The sim looks for template-provider binaries under $CWD/template-provider.
-COPY --from=tp-binaries /tp/ /app/template-provider/
 
 USER sim
 
