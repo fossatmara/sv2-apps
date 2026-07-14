@@ -14,6 +14,7 @@
 
 pub mod engine;
 pub mod miner;
+pub mod mock_tp;
 pub mod pool;
 pub mod scenario;
 

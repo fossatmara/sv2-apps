@@ -1,5 +1,11 @@
-//! Convenience bootstrap: a local template provider + pool configured for
+//! Convenience bootstrap: a mock SV2 template provider + pool configured for
 //! simulation (`ignore_share_validation = true`).
+//!
+//! The vardiff sim never validates shares or propagates solutions, so it does
+//! not need a real chain. Instead of a `bitcoind` + `sv2-tp` stack (a ~400 MB
+//! download, IPC, and ~10 s startup per pool) this uses an in-process
+//! [`mock_tp`] that replays captured real template frames — pool startup drops
+//! to ~1 s, which is what makes the benchmark practical to iterate on.
 
 use std::{convert::TryFrom, net::SocketAddr, time::Duration};
 
@@ -9,20 +15,26 @@ use stratum_apps::{
     key_utils::{Secp256k1PublicKey, Secp256k1SecretKey},
 };
 
-use crate::{
-    start_template_provider, sv2_tp_config,
-    template_provider::{DifficultyLevel, TemplateProvider},
-    utils::get_available_address,
-    POOL_COINBASE_REWARD_ADDRESS,
-};
+use crate::{sv2_tp_config, utils::get_available_address, POOL_COINBASE_REWARD_ADDRESS};
+
+use super::mock_tp;
 
 /// Test authority keypair (same one the integration tests use).
 pub const AUTHORITY_PUBLIC_KEY: &str = "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72";
 const AUTHORITY_SECRET_KEY: &str = "mkDLTBBRxdBv998612qipDYoTK3YUrqLe8uWw7gu3iXbSrn2n";
 
-/// Starts a regtest template provider plus a pool that accepts every share
-/// without validation. Returns the pool handle, its listen address, and the
-/// template provider handle (keep both alive for the duration of the run).
+/// Handle to the mock template provider task; hold it for the run's lifetime.
+/// Dropping it aborts the mock (harmless — the pool already has its template).
+pub struct MockTp(tokio::task::JoinHandle<()>);
+impl Drop for MockTp {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Starts a mock template provider plus a pool that accepts every share without
+/// validation. Returns the pool handle, its listen address, and the mock-TP
+/// handle (keep all alive for the duration of the run).
 ///
 /// `vardiff_interval_secs` controls how often the pool re-evaluates channel
 /// difficulty. Note the classic algorithm ignores windows of 15s or less
@@ -33,8 +45,11 @@ pub async fn start_sim_pool(
     shares_per_minute: f32,
     vardiff_interval_secs: u64,
     vardiff: pool_sv2::config::VardiffConfig,
-) -> (PoolSv2, SocketAddr, TemplateProvider) {
-    let (template_provider, tp_address) = start_template_provider(None, DifficultyLevel::Low);
+) -> (PoolSv2, SocketAddr, MockTp) {
+    // Spawn the in-process mock TP on its own port; the pool connects to it as
+    // an ordinary SV2 template provider.
+    let tp_address = get_available_address();
+    let mock = mock_tp::spawn(tp_address);
 
     let listen_address = get_available_address();
     let authority_public_key = Secp256k1PublicKey::try_from(AUTHORITY_PUBLIC_KEY.to_string())
@@ -76,11 +91,12 @@ pub async fn start_sim_pool(
     tokio::spawn(async move {
         let _ = pool_clone.start().await;
     });
-    // The pool opens its listener only after the first template arrives.
-    if !wait_for_pool(listen_address, Duration::from_secs(60)).await {
+    // The pool opens its listener only after the first template arrives (from
+    // the mock). With no bitcoind/IPC this is ~1 s, so a short timeout is fine.
+    if !wait_for_pool(listen_address, Duration::from_secs(30)).await {
         panic!("pool never opened its listener on {listen_address}");
     }
-    (pool, listen_address, template_provider)
+    (pool, listen_address, MockTp(mock))
 }
 
 /// Waits until a pool accepts TCP connections on `address`. Returns false if

@@ -268,8 +268,7 @@ async fn main() {
     // Keep the pool and template provider handles alive for the whole run;
     // both shut down when dropped at the end of main.
     let mut embedded_pool: Option<pool_sv2::PoolSv2> = None;
-    let mut _template_provider: Option<integration_tests_sv2::template_provider::TemplateProvider> =
-        None;
+    let mut _template_provider: Option<integration_tests_sv2::vardiff_sim::pool::MockTp> = None;
     let pool_address: SocketAddr = if args.spawn_pool {
         let algorithm = match args.algorithm.as_str() {
             "classic" => pool_sv2::config::VardiffAlgorithm::Classic,
@@ -546,12 +545,12 @@ fn spawn_signal_listener() -> async_channel::Receiver<()> {
     rx
 }
 
-/// Gracefully stops a `--spawn-pool` pool and its template provider (the
-/// template provider's child processes are killed on drop). Every stage is
-/// bounded by a timeout so a wedged component can't hang the exit forever.
+/// Gracefully stops a `--spawn-pool` pool and its mock template provider. The
+/// mock is just an in-process task (no child processes), so dropping it aborts
+/// instantly; only the pool shutdown needs a bounded timeout.
 async fn shutdown_embedded_pool(
     pool: Option<pool_sv2::PoolSv2>,
-    template_provider: Option<integration_tests_sv2::template_provider::TemplateProvider>,
+    template_provider: Option<integration_tests_sv2::vardiff_sim::pool::MockTp>,
 ) {
     if let Some(pool) = pool {
         eprintln!("shutting down embedded pool...");
@@ -560,18 +559,7 @@ async fn shutdown_embedded_pool(
             Err(_) => eprintln!("warning: pool did not shut down within 10s; continuing"),
         }
     }
-    if let Some(tp) = template_provider {
-        eprintln!("stopping template provider (bitcoind/sv2-tp)...");
-        // Drop blocks on child-process teardown; run it off the async runtime
-        // and bound it.
-        let teardown = tokio::task::spawn_blocking(move || drop(tp));
-        match tokio::time::timeout(Duration::from_secs(15), teardown).await {
-            Ok(_) => eprintln!("template provider stopped"),
-            Err(_) => eprintln!(
-                "warning: template provider did not stop within 15s; \
-                 check for leftovers with: pgrep -af 'bitcoin-node|sv2-tp'"
-            ),
-        }
-    }
+    // Dropping the mock TP handle aborts its task (see MockTp::drop).
+    drop(template_provider);
 }
 
