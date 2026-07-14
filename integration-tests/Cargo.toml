@@ -73,6 +73,11 @@ path = "bin/mining_device.rs"
 name = "vardiff-sim"
 path = "bin/vardiff_sim/main.rs"
 
+# Wall-time benchmark report generator (reads run CSVs -> self-contained HTML).
+[[bin]]
+name = "vardiff-bench-report"
+path = "bin/vardiff_bench_report/main.rs"
+
 # Bench targets preserved from the former standalone `mining_device` crate.
 # Remove these entries when the embedded `mining_device` module is deprecated.
 [[bench]]
