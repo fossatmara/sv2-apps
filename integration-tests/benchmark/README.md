@@ -12,9 +12,27 @@ time). Convergence and reaction-latency numbers are only trustworthy at 1×.
 
 ## Regenerate
 
+One command (for automation) — runs the benchmark and rebuilds the committed
+report end-to-end:
+
 ```sh
-# 1. Run the benchmark (4 algorithms × all scenarios, real time). ~3 h wall.
-#    Writes one CSV per run to integration-tests/benchmark-report/raw-csv/.
+integration-tests/benchmark/regenerate.sh
+```
+
+Just rebuild the report from the existing CSVs (fast, ~1 s — after editing the
+report tool, or to refresh from a run done elsewhere):
+
+```sh
+REPORT_ONLY=1 integration-tests/benchmark/regenerate.sh
+```
+
+Or the two steps by hand:
+
+```sh
+# 1. Run the benchmark (4 algorithms × all scenarios). Writes one CSV per run
+#    to integration-tests/benchmark-report/raw-csv/. With the in-process mock
+#    template provider (no bitcoind) startup is ~1 s/run; at SPEED=1 total time
+#    is bounded by scenario durations.
 integration-tests/benchmark/run-benchmark.sh
 
 # 2. Build the report from those CSVs (fast, ~1 s). Writes
@@ -24,7 +42,8 @@ cargo run --release --bin vardiff-bench-report -- \
 ```
 
 Step 2 is decoupled from step 1, so you can iterate on the report (metrics,
-charts) against an existing CSV set without a 3-hour rerun.
+charts) against an existing CSV set without a full rerun. `regenerate.sh`
+forwards `SPEED` and the other `run-benchmark.sh` env vars.
 
 ### Runner options (env vars)
 
