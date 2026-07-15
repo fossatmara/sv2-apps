@@ -12,40 +12,39 @@ time). Convergence and reaction-latency numbers are only trustworthy at 1×.
 
 ## Regenerate
 
-One command (for automation) — runs the benchmark and rebuilds the committed
-report end-to-end:
+One script drives everything — `benchmark/benchmark.sh` (build → run → report):
 
 ```sh
-integration-tests/benchmark/regenerate.sh
+# Full pipeline: compile the sim, run 4 algorithms × all scenarios, rebuild the
+# committed report end-to-end. With the in-process mock template provider (no
+# bitcoind) startup is ~1 s/run; at SPEED=1 total time is bounded by scenario
+# durations.
+integration-tests/benchmark/benchmark.sh
 ```
-
-Just rebuild the report from the existing CSVs (fast, ~1 s — after editing the
-report tool, or to refresh from a run done elsewhere):
 
 ```sh
-REPORT_ONLY=1 integration-tests/benchmark/regenerate.sh
+# Just rebuild the report from the existing CSVs (fast, ~1 s — after editing the
+# report tool, or to refresh from a run done elsewhere):
+integration-tests/benchmark/benchmark.sh --report-only    # or REPORT_ONLY=1
 ```
-
-Or the two steps by hand:
 
 ```sh
-# 1. Run the benchmark (4 algorithms × all scenarios). Writes one CSV per run
-#    to integration-tests/benchmark-report/raw-csv/. With the in-process mock
-#    template provider (no bitcoind) startup is ~1 s/run; at SPEED=1 total time
-#    is bounded by scenario durations.
-integration-tests/benchmark/run-benchmark.sh
-
-# 2. Build the report from those CSVs (fast, ~1 s). Writes
-#    benchmark-report/vardiff-walltime-report.html + analysis.json.
-cargo run --release --bin vardiff-bench-report -- \
-    integration-tests/benchmark-report/raw-csv
+# Collect CSVs only, no report (e.g. a scratch subset in a custom dir):
+ALGOS="pid champion" SCENARIOS="convergence step-change" \
+    integration-tests/benchmark/benchmark.sh --no-report /tmp/quickbench
+# then build a report from them wherever you like:
+cargo run --release --bin vardiff-bench-report -- /tmp/quickbench /tmp/quickbench/report.html
 ```
 
-Step 2 is decoupled from step 1, so you can iterate on the report (metrics,
-charts) against an existing CSV set without a full rerun. `regenerate.sh`
-forwards `SPEED` and the other `run-benchmark.sh` env vars.
+The run and report phases are decoupled (`--report-only` / `--no-report`), so you
+can iterate on the report (metrics, charts) against an existing CSV set without a
+full rerun.
 
-### Runner options (env vars)
+### Options (flags + env vars)
+
+Flags: `--report-only` (skip build+run), `--no-report` (build+run only),
+`--help`. The first positional arg is `OUTDIR` (default
+`benchmark-report/raw-csv`). Env overrides:
 
 | var | default | meaning |
 |-----|---------|---------|
@@ -55,14 +54,6 @@ forwards `SPEED` and the other `run-benchmark.sh` env vars.
 | `SPEED` | `1` | sim clock speed (1 = real time; the point of this bench) |
 | `MAX_PARALLEL` | `6` | concurrent runs |
 | `DURATION_MARGIN` | `30` | extra virtual seconds appended to each scenario |
-
-A quick smoke run:
-
-```sh
-ALGOS="pid champion" SCENARIOS="convergence step-change" \
-    integration-tests/benchmark/run-benchmark.sh /tmp/quickbench
-cargo run --release --bin vardiff-bench-report -- /tmp/quickbench /tmp/quickbench/report.html
-```
 
 ## What's committed vs regenerable
 

@@ -1,6 +1,6 @@
 //! Vardiff wall-time benchmark report generator.
 //!
-//! Reads the per-run CSVs produced by `benchmark/run-benchmark.sh`
+//! Reads the per-run CSVs produced by `benchmark/benchmark.sh`
 //! (`<algo>__<scenario>.csv`, one row per miner per virtual second) plus the
 //! scenario TOMLs (reusing the real [`Scenario`] parser for exact event
 //! extraction), computes convergence / accuracy / churn / overshoot /
@@ -995,7 +995,7 @@ pre{background:#010409;border:1px solid #21262d;border-radius:6px;padding:.5rem;
         "<p class=note>4 algorithms (classic, pid, qpid, champion) × {} scenarios, run at \
          <b>real time (--speed 1)</b> so handshake / TCP / idle-backstop / champion-tick latencies \
          are represented faithfully. Setpoint = {SETPOINT:.0} shares/min. Regenerate with \
-         <code>benchmark/run-benchmark.sh</code> then this tool.</p>\
+         <code>benchmark/benchmark.sh</code>.</p>\
          <div><span class=kpi>runs: <b>{n}</b></span>\
          <span class=kpi>failures/timeouts: <b class={}>{}</b></span>\
          <span class=kpi>setpoint: <b>{SETPOINT:.0} spm</b></span></div>",
