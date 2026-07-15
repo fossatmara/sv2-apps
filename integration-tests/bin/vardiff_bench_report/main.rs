@@ -29,6 +29,8 @@ const BAND: f64 = 0.20; // ±20% convergence band
 const SETTLE_GUARD_SECS: f64 = 90.0; // exclude this long after an event from "settled"
 const MIN_OBS_AFTER: f64 = 180.0; // need this much post-event data to call a non-convergence
 const ALGOS: [&str; 4] = ["classic", "pid", "qpid", "champion"];
+/// How many worst-offending miners to highlight per run in the breakout.
+const WORST_N: usize = 5;
 const COLORS: [&str; 4] = ["#8b949e", "#39c5cf", "#3fb950", "#f778ba"];
 
 /// One (t, miner-state) sample from a run CSV. `realized` is parsed and kept
@@ -63,6 +65,29 @@ struct ConvEvent {
     obs_window: f64,
 }
 
+/// Per-miner rollup within one run, so the report can surface a per-miner
+/// breakout (and the worst offenders) rather than only the fleet-pooled
+/// distribution — a pooled p50/p99 hides a bimodal fleet where some miners
+/// sit on setpoint and others are stuck off-target.
+struct MinerMetrics {
+    name: String,
+    /// Median |expected−setpoint|/setpoint over this miner's settled samples.
+    settled_p50: f64,
+    /// Worst (max) settled relative error for this miner.
+    settled_max: f64,
+    /// Median settled operating point in shares/min (setpoint = on target).
+    op_spm: f64,
+    /// Steady-state on-wire byte rate (down+up) for this miner, B/s.
+    bw_bps: f64,
+    /// SetTarget updates emitted to this miner over the run.
+    updates: u64,
+    /// Step events on this miner that never re-entered the ±band.
+    never: u32,
+    /// Final expected-spm and whether the miner was still connected at run end.
+    final_expected: f64,
+    connected: bool,
+}
+
 #[allow(dead_code)] // `scenario` is keyed by the map; kept for self-documentation.
 struct RunMetrics {
     algo: String,
@@ -83,6 +108,8 @@ struct RunMetrics {
     peak_bw_bps: f64,
     conv: Vec<ConvEvent>,
     final_expected: Vec<(String, f64, bool)>,
+    /// Per-miner rollups for the breakout section.
+    per_miner: Vec<MinerMetrics>,
 }
 
 fn main() {
@@ -334,6 +361,7 @@ fn analyze(
     let mut tmax = 0.0f64;
     let mut conv = Vec::new();
     let mut final_expected = Vec::new();
+    let mut per_miner = Vec::new();
 
     for (miner, pts) in series {
         if pts.is_empty() {
@@ -356,6 +384,10 @@ fn analyze(
                     .iter()
                     .all(|et| t < *et || (t - *et) > SETTLE_GUARD_SECS)
         };
+        // This miner's own settled-error and settled operating-point samples,
+        // for its per-miner rollup (kept separate from the fleet-pooled vecs).
+        let mut m_settled = Vec::new();
+        let mut m_op = Vec::new();
         for s in pts {
             if !s.connected {
                 continue;
@@ -363,6 +395,8 @@ fn analyze(
             let e = (s.expected - SETPOINT) / SETPOINT;
             if settled(s.t) {
                 settled_err.push(e.abs());
+                m_settled.push(e.abs());
+                m_op.push(s.expected);
                 if e > 0.0 {
                     over.push(e.abs());
                 }
@@ -374,7 +408,13 @@ fn analyze(
             };
         }
 
+        // This miner's steady-state byte rate: difference its cumulative bytes
+        // between the first settled sample and its last, over that span. Same
+        // method as the fleet figure, restricted to one miner.
+        let bw_bps = miner_steady_bw(pts, &settled);
+
         // Convergence after each hashrate-STEP event on this miner.
+        let mut m_never = 0u32;
         for ev in events.iter().filter(|e| e.miner == *miner && e.dir != 0) {
             let after: Vec<&Sample> = pts.iter().filter(|s| s.t >= ev.at && s.connected).collect();
             let Some(first) = after.first() else {
@@ -393,6 +433,9 @@ fn analyze(
             if conv_secs.is_none() && obs_window < MIN_OBS_AFTER {
                 continue;
             }
+            if conv_secs.is_none() {
+                m_never += 1;
+            }
             conv.push(ConvEvent {
                 miner: miner.clone(),
                 label: ev.label.clone(),
@@ -401,6 +444,20 @@ fn analyze(
                 obs_window,
             });
         }
+
+        m_settled.sort_by(f64::total_cmp);
+        m_op.sort_by(f64::total_cmp);
+        per_miner.push(MinerMetrics {
+            name: miner.clone(),
+            settled_p50: percentile(&m_settled, 50.0),
+            settled_max: m_settled.last().copied().unwrap_or(f64::NAN),
+            op_spm: percentile(&m_op, 50.0),
+            bw_bps,
+            updates: last.updates,
+            never: m_never,
+            final_expected: last.expected,
+            connected: last.connected,
+        });
     }
 
     // Fleet-wide bandwidth: sum every miner's cumulative bytes at each whole
@@ -453,7 +510,25 @@ fn analyze(
         peak_bw_bps,
         conv,
         final_expected,
+        per_miner,
     }
+}
+
+/// Steady-state on-wire byte rate (down+up) for one miner: difference its
+/// cumulative `bytes_total` between its first and last *settled* sample, over
+/// that span. Restricting to settled samples excludes the connection-setup
+/// burst and post-event transients, matching the fleet bandwidth's intent.
+/// Returns 0 when there is under a second of settled span.
+fn miner_steady_bw(pts: &[Sample], settled: &dyn Fn(f64) -> bool) -> f64 {
+    let s: Vec<&Sample> = pts.iter().filter(|s| s.connected && settled(s.t)).collect();
+    let (Some(first), Some(last)) = (s.first(), s.last()) else {
+        return 0.0;
+    };
+    let dt = last.t - first.t;
+    if dt <= 0.0 {
+        return 0.0;
+    }
+    last.bytes_total.saturating_sub(first.bytes_total) as f64 / dt
 }
 
 // ---------- output: JSON ----------
@@ -489,13 +564,33 @@ fn build_json(runs: &BTreeMap<(String, String), RunMetrics>) -> String {
             .iter()
             .map(|(mn, e, conn)| format!("{{\"{mn}\":{{\"expected\":{e:.2},\"conn\":{conn}}}}}"))
             .collect();
+        let per_miner: Vec<String> = m
+            .per_miner
+            .iter()
+            .map(|w| {
+                format!(
+                    "{{\"miner\":\"{}\",\"settled_p50\":{},\"settled_max\":{},\"op_spm\":{},\
+                     \"bw_bps\":{:.1},\"updates\":{},\"never\":{},\"final_expected\":{:.2},\"conn\":{}}}",
+                    w.name,
+                    jf(w.settled_p50),
+                    jf(w.settled_max),
+                    jf(w.op_spm),
+                    w.bw_bps,
+                    w.updates,
+                    w.never,
+                    w.final_expected,
+                    w.connected,
+                )
+            })
+            .collect();
         let _ = writeln!(
             s,
             "  \"{algo}__{scen}\": {{\"algo\":\"{algo}\",\"scenario\":\"{scen}\",\
              \"exit\":{},\"wall\":{},\"tmax\":{:.0},\"miners\":{},\
              \"settled_p50\":{},\"settled_p99\":{},\"over_p50\":{},\"peak_over_spm\":{},\
              \"total_updates\":{},\"updates_per_hr\":{:.1},\
-             \"avg_bw_bps\":{:.1},\"peak_bw_bps\":{:.1},\"conv_events\":[{}],\"final\":[{}]}}{}",
+             \"avg_bw_bps\":{:.1},\"peak_bw_bps\":{:.1},\"conv_events\":[{}],\"final\":[{}],\
+             \"per_miner\":[{}]}}{}",
             m.exit.map(|v| v.to_string()).unwrap_or("null".into()),
             m.wall.map(|v| v.to_string()).unwrap_or("null".into()),
             m.tmax,
@@ -510,6 +605,7 @@ fn build_json(runs: &BTreeMap<(String, String), RunMetrics>) -> String {
             m.peak_bw_bps,
             conv.join(","),
             fin.join(","),
+            per_miner.join(","),
             if i + 1 < n { "," } else { "" }
         );
     }
@@ -777,6 +873,86 @@ fn median(mut xs: Vec<f64>) -> f64 {
     xs[xs.len() / 2]
 }
 
+/// Section 3: per-miner breakout. The aggregate tables pool every miner's
+/// samples into one distribution per run, which hides a bimodal fleet (some
+/// miners parked on setpoint, others stuck off-target). This section drills
+/// into each run's individual miners, sorted worst-first by settled error, and
+/// highlights the [`WORST_N`] worst so a lurking off-target subset is visible.
+fn per_miner_section(runs: &BTreeMap<(String, String), RunMetrics>) -> String {
+    let mut h = String::new();
+    h.push_str("<h2>3. Per-miner breakout (worst offenders highlighted)</h2>");
+    let _ = write!(h,
+        "<p class=note>Each run's miners individually, sorted worst-first by settled accuracy \
+         (|expected−setpoint|/setpoint). The <b class=fail>{WORST_N} worst</b> per run are \
+         highlighted — a fleet whose pooled p50 looks fine can still have a stuck-off-target \
+         subset here. <b>op spm</b> = median settled operating point (setpoint {SETPOINT:.0}); \
+         <b>bw</b> = that miner's steady-state on-wire rate (down+up). Fleets are collapsed; \
+         click a run to expand.</p>"
+    );
+    // Group runs by scenario so all four algorithms sit together.
+    let mut by_scen: BTreeMap<&str, Vec<(&str, &RunMetrics)>> = BTreeMap::new();
+    for ((algo, scen), m) in runs {
+        by_scen.entry(scen.as_str()).or_default().push((algo.as_str(), m));
+    }
+    for (scen, mut algo_runs) in by_scen {
+        // Stable algo order (classic, pid, qpid, champion).
+        algo_runs.sort_by_key(|(a, _)| ALGOS.iter().position(|x| x == a).unwrap_or(9));
+        let _ = write!(h, "<h3>{}</h3>", esc(scen));
+        for (algo, m) in algo_runs {
+            // Sort a copy of the per-miner rollups worst-first by settled p50
+            // (NaN — no settled samples — sinks to the bottom).
+            let mut miners: Vec<&MinerMetrics> = m.per_miner.iter().collect();
+            miners.sort_by(|a, b| {
+                let (x, y) = (a.settled_p50, b.settled_p50);
+                match (x.is_nan(), y.is_nan()) {
+                    (true, true) => std::cmp::Ordering::Equal,
+                    (true, false) => std::cmp::Ordering::Greater,
+                    (false, true) => std::cmp::Ordering::Less,
+                    (false, false) => y.total_cmp(&x),
+                }
+            });
+            // Summarize the fleet spread in the <summary> so a run worth
+            // expanding is obvious without opening it.
+            let worst = miners.first();
+            let worst_txt = worst
+                .map(|w| format!("worst {}: p50 {}, op {} spm", w.name, fnum(w.settled_p50, 2), fnum(w.op_spm, 2)))
+                .unwrap_or_else(|| "no miners".into());
+            let n_off = miners.iter().filter(|w| !w.settled_p50.is_nan() && w.settled_p50 > BAND).count();
+            let _ = write!(h,
+                "<details><summary><b>{algo}</b> — {} miners, {n_off} off-target (settled p50 &gt; {:.0}%); {}</summary>",
+                m.per_miner.len(), BAND * 100.0, esc(&worst_txt)
+            );
+            h.push_str("<table><tr><th>#</th><th>miner</th><th>settled p50</th><th>settled max</th>\
+                        <th>op spm</th><th>bw</th><th>updates</th><th>never</th><th>final spm</th><th>conn</th></tr>");
+            for (i, w) in miners.iter().enumerate() {
+                let hot = i < WORST_N && !w.settled_p50.is_nan() && w.settled_p50 > BAND;
+                let row_cls = if hot { " class=hot" } else { "" };
+                // Flag the operating point when it sits outside the band.
+                let op_off = !w.op_spm.is_nan() && (w.op_spm - SETPOINT).abs() / SETPOINT > BAND;
+                let never_cls = if w.never > 0 { " class=fail" } else { "" };
+                let conn = if w.connected { "up" } else { "<span class=warn>down</span>" };
+                let _ = write!(h,
+                    "<tr{row_cls}><td>{}</td><td>{}</td><td>{}</td><td>{}</td>\
+                     <td{}>{}</td><td>{}</td><td>{}</td><td{never_cls}>{}</td><td>{}</td><td>{}</td></tr>",
+                    i + 1,
+                    esc(&w.name),
+                    fnum(w.settled_p50, 3),
+                    fnum(w.settled_max, 3),
+                    if op_off { " class=hot" } else { "" },
+                    fnum(w.op_spm, 2),
+                    fmt_bps(w.bw_bps),
+                    w.updates,
+                    w.never,
+                    fnum(w.final_expected, 2),
+                    conn,
+                );
+            }
+            h.push_str("</table></details>");
+        }
+    }
+    h
+}
+
 fn build_html(
     runs: &BTreeMap<(String, String), RunMetrics>,
     events_by_scen: &BTreeMap<String, (Vec<Event>, Option<u64>)>,
@@ -802,6 +978,7 @@ table{border-collapse:collapse;width:100%;margin:1rem 0;font-size:12.5px}\
 th,td{border:1px solid #21262d;padding:.3rem .5rem;text-align:right}th:first-child,td:first-child{text-align:left}\
 th{color:#8b949e;font-weight:normal;background:#161b22}tr:hover td{background:#161b22}\
 .ok{color:#3fb950}.fail{color:#f85149;font-weight:bold}.warn{color:#d29922}.note{color:#8b949e;font-size:12.5px}\
+tr.hot td{background:#3d1d1d}tr.hot:hover td{background:#4d2525}td.hot{color:#f85149;font-weight:bold}\
 .kpi{display:inline-block;background:#161b22;border:1px solid #30363d;border-radius:6px;padding:.4rem .8rem;margin:.2rem}\
 svg{border:1px solid #21262d;border-radius:6px;margin:.5rem 0;background:#010409}\
 details{margin:.5rem 0}summary{cursor:pointer;color:#79c0ff}\
@@ -963,8 +1140,11 @@ pre{background:#010409;border:1px solid #21262d;border-radius:6px;padding:.5rem;
     }
     h.push_str("</table>");
 
-    // ---- Section 3: per-scenario annotated time series ----
-    h.push_str("<h2>3. Per-scenario time series (annotated)</h2>");
+    // ---- Section 3: per-miner breakout ----
+    h.push_str(&per_miner_section(runs));
+
+    // ---- Section 4: per-scenario annotated time series ----
+    h.push_str("<h2>4. Per-scenario time series (annotated)</h2>");
     h.push_str("<p class=note>Mean expected share-rate across connected miners; dotted verticals mark \
                 scenario events (blue = global setpoint change).</p>");
     for scen in scenarios {
@@ -999,8 +1179,8 @@ pre{background:#010409;border:1px solid #21262d;border-radius:6px;padding:.5rem;
         h.push_str("</table>");
     }
 
-    // ---- Section 4: raw data ----
-    h.push_str("<h2>4. Raw data</h2>");
+    // ---- Section 5: raw data ----
+    h.push_str("<h2>5. Raw data</h2>");
     h.push_str("<p class=note>Per-run CSVs (one row per miner per virtual second) are alongside this \
                 report under <code>raw-csv/</code> (also zipped). Full computed metrics:</p>");
     h.push_str("<details><summary>analysis.json</summary><pre>");

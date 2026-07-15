@@ -89,9 +89,15 @@ cargo run --release --bin vardiff-bench-report -- /tmp/quickbench /tmp/quickbenc
   returned (the controller under-reacts to that direction).
 - **Failures & outliers:** non-zero exits/timeouts, severe overshoot
   (>3× setpoint), stuck-off-target (p99 > 1.0), miners ending >2× setpoint.
+- **Per-miner breakout:** every run's miners individually (settled p50/max,
+  operating point, per-miner bandwidth, updates, never-converged), sorted
+  worst-first with the worst N highlighted. The aggregate tables pool all
+  miners into one distribution per run, which hides a bimodal fleet (some
+  miners on setpoint, others stuck off-target); this section exposes that.
 - **Per-scenario annotated time series:** mean expected share-rate for all four
   algorithms with scenario events marked, plus a per-scenario metric table.
-- **Raw data:** embedded `analysis.json`; per-run CSVs alongside.
+- **Raw data:** embedded `analysis.json` (now including a `per_miner` array per
+  run); per-run CSVs alongside.
 
 The analysis/report tool is `bin/vardiff_bench_report/` — pure Rust, reusing the
 real `Scenario` parser for exact event extraction and emitting dependency-free
