@@ -1095,6 +1095,7 @@ checksum = "32637268377fc7b10a8c6d51de3e7fba1ce5dd371a96e342b34e6078db558e7f"
 [[package]]
 name = "binary_sv2"
 version = "6.0.0"
+source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#1fe3ee31841792e574634878c183289521e85abb"
 dependencies = [
  "buffer_sv2",
  "derive_codec_sv2",
@@ -1279,6 +1280,7 @@ dependencies = [
 [[package]]
 name = "buffer_sv2"
 version = "3.0.1"
+source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#1fe3ee31841792e574634878c183289521e85abb"
 dependencies = [
  "aes-gcm",
 ]
@@ -1430,6 +1432,7 @@ dependencies = [
 [[package]]
 name = "channels_sv2"
 version = "7.0.0"
+source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#1fe3ee31841792e574634878c183289521e85abb"
 dependencies = [
  "binary_sv2",
  "bitcoin",
@@ -1542,6 +1545,7 @@ dependencies = [
 [[package]]
 name = "codec_sv2"
 version = "6.0.0"
+source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#1fe3ee31841792e574634878c183289521e85abb"
 dependencies = [
  "binary_sv2",
  "buffer_sv2",
@@ -1570,6 +1574,7 @@ dependencies = [
 [[package]]
 name = "common_messages_sv2"
 version = "8.0.0"
+source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#1fe3ee31841792e574634878c183289521e85abb"
 dependencies = [
  "binary_sv2",
 ]
@@ -1949,6 +1954,7 @@ dependencies = [
 [[package]]
 name = "derive_codec_sv2"
 version = "1.1.2"
+source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#1fe3ee31841792e574634878c183289521e85abb"
 
 [[package]]
 name = "digest"
@@ -2127,6 +2133,7 @@ dependencies = [
 [[package]]
 name = "extensions_sv2"
 version = "0.2.0"
+source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#1fe3ee31841792e574634878c183289521e85abb"
 dependencies = [
  "binary_sv2",
 ]
@@ -2199,6 +2206,7 @@ dependencies = [
 [[package]]
 name = "framing_sv2"
 version = "7.0.0"
+source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#1fe3ee31841792e574634878c183289521e85abb"
 dependencies = [
  "binary_sv2",
  "buffer_sv2",
@@ -2419,6 +2427,7 @@ dependencies = [
 [[package]]
 name = "handlers_sv2"
 version = "0.5.0"
+source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#1fe3ee31841792e574634878c183289521e85abb"
 dependencies = [
  "binary_sv2",
  "common_messages_sv2",
@@ -3028,6 +3037,7 @@ dependencies = [
 [[package]]
 name = "job_declaration_sv2"
 version = "9.0.0"
+source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#1fe3ee31841792e574634878c183289521e85abb"
 dependencies = [
  "binary_sv2",
 ]
@@ -3287,6 +3297,7 @@ checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 [[package]]
 name = "mining_sv2"
 version = "11.0.0"
+source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#1fe3ee31841792e574634878c183289521e85abb"
 dependencies = [
  "binary_sv2",
 ]
@@ -3340,6 +3351,7 @@ dependencies = [
 [[package]]
 name = "noise_sv2"
 version = "1.4.2"
+source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#1fe3ee31841792e574634878c183289521e85abb"
 dependencies = [
  "aes-gcm",
  "chacha20poly1305",
@@ -3501,6 +3513,7 @@ dependencies = [
 [[package]]
 name = "parsers_sv2"
 version = "0.5.0"
+source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#1fe3ee31841792e574634878c183289521e85abb"
 dependencies = [
  "binary_sv2",
  "common_messages_sv2",
@@ -4673,6 +4686,7 @@ dependencies = [
 [[package]]
 name = "stratum-core"
 version = "0.5.0"
+source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#1fe3ee31841792e574634878c183289521e85abb"
 dependencies = [
  "binary_sv2",
  "bitcoin",
@@ -4695,6 +4709,7 @@ dependencies = [
 [[package]]
 name = "stratum_translation"
 version = "0.4.0"
+source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#1fe3ee31841792e574634878c183289521e85abb"
 dependencies = [
  "binary_sv2",
  "bitcoin",
@@ -4763,6 +4778,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 [[package]]
 name = "sv1_api"
 version = "5.0.0"
+source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#1fe3ee31841792e574634878c183289521e85abb"
 dependencies = [
  "binary_sv2",
  "bitcoin",
@@ -4830,6 +4846,7 @@ dependencies = [
 [[package]]
 name = "template_distribution_sv2"
 version = "6.0.0"
+source = "git+https://github.com/marafoundation/stratum?branch=vardiff-dev#1fe3ee31841792e574634878c183289521e85abb"
 dependencies = [
  "binary_sv2",
 ]
