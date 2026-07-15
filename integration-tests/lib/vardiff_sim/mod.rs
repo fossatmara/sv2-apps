@@ -65,10 +65,26 @@ pub fn virtual_now_secs() -> f64 {
     stratum_apps::stratum_core::channels_sv2::vardiff::sim_clock::now_secs_f64()
 }
 
+/// The PID base tuning the *active* algorithm actually runs when no live
+/// override is set. qpid schedules gains around its own `tuned_base()` (a
+/// higher confidence K and raised down-bar than the PID defaults), so a
+/// dashboard that fell back to the plain PID defaults would misreport qpid's
+/// real operating parameters. classic/pid/champion use the PID defaults.
+fn active_base() -> stratum_apps::stratum_core::channels_sv2::vardiff::pid::PidParams {
+    use stratum_apps::stratum_core::channels_sv2::vardiff::{qpid::QPidVardiffState, pid::PidParams};
+    if algorithm() == "qpid" {
+        QPidVardiffState::tuned_base()
+    } else {
+        PidParams::default()
+    }
+}
+
 /// Current PID confidence shrinkage constant K (live-tunable; embedded
-/// pool only, like the clock speed).
+/// pool only, like the clock speed). Falls back to the active algorithm's base
+/// K (see [`active_base`]) when no live override is set.
 pub fn confidence_k() -> f64 {
-    stratum_apps::stratum_core::channels_sv2::vardiff::tuning::confidence_k()
+    stratum_apps::stratum_core::channels_sv2::vardiff::tuning::confidence_k_override()
+        .unwrap_or_else(|| active_base().confidence_k)
 }
 
 /// Sets the PID confidence shrinkage constant K.
@@ -76,11 +92,11 @@ pub fn set_confidence_k(k: f64) {
     stratum_apps::stratum_core::channels_sv2::vardiff::tuning::set_confidence_k(k)
 }
 
-/// Current PID significance threshold Z (the live override, or the default
-/// when untouched).
+/// Current PID significance threshold Z (the live override, or the active
+/// algorithm's base value when untouched).
 pub fn significance_z() -> f64 {
     stratum_apps::stratum_core::channels_sv2::vardiff::tuning::significance_z_override()
-        .unwrap_or(stratum_apps::stratum_core::channels_sv2::vardiff::pid::DEFAULT_SIGNIFICANCE_Z)
+        .unwrap_or_else(|| active_base().significance_z)
 }
 
 /// Sets the live PID significance-Z override.
@@ -88,12 +104,11 @@ pub fn set_significance_z(z: f64) {
     stratum_apps::stratum_core::channels_sv2::vardiff::tuning::set_significance_z(z)
 }
 
-/// Current downward significance threshold (override or default).
+/// Current downward significance threshold (live override, or the active
+/// algorithm's base value when untouched).
 pub fn significance_z_down() -> f64 {
     stratum_apps::stratum_core::channels_sv2::vardiff::tuning::significance_z_down_override()
-        .unwrap_or(
-            stratum_apps::stratum_core::channels_sv2::vardiff::pid::DEFAULT_SIGNIFICANCE_Z_DOWN,
-        )
+        .unwrap_or_else(|| active_base().significance_z_down)
 }
 
 /// Sets the live downward significance override.
