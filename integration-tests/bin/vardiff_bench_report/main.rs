@@ -3,7 +3,8 @@
 //! Reads the per-run CSVs produced by `benchmark/run-benchmark.sh`
 //! (`<algo>__<scenario>.csv`, one row per miner per virtual second) plus the
 //! scenario TOMLs (reusing the real [`Scenario`] parser for exact event
-//! extraction), computes convergence / accuracy / churn / overshoot metrics,
+//! extraction), computes convergence / accuracy / churn / overshoot /
+//! bandwidth metrics,
 //! and writes a single self-contained HTML report with inline SVG charts —
 //! no Python, no external chart deps.
 //!
@@ -40,6 +41,8 @@ struct Sample {
     realized: f64,
     updates: u64,
     connected: bool,
+    /// Cumulative on-wire SV2 bytes both directions (down+up) for this miner.
+    bytes_total: u64,
 }
 
 /// A scenario event flattened for annotation/analysis.
@@ -74,6 +77,10 @@ struct RunMetrics {
     peak_over_spm: f64,
     total_updates: u64,
     updates_per_hr: f64,
+    /// Fleet-wide on-wire bandwidth (down+up), bytes/sec: mean over the run and
+    /// the peak single-second rate.
+    avg_bw_bps: f64,
+    peak_bw_bps: f64,
     conv: Vec<ConvEvent>,
     final_expected: Vec<(String, f64, bool)>,
 }
@@ -268,6 +275,8 @@ fn load_csv(path: &Path) -> BTreeMap<String, Vec<Sample>> {
         idx("realized_spm"),
         idx("target_updates"),
     );
+    // Bandwidth columns are optional (older CSVs predate them).
+    let (idown, iup) = (idx("bytes_down"), idx("bytes_up"));
     let (Some(it), Some(imn), Some(ic), Some(iexp), Some(ireal), Some(iupd)) =
         (it, imn, ic, iexp, ireal, iupd)
     else {
@@ -286,12 +295,17 @@ fn load_csv(path: &Path) -> BTreeMap<String, Vec<Sample>> {
         ) else {
             continue;
         };
+        let field_u64 = |i: Option<usize>| {
+            i.and_then(|i| f.get(i)).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0)
+        };
+        let bytes_total = field_u64(idown) + field_u64(iup);
         out.entry(f[imn].to_string()).or_default().push(Sample {
             t,
             expected,
             realized,
             updates,
             connected: f[ic] == "1",
+            bytes_total,
         });
     }
     out
@@ -389,6 +403,32 @@ fn analyze(
         }
     }
 
+    // Fleet-wide bandwidth: sum every miner's cumulative bytes at each whole
+    // second, then difference consecutive seconds to recover the per-second
+    // byte-rate. Peak = busiest single second; average = total / duration.
+    let mut fleet_cum: BTreeMap<i64, u64> = BTreeMap::new();
+    for pts in series.values() {
+        for s in pts {
+            *fleet_cum.entry(s.t.round() as i64).or_insert(0) += s.bytes_total;
+        }
+    }
+    let mut peak_bw_bps = 0.0f64;
+    let (mut span, mut delivered) = (0.0f64, 0u64);
+    let mut prev: Option<(i64, u64)> = None;
+    for (&t, &cum) in &fleet_cum {
+        if let Some((pt, pcum)) = prev {
+            let dt = (t - pt) as f64;
+            let dbytes = cum.saturating_sub(pcum);
+            if dt > 0.0 {
+                peak_bw_bps = peak_bw_bps.max(dbytes as f64 / dt);
+                span += dt;
+                delivered += dbytes;
+            }
+        }
+        prev = Some((t, cum));
+    }
+    let avg_bw_bps = if span > 0.0 { delivered as f64 / span } else { 0.0 };
+
     settled_err.sort_by(f64::total_cmp);
     over.sort_by(f64::total_cmp);
     final_expected.sort_by(|a, b| a.0.cmp(&b.0));
@@ -409,6 +449,8 @@ fn analyze(
         } else {
             0.0
         },
+        avg_bw_bps,
+        peak_bw_bps,
         conv,
         final_expected,
     }
@@ -452,7 +494,8 @@ fn build_json(runs: &BTreeMap<(String, String), RunMetrics>) -> String {
             "  \"{algo}__{scen}\": {{\"algo\":\"{algo}\",\"scenario\":\"{scen}\",\
              \"exit\":{},\"wall\":{},\"tmax\":{:.0},\"miners\":{},\
              \"settled_p50\":{},\"settled_p99\":{},\"over_p50\":{},\"peak_over_spm\":{},\
-             \"total_updates\":{},\"updates_per_hr\":{:.1},\"conv_events\":[{}],\"final\":[{}]}}{}",
+             \"total_updates\":{},\"updates_per_hr\":{:.1},\
+             \"avg_bw_bps\":{:.1},\"peak_bw_bps\":{:.1},\"conv_events\":[{}],\"final\":[{}]}}{}",
             m.exit.map(|v| v.to_string()).unwrap_or("null".into()),
             m.wall.map(|v| v.to_string()).unwrap_or("null".into()),
             m.tmax,
@@ -463,6 +506,8 @@ fn build_json(runs: &BTreeMap<(String, String), RunMetrics>) -> String {
             jf(m.peak_over_spm),
             m.total_updates,
             m.updates_per_hr,
+            m.avg_bw_bps,
+            m.peak_bw_bps,
             conv.join(","),
             fin.join(","),
             if i + 1 < n { "," } else { "" }
@@ -700,6 +745,20 @@ fn fnum(x: f64, d: usize) -> String {
     }
 }
 
+/// Human-readable byte-rate (B/s, kB/s, MB/s) for the bandwidth columns.
+fn fmt_bps(bps: f64) -> String {
+    if bps.is_nan() {
+        return "—".into();
+    }
+    if bps >= 1e6 {
+        format!("{:.2} MB/s", bps / 1e6)
+    } else if bps >= 1e3 {
+        format!("{:.2} kB/s", bps / 1e3)
+    } else {
+        format!("{bps:.0} B/s")
+    }
+}
+
 fn exit_cell(rc: Option<i32>) -> (&'static str, String) {
     match rc {
         None => ("warn", "?".into()),
@@ -771,7 +830,8 @@ pre{background:#010409;border:1px solid #21262d;border-radius:6px;padding:.5rem;
     // ---- Section 1: aggregate summary ----
     h.push_str("<h2>1. Summary — aggregate per algorithm</h2>");
     h.push_str("<table><tr><th>algorithm</th><th>runs</th><th>settled p50</th><th>settled p99</th>\
-                <th>peak spm (max)</th><th>updates/hr (median)</th><th>failures</th></tr>");
+                <th>peak spm (max)</th><th>updates/hr (median)</th>\
+                <th>avg bw (median)</th><th>peak bw (max)</th><th>failures</th></tr>");
     for algo in ALGOS {
         let rs: Vec<&RunMetrics> = runs.values().filter(|m| m.algo == algo).collect();
         let med = |f: &dyn Fn(&RunMetrics) -> f64| median(rs.iter().map(|m| f(m)).collect());
@@ -780,14 +840,17 @@ pre{background:#010409;border:1px solid #21262d;border-radius:6px;padding:.5rem;
             .map(|m| m.peak_over_spm)
             .filter(|v| !v.is_nan())
             .fold(f64::NAN, |a, b| if a.is_nan() { b } else { a.max(b) });
+        let peak_bw_max = rs.iter().map(|m| m.peak_bw_bps).fold(0.0f64, f64::max);
         let nf = rs.iter().filter(|m| !matches!(m.exit, Some(0) | None)).count();
         let _ = write!(h,
-            "<tr><td>{algo}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td class={}>{nf}</td></tr>",
+            "<tr><td>{algo}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td class={}>{nf}</td></tr>",
             rs.len(),
             fnum(med(&|m| m.settled_p50), 3),
             fnum(med(&|m| m.settled_p99), 3),
             fnum(peak_max, 1),
             fnum(med(&|m| m.updates_per_hr), 1),
+            fmt_bps(med(&|m| m.avg_bw_bps)),
+            fmt_bps(peak_bw_max),
             if nf > 0 { "fail" } else { "ok" }
         );
     }
@@ -798,6 +861,8 @@ pre{background:#010409;border:1px solid #21262d;border-radius:6px;padding:.5rem;
         ("settled_p50", "Settled accuracy — median |expected−setpoint|/setpoint (lower=better)", "", &(|m: &RunMetrics| m.settled_p50) as &dyn Fn(&RunMetrics) -> f64),
         ("peak", "Peak expected spm — max overshoot (setpoint=4)", "spm", &(|m: &RunMetrics| m.peak_over_spm)),
         ("churn", "SetTarget churn — median updates/hr (lower=calmer)", "/hr", &(|m: &RunMetrics| m.updates_per_hr)),
+        ("avg_bw", "Avg fleet bandwidth — median B/s down+up (lower=leaner)", "B/s", &(|m: &RunMetrics| m.avg_bw_bps)),
+        ("peak_bw", "Peak fleet bandwidth — max B/s down+up in any 1s (lower=burst-safe)", "B/s", &(|m: &RunMetrics| m.peak_bw_bps)),
     ] {
         let vals: Vec<(String, f64)> = ALGOS
             .iter()
@@ -805,6 +870,8 @@ pre{background:#010409;border:1px solid #21262d;border-radius:6px;padding:.5rem;
                 let rs: Vec<&RunMetrics> = runs.values().filter(|m| &m.algo == a).collect();
                 let v = if key == "peak" {
                     rs.iter().map(|m| m.peak_over_spm).filter(|x| !x.is_nan()).fold(0.0, f64::max)
+                } else if key == "peak_bw" {
+                    rs.iter().map(|m| m.peak_bw_bps).fold(0.0, f64::max)
                 } else {
                     median(rs.iter().map(|m| f(m)).collect())
                 };

@@ -96,7 +96,9 @@ async fn run_miner_inner(
             .try_into()
             .expect("static max target is valid"),
     };
-    send_mining(&sender, Mining::OpenStandardMiningChannel(open_channel)).await?;
+    // Setup handshake bytes count toward upstream too (one-time per channel).
+    let up = send_mining(&sender, Mining::OpenStandardMiningChannel(open_channel)).await?;
+    emit(MinerEvent::Bytes { down: 0, up }).await;
 
     let mut state = MinerState {
         hashrate: config.hashrate,
@@ -127,6 +129,9 @@ async fn run_miner_inner(
                 let mut frame: StdFrame = frame
                     .try_into()
                     .map_err(|e| format!("bad frame: {e:?}"))?;
+                // Downstream wire cost: SV2 header + payload of every frame the
+                // pool sends this miner (SetTarget, share acks, jobs, prevhash).
+                emit(MinerEvent::Bytes { down: frame.encoded_length() as u64, up: 0 }).await;
                 let message_type = frame
                     .get_header()
                     .ok_or_else(|| "frame without header".to_string())?
@@ -179,7 +184,8 @@ async fn run_miner_inner(
                     if let Some(delay) = state.delivery_delay() {
                         tokio::time::sleep(delay).await;
                     }
-                    send_mining(&sender, Mining::SubmitSharesStandard(share)).await?;
+                    let up = send_mining(&sender, Mining::SubmitSharesStandard(share)).await?;
+                    emit(MinerEvent::Bytes { down: 0, up }).await;
                     emit(MinerEvent::ShareSubmitted { sequence }).await;
                 }
                 next_share_at = state.resample_share_timer();
@@ -424,12 +430,16 @@ async fn setup_connection(
     }
 }
 
-async fn send_mining(sender: &Sender<EitherFrame>, message: Mining<'static>) -> Result<(), String> {
+/// Sends a mining message upstream; returns the on-wire frame size (SV2 header
+/// + payload) so callers can tally upstream bandwidth.
+async fn send_mining(sender: &Sender<EitherFrame>, message: Mining<'static>) -> Result<u64, String> {
     let frame: StdFrame = MiningDeviceMessages::Mining(message)
         .try_into()
         .map_err(|e| format!("failed to frame message: {e:?}"))?;
+    let size = frame.encoded_length() as u64;
     sender
         .send(frame.into())
         .await
-        .map_err(|e| format!("failed to send message: {e}"))
+        .map_err(|e| format!("failed to send message: {e}"))?;
+    Ok(size)
 }

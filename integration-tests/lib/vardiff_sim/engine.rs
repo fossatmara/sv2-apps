@@ -73,6 +73,10 @@ pub struct MinerStats {
     pub rejected: u64,
     pub target_updates: u64,
     pub disconnects: u64,
+    /// Cumulative on-wire SV2 bytes (header + payload) in each direction:
+    /// `bytes_down` = pool->miner, `bytes_up` = miner->pool.
+    pub bytes_down: u64,
+    pub bytes_up: u64,
     pub last_error: Option<String>,
     /// Virtual timestamps of recent share submissions.
     share_times: VecDeque<f64>,
@@ -645,6 +649,10 @@ impl SimEngine {
                 MinerEvent::HashrateChanged { hashrate } => {
                     stats.hashrate = hashrate;
                 }
+                MinerEvent::Bytes { down, up } => {
+                    stats.bytes_down += down;
+                    stats.bytes_up += up;
+                }
                 MinerEvent::Disconnected { reason } => {
                     stats.connected = false;
                     stats.channel_id = None;
@@ -754,7 +762,7 @@ impl CsvWriter {
         let mut file = std::fs::File::create(path)?;
         writeln!(
             file,
-            "t_secs,miner,connected,hashrate,difficulty,expected_spm,realized_spm,submitted,accepted,rejected,target_updates"
+            "t_secs,miner,connected,hashrate,difficulty,expected_spm,realized_spm,submitted,accepted,rejected,target_updates,bytes_down,bytes_up"
         )?;
         Ok(Self { file })
     }
@@ -772,7 +780,7 @@ impl CsvWriter {
             let s = &engine.stats[&name];
             writeln!(
                 self.file,
-                "{t:.1},{name},{},{},{},{},{},{},{},{},{}",
+                "{t:.1},{name},{},{},{},{},{},{},{},{},{},{},{}",
                 s.connected as u8,
                 s.hashrate,
                 s.difficulty,
@@ -782,6 +790,8 @@ impl CsvWriter {
                 s.accepted,
                 s.rejected,
                 s.target_updates,
+                s.bytes_down,
+                s.bytes_up,
             )?;
         }
         Ok(())

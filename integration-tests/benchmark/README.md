@@ -75,7 +75,14 @@ cargo run --release --bin vardiff-bench-report -- /tmp/quickbench /tmp/quickbenc
 ## Metrics (report sections)
 
 - **Aggregate summary** per algorithm: settled accuracy p50/p99, peak overshoot,
-  update churn, failure count.
+  update churn, network bandwidth (average + peak), failure count.
+- **Bandwidth** (total both directions): the on-wire SV2 byte cost of each
+  frame (6-byte header + payload) is tallied at the miner — the same
+  per-connection point that injects latency — separately for pool→miner
+  (SetTarget, acks, jobs) and miner→pool (setup, shares). Reported as the
+  fleet-wide **average** B/s over the run and the **peak** single-second rate
+  (the worst burst). A chattier controller (more SetTarget churn) shows up here
+  directly.
 - **Convergence** after hashrate-step events: up (raise difficulty) / down
   (lower) median + max time to re-enter the ±20 % band, and a **"never
   converged"** count — a step that knocked the miner out of band and it never

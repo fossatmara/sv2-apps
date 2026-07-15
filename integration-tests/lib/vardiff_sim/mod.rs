@@ -175,6 +175,9 @@ pub enum MinerEvent {
     SharesAccepted { count: u32 },
     ShareRejected { code: String },
     HashrateChanged { hashrate: f64 },
+    /// On-wire SV2 frame bytes for one message (header + payload). `down` =
+    /// pool->miner (acks, SetTarget, jobs), `up` = miner->pool (shares, setup).
+    Bytes { down: u64, up: u64 },
     Disconnected { reason: String },
 }
 
