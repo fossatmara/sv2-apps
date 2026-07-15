@@ -268,7 +268,39 @@ impl VardiffFactory {
                     gamma: self.config.gamma,
                     epsilon: self.config.epsilon,
                 };
-                let mut state = QPidVardiffState::with_params(table, q_params, pid_params)?;
+                // qpid schedules gains around its own live-validated base
+                // (`tuned_base()`: kp 0.9, significance_z_down 2.5, K 4.0), not
+                // the plain-PID defaults the shared VardiffConfig falls back to.
+                // The shared config can't flag which fields the operator set, so
+                // treat a value equal to the PID default as "unset" and yield to
+                // the qpid base; a value the operator changed still wins.
+                use stratum_apps::stratum_core::channels_sv2::vardiff::pid as piddef;
+                let base = QPidVardiffState::tuned_base();
+                let pick = |cfg: f64, dflt: f64, base: f64| if cfg != dflt { cfg } else { base };
+                let qpid_params = PidParams {
+                    kp: pick(self.config.kp, piddef::DEFAULT_KP, base.kp),
+                    ki: pick(self.config.ki, piddef::DEFAULT_KI, base.ki),
+                    kd: pick(self.config.kd, piddef::DEFAULT_KD, base.kd),
+                    significance_z: pick(
+                        self.config.significance_z,
+                        piddef::DEFAULT_SIGNIFICANCE_Z,
+                        base.significance_z,
+                    ),
+                    significance_z_down: pick(
+                        self.config.significance_z_down,
+                        piddef::DEFAULT_SIGNIFICANCE_Z_DOWN,
+                        base.significance_z_down,
+                    ),
+                    // Not gain-scheduled by qpid; the shared config governs them
+                    // (and equals the base default when the operator leaves them).
+                    max_step: self.config.max_step,
+                    deadband: self.config.deadband,
+                    tracking_secs: self.config.tracking_secs,
+                    // No config field yet; take qpid's tuned confidence constant.
+                    confidence_k: base.confidence_k,
+                    ..PidParams::default()
+                };
+                let mut state = QPidVardiffState::with_params(table, q_params, qpid_params)?;
                 state.set_telemetry_key(user_identity.to_string());
                 Ok(Box::new(state))
             }

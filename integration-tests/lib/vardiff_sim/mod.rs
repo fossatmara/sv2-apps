@@ -154,14 +154,19 @@ pub fn set_algorithm(name: &str) -> bool {
     true
 }
 
-/// Current manual gain values (override, else pid defaults).
+/// Current manual gain values (live override, else the active algorithm's
+/// base gains — see [`active_base`]). For qpid this is its `tuned_base()`
+/// starting point (kp 0.9, ki 0.008), not the plain-PID defaults; the learner
+/// schedules around it, and the per-miner telemetry chart shows the live
+/// scheduled values.
 pub fn manual_gains() -> (f64, f64, f64) {
-    use stratum_apps::stratum_core::channels_sv2::vardiff::{pid, tuning};
+    use stratum_apps::stratum_core::channels_sv2::vardiff::tuning;
     let (kp, ki, kd) = tuning::gain_overrides();
+    let base = active_base();
     (
-        kp.unwrap_or(pid::DEFAULT_KP),
-        ki.unwrap_or(pid::DEFAULT_KI),
-        kd.unwrap_or(pid::DEFAULT_KD),
+        kp.unwrap_or(base.kp),
+        ki.unwrap_or(base.ki),
+        kd.unwrap_or(base.kd),
     )
 }
 
