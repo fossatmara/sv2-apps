@@ -467,11 +467,17 @@ async fn main() {
     // sampling at the same fidelity whether the run is real-time or accelerated.
     //
     // wall_interval = virtual_step / speed, clamped so the loop neither busy-
-    // spins at very high speed nor lurches (>100ms) at speed 1. At speed 1 this
-    // is the old 100ms; at speed 64 it tightens to the 5ms floor (~0.32 virtual
-    // sec/tick) — a ~20x finer virtual resolution than the old fixed interval.
+    // spins at very high speed nor lurches (>100ms) at speed 1. The 1ms floor
+    // holds the exact 0.1s virtual-step target all the way through speed 100
+    // (each drain is a cheap lock + counter reads + a few CSV lines, so ~1000
+    // iters/wall-sec is trivial CPU, and 1ms is within tokio's honorable timer
+    // resolution). Above ~100x the floor engages and the virtual step grows
+    // with speed again (0.26s at 256x), so event-application lag creeps back —
+    // very high speeds are inherently approximate here anyway, since the miner
+    // tasks run in real wall-time async and generate shares between drains at
+    // the pre-event hashrate. Keep tuning-grade runs at SPEED<=64.
     const VIRTUAL_STEP_SECS: f64 = 0.1; // target virtual time per drain tick
-    const MIN_WALL_MS: f64 = 5.0; // busy-spin floor
+    const MIN_WALL_MS: f64 = 1.0; // busy-spin / timer-resolution floor
     const MAX_WALL_MS: f64 = 100.0; // responsiveness ceiling (speed 1)
     loop {
         let drain_wall_ms =
