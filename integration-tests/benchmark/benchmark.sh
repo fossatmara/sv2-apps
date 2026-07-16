@@ -149,6 +149,17 @@ run_benchmark() {
   [ "$heavy_cap" -gt "$MAX_PARALLEL" ] && heavy_cap="$MAX_PARALLEL"
   is_heavy() { [ "$(grep -c '^\[\[miners\]\]' "scenarios/$1.toml")" -ge 20 ]; }
 
+  # Per-launch stagger, in WALL seconds, scaled by speed. Its job is to spread
+  # pool-startup load over wall time; but at speed S a run also *finishes* in
+  # ~1/S the wall time, so a fixed stagger caps steady concurrency at
+  # run_wall/stagger — e.g. at SPEED=64 a ~15s run with a 4s stagger tops out at
+  # ~4 concurrent, wasting MAX_PARALLEL. Scaling the stagger by 1/S keeps
+  # concurrency speed-invariant. Floored at 0.2s so startups still don't all
+  # land in the same instant. base: 4s light / 8s heavy at SPEED=1.
+  local light_stagger heavy_stagger
+  light_stagger="$(awk -v s="$SPEED" 'BEGIN{d=4/s; if(d<0.2)d=0.2; print d}')"
+  heavy_stagger="$(awk -v s="$SPEED" 'BEGIN{d=8/s; if(d<0.2)d=0.2; print d}')"
+
   # Pass 1: heavy scenarios, low concurrency.
   local scen algo rep
   for scen in $scenarios; do
@@ -157,7 +168,7 @@ run_benchmark() {
       for rep in $(seq 1 "$REPS"); do
         while [ "$(jobs_running)" -ge "$heavy_cap" ]; do sleep 2; done
         run_one "$algo" "$scen" "$rep" &
-        sleep 8
+        sleep "$heavy_stagger"
       done
     done
   done
@@ -170,7 +181,7 @@ run_benchmark() {
       for rep in $(seq 1 "$REPS"); do
         while [ "$(jobs_running)" -ge "$MAX_PARALLEL" ]; do sleep 2; done
         run_one "$algo" "$scen" "$rep" &
-        sleep 4
+        sleep "$light_stagger"
       done
     done
   done
