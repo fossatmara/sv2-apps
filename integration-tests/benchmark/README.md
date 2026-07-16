@@ -52,8 +52,19 @@ Flags: `--report-only` (skip build+run), `--no-report` (build+run only),
 | `SCENARIOS` | all `scenarios/*.toml` | scenario names (space-separated) |
 | `SPM` | `4` | vardiff setpoint (shares/minute) |
 | `SPEED` | `1` | sim clock speed (1 = real time; the point of this bench) |
-| `MAX_PARALLEL` | `6` | concurrent runs |
+| `REPS` | `1` | repeats per (algo,scenario); the report pools a run's reps |
+| `MAX_PARALLEL` | `12` | concurrent runs (light scenarios; heavy capped by `HEAVY_PARALLEL`, default 4) |
 | `DURATION_MARGIN` | `30` | extra virtual seconds appended to each scenario |
+
+**Reps (`REPS`).** A single run of a small-fleet scenario is noisy: the miners'
+Poisson share arrivals vary run-to-run more than most real algorithm
+differences, so single-run convergence/bandwidth numbers aren't trustworthy.
+`REPS=N` runs each (algo, scenario) N times (CSVs suffixed `__repN`) and the
+report **pools all reps of a run** — each rep's miners are namespaced
+`<miner>@repN` and analyzed as one union, so never-converged sums across reps
+and settled/operating-point/bandwidth percentiles average over the pool. Use
+`REPS>=5` before drawing tuning conclusions. `REPS=1` writes the plain
+`<algo>__<scenario>.csv` (unchanged, back-compatible).
 
 ## What's committed vs regenerable
 

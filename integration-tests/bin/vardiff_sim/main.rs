@@ -457,16 +457,28 @@ async fn main() {
     // 100ms wall tick spans several virtual seconds) we catch up and emit a
     // row for each skipped second, so downstream analysis sees no gaps.
     let mut last_csv_secs: Option<u64> = None;
-    // Drain on a FIXED short WALL interval, decoupled from sim speed: this
-    // advances difficulty points / rate-error samples / the chart's right edge
-    // ~10x/sec so the live dashboard streams smoothly instead of lurching once
-    // per wall second (the old `1/speed` sleep drained only 1x/sec at speed 1).
-    // Every event counter is drained exactly-once and every sampler is
-    // virtual-clock-gated, so a faster wall drain cannot double-count.
-    const DRAIN_INTERVAL: Duration = Duration::from_millis(100);
+    // Drain cadence targets a fixed amount of VIRTUAL time per tick, not wall
+    // time, so the simulation's time resolution is speed-invariant. A fixed
+    // wall interval would degrade with acceleration: at 100ms wall and speed
+    // 64, one tick spans 6.4 virtual seconds, so scenario events (applied here,
+    // gated on virtual time) land up to 6.4s late and shares between drains see
+    // a stale hashrate — which measurably distorts convergence at high speed.
+    // Holding the *virtual* step constant keeps event-application and CSV
+    // sampling at the same fidelity whether the run is real-time or accelerated.
+    //
+    // wall_interval = virtual_step / speed, clamped so the loop neither busy-
+    // spins at very high speed nor lurches (>100ms) at speed 1. At speed 1 this
+    // is the old 100ms; at speed 64 it tightens to the 5ms floor (~0.32 virtual
+    // sec/tick) — a ~20x finer virtual resolution than the old fixed interval.
+    const VIRTUAL_STEP_SECS: f64 = 0.1; // target virtual time per drain tick
+    const MIN_WALL_MS: f64 = 5.0; // busy-spin floor
+    const MAX_WALL_MS: f64 = 100.0; // responsiveness ceiling (speed 1)
     loop {
+        let drain_wall_ms =
+            (VIRTUAL_STEP_SECS * 1000.0 / engine.lock().expect("engine lock").speed())
+                .clamp(MIN_WALL_MS, MAX_WALL_MS);
         tokio::select! {
-            _ = tokio::time::sleep(DRAIN_INTERVAL) => {}
+            _ = tokio::time::sleep(Duration::from_secs_f64(drain_wall_ms / 1000.0)) => {}
             _ = shutdown_signal.recv() => {
                 println!("signal received, shutting down...");
                 break;

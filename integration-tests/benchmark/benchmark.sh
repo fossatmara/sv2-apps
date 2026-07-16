@@ -26,14 +26,21 @@
 #   SCENARIOS="convergence step-change" scenario names (default: all scenarios/*.toml)
 #   SPM=4              vardiff setpoint (shares/minute)
 #   SPEED=1            sim clock speed (1 = real wall time, the point of this bench)
-#   MAX_PARALLEL=6     concurrent runs
+#   REPS=1             repeats per (algo,scenario). >1 runs each combo N times;
+#                      the report pools a run's reps so convergence/bandwidth
+#                      metrics average out per-run Poisson share-timing noise
+#                      (single-run numbers on small fleets are noisy — see below).
+#   MAX_PARALLEL=12    concurrent runs (light scenarios). Sized for the
+#                      no-bitcoind sim: one run peaks ~33 MB / mostly idle-wait
+#                      at SPEED=1, so this is well within a 24-core / 46 GB box.
 #   DURATION_MARGIN=30 extra virtual seconds appended to each scenario's duration
 #
 # Each run is an independent process with its own pool + in-process mock
 # template provider (port-keyed, so parallel runs don't collide). Output:
-#   OUTDIR/<algo>__<scenario>.csv   one row per miner per virtual second
-#   OUTDIR/<algo>__<scenario>.log   stdout/stderr
-#   OUTDIR/_progress.log            "<tag> exit=<rc> wall=<s>s dur=<s>s" per run
+#   OUTDIR/<algo>__<scenario>.csv        one row per miner per virtual second
+#   OUTDIR/<algo>__<scenario>__repN.csv  same, when REPS>1 (pooled by the report)
+#   OUTDIR/<algo>__<scenario>[__repN].log   stdout/stderr
+#   OUTDIR/_progress.log                 "<tag> exit=<rc> wall=<s>s dur=<s>s" per run
 #
 # Committed report outputs (full-pipeline / --report-only, default OUTDIR):
 #   benchmark-report/vardiff-walltime-report.html
@@ -78,9 +85,10 @@ fi
 BIN="$IT_DIR/target/release/vardiff-sim"
 SPM="${SPM:-4}"
 SPEED="${SPEED:-1}"
-MAX_PARALLEL="${MAX_PARALLEL:-6}"
+MAX_PARALLEL="${MAX_PARALLEL:-12}"
 DURATION_MARGIN="${DURATION_MARGIN:-30}"
 ALGOS="${ALGOS:-classic pid qpid champion}"
+REPS="${REPS:-1}"
 
 if [ "$REPORT_ONLY" = "1" ] && [ "$NO_REPORT" = "1" ]; then
   echo "error: --report-only and --no-report are mutually exclusive" >&2
@@ -104,14 +112,22 @@ run_benchmark() {
 
   mkdir -p "$OUTDIR"
   : >"$OUTDIR/_progress.log"
-  echo "benchmark: algos=[$ALGOS] speed=$SPEED spm=$SPM parallel=$MAX_PARALLEL out=$OUTDIR" | tee -a "$OUTDIR/_progress.log"
+  echo "benchmark: algos=[$ALGOS] speed=$SPEED spm=$SPM reps=$REPS parallel=$MAX_PARALLEL out=$OUTDIR" | tee -a "$OUTDIR/_progress.log"
 
+  # One run of (algo, scenario, rep). With REPS=1 the CSV is the plain
+  # <algo>__<scenario>.csv (back-compat); with REPS>1 each rep gets a
+  # __repN suffix and the report tool pools all reps of a run together, so
+  # convergence/bandwidth stats average out per-run Poisson share-timing noise
+  # (a tiny fleet's share arrivals vary run-to-run more than any real
+  # algorithm difference — the reason single-run numbers are untrustworthy).
   run_one() {
-    local algo="$1" scen="$2"
+    local algo="$1" scen="$2" rep="$3"
     local dur
     dur="$(grep -m1 duration_secs "scenarios/${scen}.toml" | grep -oE '[0-9]+')"
     dur="${dur:-600}"
-    local tag="${algo}__${scen}" t0 t1 rc
+    local tag="${algo}__${scen}"
+    [ "$REPS" -gt 1 ] && tag="${tag}__rep${rep}"
+    local t0 t1 rc
     t0="$(date +%s)"
     # timeout margin generous over duration so real-time runs finish cleanly.
     timeout "$((dur + 180))" "$BIN" --spawn-pool --algorithm "$algo" \
@@ -126,17 +142,23 @@ run_benchmark() {
   jobs_running() { jobs -rp | wc -l; }
 
   # Heavy scenarios (many miners) run with reduced concurrency so their
-  # connection storms don't starve a full parallel batch.
+  # connection storms don't starve a full parallel batch. Capped at
+  # min(MAX_PARALLEL, HEAVY_PARALLEL) — kept low deliberately: heavy runs are
+  # startup-storm-bound, not resource-bound.
+  local heavy_cap="${HEAVY_PARALLEL:-4}"
+  [ "$heavy_cap" -gt "$MAX_PARALLEL" ] && heavy_cap="$MAX_PARALLEL"
   is_heavy() { [ "$(grep -c '^\[\[miners\]\]' "scenarios/$1.toml")" -ge 20 ]; }
 
   # Pass 1: heavy scenarios, low concurrency.
-  local scen algo
+  local scen algo rep
   for scen in $scenarios; do
     is_heavy "$scen" || continue
     for algo in $ALGOS; do
-      while [ "$(jobs_running)" -ge 2 ]; do sleep 2; done
-      run_one "$algo" "$scen" &
-      sleep 8
+      for rep in $(seq 1 "$REPS"); do
+        while [ "$(jobs_running)" -ge "$heavy_cap" ]; do sleep 2; done
+        run_one "$algo" "$scen" "$rep" &
+        sleep 8
+      done
     done
   done
   wait
@@ -145,9 +167,11 @@ run_benchmark() {
   for algo in $ALGOS; do
     for scen in $scenarios; do
       is_heavy "$scen" && continue
-      while [ "$(jobs_running)" -ge "$MAX_PARALLEL" ]; do sleep 2; done
-      run_one "$algo" "$scen" &
-      sleep 4
+      for rep in $(seq 1 "$REPS"); do
+        while [ "$(jobs_running)" -ge "$MAX_PARALLEL" ]; do sleep 2; done
+        run_one "$algo" "$scen" "$rep" &
+        sleep 4
+      done
     done
   done
   wait

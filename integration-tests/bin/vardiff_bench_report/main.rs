@@ -106,6 +106,10 @@ struct RunMetrics {
     /// the peak single-second rate.
     avg_bw_bps: f64,
     peak_bw_bps: f64,
+    /// Distribution of per-miner steady-state byte rates (B/s): median and p99
+    /// across the run's miners. Exposes a heavy-hitter tail the mean hides.
+    bw_p50_bps: f64,
+    bw_p99_bps: f64,
     conv: Vec<ConvEvent>,
     final_expected: Vec<(String, f64, bool)>,
     /// Per-miner rollups for the breakout section.
@@ -138,20 +142,47 @@ fn main() {
         let (events, dur) = load_events(&scen_dir, scen);
         events_by_scen.insert(scen.clone(), (events.clone(), dur));
         for algo in ALGOS {
-            let csv = csv_dir.join(format!("{algo}__{scen}.csv"));
-            if !csv.exists() {
+            // Pool every rep of this (algo, scenario): the plain
+            // <algo>__<scenario>.csv (REPS=1) and/or any __repN.csv (REPS>1).
+            // Each rep's miners are namespaced `<miner>@repN` so they don't
+            // collide, and analyze() sees the union — averaging per-run Poisson
+            // share-timing noise across reps. Event matching strips the suffix
+            // (see base_miner), so a rep's miners still line up with scenario
+            // events.
+            let rep_paths = rep_csvs(&csv_dir, algo, scen);
+            if rep_paths.is_empty() {
                 continue;
             }
-            let series = load_csv(&csv);
+            let mut series: BTreeMap<String, Vec<Sample>> = BTreeMap::new();
+            let mut worst_rc: Option<i32> = None;
+            let mut max_wall: Option<u64> = None;
+            for (rep_tag, path) in &rep_paths {
+                let s = load_csv(path);
+                if s.is_empty() {
+                    continue;
+                }
+                // Namespace this rep's miners unless it's the sole plain run.
+                for (miner, samples) in s {
+                    let key = match rep_tag {
+                        Some(r) => format!("{miner}@{r}"),
+                        None => miner,
+                    };
+                    series.insert(key, samples);
+                }
+                let tag = match rep_tag {
+                    Some(r) => format!("{algo}__{scen}__{r}"),
+                    None => format!("{algo}__{scen}"),
+                };
+                if let Some((rc, wall)) = progress.get(&tag).copied() {
+                    // Surface the worst exit and the slowest wall across reps.
+                    worst_rc = Some(worst_rc.map_or(rc, |w: i32| if rc != 0 { rc } else { w }));
+                    max_wall = Some(max_wall.map_or(wall, |w: u64| w.max(wall)));
+                }
+            }
             if series.is_empty() {
                 continue;
             }
-            let (rc, wall) = progress
-                .get(&format!("{algo}__{scen}"))
-                .copied()
-                .map(|(r, w)| (Some(r), Some(w)))
-                .unwrap_or((None, None));
-            let m = analyze(algo, scen, rc, wall, &series, &events);
+            let m = analyze(algo, scen, worst_rc, max_wall, &series, &events);
             runs.insert((algo.to_string(), scen.clone()), m);
         }
     }
@@ -284,6 +315,39 @@ fn load_events(scen_dir: &Path, scen: &str) -> (Vec<Event>, Option<u64>) {
     (events, s.duration_secs)
 }
 
+/// The scenario-relative miner name, stripping a `@repN` pooling suffix so a
+/// pooled rep's miner still matches scenario events. `honest-big@rep2` -> `honest-big`.
+fn base_miner(name: &str) -> &str {
+    name.split_once('@').map(|(b, _)| b).unwrap_or(name)
+}
+
+/// Discover every rep CSV for a (algo, scenario): the plain
+/// `<algo>__<scenario>.csv` (REPS=1) and any `<algo>__<scenario>__repN.csv`
+/// (REPS>1). Returns (rep_tag, path); rep_tag is `None` for the plain file and
+/// `Some("repN")` for a rep, so callers namespace pooled miners accordingly.
+fn rep_csvs(dir: &Path, algo: &str, scen: &str) -> Vec<(Option<String>, PathBuf)> {
+    let mut out = Vec::new();
+    let plain = dir.join(format!("{algo}__{scen}.csv"));
+    if plain.exists() {
+        out.push((None, plain));
+    }
+    let prefix = format!("{algo}__{scen}__rep");
+    if let Ok(rd) = fs::read_dir(dir) {
+        let mut reps: Vec<(u32, PathBuf)> = rd
+            .flatten()
+            .filter_map(|e| {
+                let p = e.path();
+                let stem = p.file_stem()?.to_str()?;
+                let n = stem.strip_prefix(&prefix)?.parse::<u32>().ok()?;
+                (p.extension()? == "csv").then_some((n, p))
+            })
+            .collect();
+        reps.sort_by_key(|(n, _)| *n);
+        out.extend(reps.into_iter().map(|(n, p)| (Some(format!("rep{n}")), p)));
+    }
+    out
+}
+
 /// Read a run CSV into miner -> samples.
 fn load_csv(path: &Path) -> BTreeMap<String, Vec<Sample>> {
     let mut out: BTreeMap<String, Vec<Sample>> = BTreeMap::new();
@@ -372,10 +436,12 @@ fn analyze(
         total_updates += last.updates;
         final_expected.push((miner.clone(), last.expected, last.connected));
 
-        // Event times affecting this miner (its own + global).
+        // Event times affecting this miner (its own + global). base_miner
+        // strips any `@repN` pooling suffix so pooled reps still match events.
+        let base = base_miner(miner);
         let ev_ts: Vec<f64> = events
             .iter()
-            .filter(|e| e.miner == *miner || e.miner.is_empty())
+            .filter(|e| e.miner == base || e.miner.is_empty())
             .map(|e| e.at)
             .collect();
         let settled = |t: f64| {
@@ -415,7 +481,7 @@ fn analyze(
 
         // Convergence after each hashrate-STEP event on this miner.
         let mut m_never = 0u32;
-        for ev in events.iter().filter(|e| e.miner == *miner && e.dir != 0) {
+        for ev in events.iter().filter(|e| e.miner == base && e.dir != 0) {
             let after: Vec<&Sample> = pts.iter().filter(|s| s.t >= ev.at && s.connected).collect();
             let Some(first) = after.first() else {
                 continue;
@@ -486,6 +552,13 @@ fn analyze(
     }
     let avg_bw_bps = if span > 0.0 { delivered as f64 / span } else { 0.0 };
 
+    // Per-miner steady-state byte-rate distribution: p50/p99 over the miners,
+    // exposing a heavy-hitter tail (a few chatty miners) the fleet mean hides.
+    let mut miner_bw: Vec<f64> = per_miner.iter().map(|w| w.bw_bps).collect();
+    miner_bw.sort_by(f64::total_cmp);
+    let bw_p50_bps = percentile(&miner_bw, 50.0);
+    let bw_p99_bps = percentile(&miner_bw, 99.0);
+
     settled_err.sort_by(f64::total_cmp);
     over.sort_by(f64::total_cmp);
     final_expected.sort_by(|a, b| a.0.cmp(&b.0));
@@ -508,6 +581,8 @@ fn analyze(
         },
         avg_bw_bps,
         peak_bw_bps,
+        bw_p50_bps,
+        bw_p99_bps,
         conv,
         final_expected,
         per_miner,
@@ -589,7 +664,8 @@ fn build_json(runs: &BTreeMap<(String, String), RunMetrics>) -> String {
              \"exit\":{},\"wall\":{},\"tmax\":{:.0},\"miners\":{},\
              \"settled_p50\":{},\"settled_p99\":{},\"over_p50\":{},\"peak_over_spm\":{},\
              \"total_updates\":{},\"updates_per_hr\":{:.1},\
-             \"avg_bw_bps\":{:.1},\"peak_bw_bps\":{:.1},\"conv_events\":[{}],\"final\":[{}],\
+             \"avg_bw_bps\":{:.1},\"peak_bw_bps\":{:.1},\"bw_p50_bps\":{:.1},\"bw_p99_bps\":{:.1},\
+             \"conv_events\":[{}],\"final\":[{}],\
              \"per_miner\":[{}]}}{}",
             m.exit.map(|v| v.to_string()).unwrap_or("null".into()),
             m.wall.map(|v| v.to_string()).unwrap_or("null".into()),
@@ -603,6 +679,8 @@ fn build_json(runs: &BTreeMap<(String, String), RunMetrics>) -> String {
             m.updates_per_hr,
             m.avg_bw_bps,
             m.peak_bw_bps,
+            m.bw_p50_bps,
+            m.bw_p99_bps,
             conv.join(","),
             fin.join(","),
             per_miner.join(","),
@@ -959,13 +1037,23 @@ fn build_html(
     scenarios: &[String],
     csv_dir: &Path,
 ) -> String {
-    // Reload full series per run for the time-series charts.
+    // Reload full series per run for the time-series charts, pooling reps
+    // (same discovery as the metrics path) so REPS>1 runs still chart.
     let mut all_series: BTreeMap<String, BTreeMap<String, Vec<Sample>>> = BTreeMap::new();
     for scen in scenarios {
         for algo in ALGOS {
-            let p = csv_dir.join(format!("{algo}__{scen}.csv"));
-            if p.exists() {
-                all_series.insert(format!("{algo}__{scen}"), load_csv(&p));
+            let mut pooled: BTreeMap<String, Vec<Sample>> = BTreeMap::new();
+            for (rep_tag, path) in rep_csvs(csv_dir, algo, scen) {
+                for (miner, samples) in load_csv(&path) {
+                    let key = match &rep_tag {
+                        Some(r) => format!("{miner}@{r}"),
+                        None => miner,
+                    };
+                    pooled.insert(key, samples);
+                }
+            }
+            if !pooled.is_empty() {
+                all_series.insert(format!("{algo}__{scen}"), pooled);
             }
         }
     }
@@ -1008,7 +1096,7 @@ pre{background:#010409;border:1px solid #21262d;border-radius:6px;padding:.5rem;
     h.push_str("<h2>1. Summary — aggregate per algorithm</h2>");
     h.push_str("<table><tr><th>algorithm</th><th>runs</th><th>settled p50</th><th>settled p99</th>\
                 <th>peak spm (max)</th><th>updates/hr (median)</th>\
-                <th>avg bw (median)</th><th>peak bw (max)</th><th>failures</th></tr>");
+                <th>bw p50 (median)</th><th>bw p99 (median)</th><th>peak bw (max)</th><th>failures</th></tr>");
     for algo in ALGOS {
         let rs: Vec<&RunMetrics> = runs.values().filter(|m| m.algo == algo).collect();
         let med = |f: &dyn Fn(&RunMetrics) -> f64| median(rs.iter().map(|m| f(m)).collect());
@@ -1019,14 +1107,17 @@ pre{background:#010409;border:1px solid #21262d;border-radius:6px;padding:.5rem;
             .fold(f64::NAN, |a, b| if a.is_nan() { b } else { a.max(b) });
         let peak_bw_max = rs.iter().map(|m| m.peak_bw_bps).fold(0.0f64, f64::max);
         let nf = rs.iter().filter(|m| !matches!(m.exit, Some(0) | None)).count();
+        // bw p50/p99 are the medians (across scenarios) of each run's per-miner
+        // bw p50/p99 — the typical miner's rate and the chatty-tail rate.
         let _ = write!(h,
-            "<tr><td>{algo}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td class={}>{nf}</td></tr>",
+            "<tr><td>{algo}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td class={}>{nf}</td></tr>",
             rs.len(),
             fnum(med(&|m| m.settled_p50), 3),
             fnum(med(&|m| m.settled_p99), 3),
             fnum(peak_max, 1),
             fnum(med(&|m| m.updates_per_hr), 1),
-            fmt_bps(med(&|m| m.avg_bw_bps)),
+            fmt_bps(med(&|m| m.bw_p50_bps)),
+            fmt_bps(med(&|m| m.bw_p99_bps)),
             fmt_bps(peak_bw_max),
             if nf > 0 { "fail" } else { "ok" }
         );
@@ -1152,11 +1243,12 @@ pre{background:#010409;border:1px solid #21262d;border-radius:6px;padding:.5rem;
         h.push_str(&format!("<h3>{}</h3>", esc(scen)));
         h.push_str(&scenario_svg(scen, events, runs, csv_dir, &all_series));
         h.push_str("<table><tr><th>algo</th><th>exit</th><th>settled p50</th><th>settled p99</th>\
-                    <th>peak spm</th><th>updates/hr</th><th>final expected (per miner)</th></tr>");
+                    <th>peak spm</th><th>updates/hr</th><th>bw p50</th><th>bw p99</th>\
+                    <th>final expected (per miner)</th></tr>");
         for algo in ALGOS {
             match runs.get(&(algo.to_string(), scen.clone())) {
                 None => {
-                    let _ = write!(h, "<tr><td>{algo}</td><td colspan=6 class=warn>missing</td></tr>");
+                    let _ = write!(h, "<tr><td>{algo}</td><td colspan=8 class=warn>missing</td></tr>");
                 }
                 Some(m) => {
                     let (cls, es) = exit_cell(m.exit);
@@ -1169,9 +1261,10 @@ pre{background:#010409;border:1px solid #21262d;border-radius:6px;padding:.5rem;
                         .join("; ");
                     let _ = write!(h,
                         "<tr><td>{algo}</td><td class={cls}>{es}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>\
-                         <td style=\"text-align:left;font-size:11px\">{}</td></tr>",
+                         <td>{}</td><td>{}</td><td style=\"text-align:left;font-size:11px\">{}</td></tr>",
                         fnum(m.settled_p50, 3), fnum(m.settled_p99, 3),
-                        fnum(m.peak_over_spm, 1), fnum(m.updates_per_hr, 1), esc(&fin)
+                        fnum(m.peak_over_spm, 1), fnum(m.updates_per_hr, 1),
+                        fmt_bps(m.bw_p50_bps), fmt_bps(m.bw_p99_bps), esc(&fin)
                     );
                 }
             }
