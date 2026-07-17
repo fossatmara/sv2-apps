@@ -154,9 +154,7 @@ fn classify_hint(declared: f32, current_nominal: f32) -> HintAction {
 /// target space `.min` picks the harder ceiling, so this bounds how far an ease
 /// can lower difficulty. Non-biting at POOL_FLOOR_HASHRATE = 1.0 today.
 fn pool_floor_target(shares_per_minute: f32) -> Option<Target> {
-    hash_rate_to_target(POOL_FLOOR_HASHRATE as f64, shares_per_minute as f64)
-        .ok()
-        .map(Target::from)
+    hash_rate_to_target(POOL_FLOOR_HASHRATE as f64, shares_per_minute as f64).ok()
 }
 
 // NOTE on the REJECT branch and max_target: the spec mandates reflecting a
@@ -1483,7 +1481,11 @@ mod hint_guard_tests {
     fn open_substitutes_default_for_garbage_nominal() {
         // model the open handler's binding decision for the field-failure cases.
         let resolve = |declared: f32| {
-            if is_plausible_nominal(declared) { declared } else { COLD_START_DEFAULT_NOMINAL_HS }
+            if is_plausible_nominal(declared) {
+                declared
+            } else {
+                COLD_START_DEFAULT_NOMINAL_HS
+            }
         };
         assert_eq!(resolve(f32::NAN), COLD_START_DEFAULT_NOMINAL_HS); // NaN → default
         assert_eq!(resolve(f32::INFINITY), COLD_START_DEFAULT_NOMINAL_HS); // inf → default
@@ -1521,7 +1523,7 @@ mod hint_guard_tests {
         // Guard is `< floor` rejects, so floor itself is ACCEPTED. Pin this so a
         // refactor to `<=` (which would reject the floor) is caught at build.
         let at_floor = MIN_PLAUSIBLE_NOMINAL_HS; // 1000.0
-        // at_floor below current → ease (NOT reject); confirms the boundary side.
+                                                 // at_floor below current → ease (NOT reject); confirms the boundary side.
         assert_eq!(
             classify_hint(at_floor, 2_000.0),
             HintAction::EaseDown(at_floor)
@@ -1542,7 +1544,10 @@ mod hint_guard_tests {
     fn infinite_nominal_is_rejected() {
         assert_eq!(classify_hint(f32::INFINITY, 100_000.0), HintAction::Reject);
         // -inf is below the floor by ordering too, but is_finite catches it first.
-        assert_eq!(classify_hint(f32::NEG_INFINITY, 100_000.0), HintAction::Reject);
+        assert_eq!(
+            classify_hint(f32::NEG_INFINITY, 100_000.0),
+            HintAction::Reject
+        );
     }
 
     // ---- clamp-direction: the seam most likely to silently invert.
@@ -1559,9 +1564,20 @@ mod hint_guard_tests {
         use stratum_apps::stratum_core::bitcoin::Target;
         let harder = Target::from_le_bytes([0x11u8; 32]); // smaller value
         let easier = Target::from_le_bytes([0xEEu8; 32]); // larger value
-        assert!(harder < easier, "sanity: smaller target value = harder difficulty");
-        assert_eq!(easier.min(harder), harder, ".min must pick the harder (smaller) ceiling");
-        assert_eq!(harder.min(easier), harder, ".min result is order-independent");
+        assert!(
+            harder < easier,
+            "sanity: smaller target value = harder difficulty"
+        );
+        assert_eq!(
+            easier.min(harder),
+            harder,
+            ".min must pick the harder (smaller) ceiling"
+        );
+        assert_eq!(
+            harder.min(easier),
+            harder,
+            ".min result is order-independent"
+        );
         // the guard's pool_floor_target is well-formed for a real spm.
         assert!(pool_floor_target(6.0).is_some());
     }
@@ -1580,15 +1596,15 @@ mod hint_guard_tests {
     #[test]
     fn degenerate_reference_defers_not_eases() {
         let good = 50_000.0; // a plausible declaration
-        // garbage-high reference: naive `declared < current` would read this as
-        // "downward" and EASE — the screen must prevent that and DeferUp instead.
+                             // garbage-high reference: naive `declared < current` would read this as
+                             // "downward" and EASE — the screen must prevent that and DeferUp instead.
         assert_eq!(classify_hint(good, f32::INFINITY), HintAction::DeferUp);
         assert_eq!(classify_hint(good, f32::NAN), HintAction::DeferUp);
         // garbage-low / zero reference: also no trustworthy direction → defer.
         assert_eq!(classify_hint(good, 0.0), HintAction::DeferUp);
         assert_eq!(classify_hint(good, 1.0), HintAction::DeferUp); // sub-floor ref
-        // and a garbage DECLARATION still loses to Reject regardless of reference
-        // (declaration screened first).
+                                                                   // and a garbage DECLARATION still loses to Reject regardless of reference
+                                                                   // (declaration screened first).
         assert_eq!(classify_hint(f32::NAN, f32::NAN), HintAction::Reject);
     }
 
