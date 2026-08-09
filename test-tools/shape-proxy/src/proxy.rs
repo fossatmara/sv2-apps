@@ -425,26 +425,75 @@ impl ProxyCore {
                 self.handle_share_submission(id, share.channel_id, share.sequence_number, msg)
                     .await;
             }
+            // A downstream closing a channel must drop the local mapping, not just
+            // be forwarded. Without this arm `CloseChannel` fell into the catch-all
+            // below: it reached the pool (which closed correctly) while our
+            // `channels` entry survived, so `/status` reported the channel forever
+            // with `miner_connected: true`.
+            //
+            // The `Disconnected` cleanup path is not enough on its own. Our
+            // downstream is the *translator*, which holds one long-lived SV2
+            // connection across many miner reconnects, so its socket never drops
+            // and `DownstreamEvent::Disconnected` never fires. Each SV1 miner
+            // reconnect therefore leaked one entry: a slot left running for 13 days
+            // accumulated 1026 of them, and long runs read stale channels as live.
+            Mining::CloseChannel(ref close) => {
+                let channel_id = close.channel_id;
+                // Same lookup convention as `handle_share_submission`: the id may
+                // be either side's, since a channel opened before the upstream
+                // assigned an id is keyed downstream-side.
+                let key = find_channel_key(&self.channels, id, channel_id);
+
+                match key {
+                    Some(k) => {
+                        let removed = self.channels.remove(&k);
+                        info!(
+                            downstream_id = id,
+                            channel_id,
+                            shares_forwarded = removed.as_ref().map_or(0, |m| m.shares_forwarded),
+                            shares_gated = removed.as_ref().map_or(0, |m| m.shares_gated),
+                            "Channel closed by downstream; mapping removed"
+                        );
+                    }
+                    None => {
+                        debug!(
+                            downstream_id = id,
+                            channel_id, "CloseChannel for unknown channel"
+                        );
+                    }
+                }
+
+                // Still forward it: the pool must stop sending for this channel.
+                self.forward_to_upstream(id, msg).await;
+            }
             other => {
                 debug!(downstream_id = id, "Forwarding message upstream: {other}");
-                let frame: StandardSv2Frame<Message> = match Message::Mining(other).try_into() {
-                    Ok(f) => f,
-                    Err(e) => {
-                        warn!(downstream_id = id, "Failed to encode message: {e:?}");
-                        return;
-                    }
-                };
-                if let Some(ref mut writer) = self.upstream_writer {
-                    if let Err(e) = writer.write_frame(frame.into()).await {
-                        error!("Failed to forward message upstream: {e:?}");
-                    }
-                } else {
-                    warn!(
-                        downstream_id = id,
-                        "Upstream not connected, dropping message"
-                    );
-                }
+                self.forward_to_upstream(id, other).await;
             }
+        }
+    }
+
+    /// Forwards a downstream message upstream verbatim.
+    ///
+    /// Extracted from the catch-all arm so the `CloseChannel` handler can drop its
+    /// local mapping *and* still forward, rather than duplicating the encode path.
+    async fn forward_to_upstream(&mut self, id: DownstreamId, msg: Mining<'static>) {
+        let frame: StandardSv2Frame<Message> = match Message::Mining(msg).try_into() {
+            Ok(f) => f,
+            Err(e) => {
+                warn!(downstream_id = id, "Failed to encode message: {e:?}");
+                return;
+            }
+        };
+        if let Some(ref mut writer) = self.upstream_writer {
+            if let Err(e) = writer.write_frame(frame.into()).await {
+                error!("Failed to forward message upstream: {e:?}");
+            }
+        } else {
+            warn!(
+                downstream_id = id,
+                "Upstream not connected, dropping message"
+            );
         }
     }
 
@@ -919,6 +968,26 @@ impl ProxyCore {
     }
 }
 
+/// Finds the `channels` key for `(downstream_id, channel_id)`.
+///
+/// `channel_id` may be either side's id: a channel opened before the upstream
+/// assigned one is keyed downstream-side, and the miner keeps using that id. Same
+/// convention as `handle_share_submission`.
+fn find_channel_key(
+    channels: &HashMap<u32, ChannelMapping>,
+    downstream_id: DownstreamId,
+    channel_id: u32,
+) -> Option<u32> {
+    channels
+        .iter()
+        .find(|(_, m)| {
+            m.downstream_id == downstream_id
+                && (m.downstream_channel_id == channel_id
+                    || m.upstream_channel_id == Some(channel_id))
+        })
+        .map(|(k, _)| *k)
+}
+
 fn target_to_difficulty(target_le: &[u8]) -> f64 {
     let mut msb_index = 31;
     while msb_index > 0 && target_le[msb_index] == 0 {
@@ -945,6 +1014,56 @@ fn target_to_difficulty(target_le: &[u8]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mapping(downstream_id: DownstreamId, ds_ch: u32, up_ch: Option<u32>) -> ChannelMapping {
+        ChannelMapping {
+            downstream_channel_id: ds_ch,
+            upstream_channel_id: up_ch,
+            downstream_id,
+            gate: ShareGate::new(RateProfile::default()),
+            floor_active: false,
+            pool_difficulty: None,
+            miner_difficulty: 1.0,
+            shares_forwarded: 0,
+            shares_gated: 0,
+            forward_window: RollingWindow::new(),
+            open_request: None,
+            open_standard_msg: None,
+        }
+    }
+
+    /// The leak this guards against: `CloseChannel` used to fall into the
+    /// forward-upstream catch-all, so the pool closed the channel while our
+    /// mapping survived and `/status` reported it forever as `miner_connected`.
+    /// Our downstream is the translator, whose socket persists across miner
+    /// reconnects, so `DownstreamEvent::Disconnected` never fires to clean up —
+    /// one slot accumulated 1026 stale channels over 13 days.
+    #[test]
+    fn close_channel_lookup_finds_by_upstream_id() {
+        let mut channels = HashMap::new();
+        channels.insert(7u32, mapping(1, 7, Some(42)));
+        // The miner may cite either id; both must resolve to the same key.
+        assert_eq!(find_channel_key(&channels, 1, 42), Some(7));
+        assert_eq!(find_channel_key(&channels, 1, 7), Some(7));
+    }
+
+    #[test]
+    fn close_channel_lookup_is_scoped_to_the_downstream() {
+        let mut channels = HashMap::new();
+        channels.insert(1u32, mapping(1, 1, Some(100)));
+        channels.insert(2u32, mapping(2, 1, Some(200)));
+        // Same downstream_channel_id on two different downstreams: closing one
+        // must not remove the other's.
+        assert_eq!(find_channel_key(&channels, 1, 1), Some(1));
+        assert_eq!(find_channel_key(&channels, 2, 1), Some(2));
+        assert_eq!(find_channel_key(&channels, 3, 1), None);
+    }
+
+    #[test]
+    fn close_channel_lookup_unknown_is_none() {
+        let channels: HashMap<u32, ChannelMapping> = HashMap::new();
+        assert_eq!(find_channel_key(&channels, 1, 1), None);
+    }
 
     #[test]
     fn target_to_difficulty_known_values() {
