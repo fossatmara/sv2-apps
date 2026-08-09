@@ -1,0 +1,24 @@
+[package]
+name = "shape-proxy"
+version = "0.1.0"
+edition = "2021"
+authors = ["The Stratum V2 Developers"]
+description = "SV2 share-gating proxy for testing pool difficulty adjustment algorithms"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "shape-proxy"
+path = "src/main.rs"
+
+[dependencies]
+stratum-apps = { path = "../../stratum-apps", features = ["network", "config"] }
+
+tokio = { version = "1.44", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+axum = "0.8"
+prometheus = "0.13"

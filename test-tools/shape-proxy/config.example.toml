@@ -1,0 +1,27 @@
+# Shape-Proxy Configuration
+# See README.md for full documentation.
+
+# Pool upstream address (SV2 Noise connection)
+upstream_address = "127.0.0.1:34254"
+
+# Address to listen for downstream miners
+downstream_listen = "0.0.0.0:34260"
+
+# HTTP API address for status and profile control
+api_listen = "0.0.0.0:8080"
+
+# Proxy's own Noise keypair (for downstream miners)
+# EXAMPLE ONLY — generate unique keys for each deployment
+authority_pubkey = "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72"
+authority_secret = "mkDLTBBRxdBv998612qipDYoTK3YUrqLe8uWw7LfzDJmwMcjdYj"
+
+# Upstream pool's authority pubkey (optional, omit to skip verification)
+# upstream_authority_pubkey = "..."
+
+# Minimum difficulty floor for downstream miners (0 = disabled).
+# When enabled, SetTarget messages below this difficulty are absorbed
+# to prevent the pool from lowering difficulty too far.
+# min_downstream_difficulty = 1024.0
+
+# Certificate validity for downstream Noise handshakes (seconds)
+# cert_validity_secs = 86400
