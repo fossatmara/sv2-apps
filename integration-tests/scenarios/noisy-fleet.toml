@@ -1,0 +1,38 @@
+# Noisy miners: all on-target on average but with heavy hashrate noise.
+# A sound controller should track the slow trends and refuse to chase the
+# noise; watch for SetTarget churn and difficulty walking away.
+name = "noisy-fleet"
+duration_secs = 900
+
+[[miners]]
+name = "walker-1"
+hashrate = 100e12
+
+[miners.drift]
+mode = "random_walk"
+amplitude = 0.4
+step_secs = 5
+
+[[miners]]
+name = "walker-2"
+hashrate = 20e12
+
+[miners.drift]
+mode = "random_walk"
+amplitude = 0.4
+step_secs = 5
+
+[[miners]]
+name = "fast-oscillator"
+hashrate = 50e12
+
+[miners.drift]
+mode = "sine"
+amplitude = 0.35
+period_secs = 90
+step_secs = 3
+
+# Quiet control: any updates here are pure noise-chasing.
+[[miners]]
+name = "steady"
+hashrate = 100e12

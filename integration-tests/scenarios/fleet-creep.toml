@@ -1,0 +1,70 @@
+# Monotonic fleet creep — the control-theory ramp-input test.
+#
+# Failure mode: a farm that only ever grows (or only ever sheds), never
+# reversing — rigs added to a container hour by hour, or a slow controlled
+# shutdown. This is the classic "ramp input -> steady-state tracking lag" case:
+# unlike thermal-rolloff (a sine that returns to baseline), a monotonic ramp
+# has no reversal, so a controller with integral lag settles at a persistent
+# offset behind the true rate the whole time.
+#
+# Watch: the steady-state gap between realized rate and setpoint during each
+# ramp. A pure-proportional controller lags a ramp forever; an integral term
+# eventually catches up. Two miners ramp opposite directions so both the
+# tightening-lag and loosening-lag show at once.
+name = "fleet-creep"
+duration_secs = 900
+
+# Growing farm: +50% every ~2 min, monotonic up to ~8x.
+[[miners]]
+name = "growing"
+hashrate = 50e12
+[[miners.events]]
+at = 120
+action = "set_hashrate"
+hashrate = 90e12
+[[miners.events]]
+at = 240
+action = "set_hashrate"
+hashrate = 150e12
+[[miners.events]]
+at = 360
+action = "set_hashrate"
+hashrate = 240e12
+[[miners.events]]
+at = 480
+action = "set_hashrate"
+hashrate = 360e12
+[[miners.events]]
+at = 600
+action = "set_hashrate"
+hashrate = 420e12
+
+# Shrinking farm: controlled wind-down, monotonic down to ~1/8.
+[[miners]]
+name = "shrinking"
+hashrate = 400e12
+[[miners.events]]
+at = 120
+action = "set_hashrate"
+hashrate = 280e12
+[[miners.events]]
+at = 240
+action = "set_hashrate"
+hashrate = 180e12
+[[miners.events]]
+at = 360
+action = "set_hashrate"
+hashrate = 110e12
+[[miners.events]]
+at = 480
+action = "set_hashrate"
+hashrate = 70e12
+[[miners.events]]
+at = 600
+action = "set_hashrate"
+hashrate = 50e12
+
+# Flat control.
+[[miners]]
+name = "steady"
+hashrate = 100e12

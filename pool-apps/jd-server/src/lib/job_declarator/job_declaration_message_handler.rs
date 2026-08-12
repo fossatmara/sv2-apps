@@ -122,7 +122,7 @@ impl HandleJobDeclarationMessagesFromClientAsync for JobDeclarator {
             .clone();
 
         // can we parse `DeclareMiningJob.mining_job_token` into a `JdToken`?
-        let token: JdToken = match msg.mining_job_token.inner_as_ref().try_into() {
+        let token: JdToken = match msg.mining_job_token.try_as_array::<8>() {
             Ok(token_bytes) => u64::from_le_bytes(token_bytes),
             Err(_) => {
                 // Send DeclareMiningJobError back to client
@@ -220,12 +220,9 @@ impl HandleJobDeclarationMessagesFromClientAsync for JobDeclarator {
                     .iter()
                     .filter_map(|missing_wtxid| {
                         msg.wtxid_list
-                            .inner_as_ref()
                             .iter()
-                            .position(|u256_bytes| {
-                                let bytes: [u8; 32] =
-                                    (*u256_bytes).try_into().expect("U256 is 32 bytes");
-                                let wtxid = Wtxid::from_byte_array(bytes);
+                            .position(|u256| {
+                                let wtxid = Wtxid::from_byte_array(u256.to_array());
                                 wtxid == *missing_wtxid
                             })
                             .map(|pos| pos as u16)
@@ -234,7 +231,9 @@ impl HandleJobDeclarationMessagesFromClientAsync for JobDeclarator {
 
                 let provide_missing_transactions = ProvideMissingTransactions {
                     request_id: msg.request_id,
-                    unknown_tx_position_list: unknown_tx_position_list.into(),
+                    unknown_tx_position_list: unknown_tx_position_list
+                        .try_into()
+                        .map_err(error::JDSError::shutdown)?,
                 };
                 JobDeclaration::ProvideMissingTransactions(provide_missing_transactions)
             }
@@ -294,8 +293,7 @@ impl HandleJobDeclarationMessagesFromClientAsync for JobDeclarator {
         let pending_declare_mining_job_token: JdToken = u64::from_le_bytes(
             pending_declare_mining_job
                 .mining_job_token
-                .inner_as_ref()
-                .try_into()
+                .try_as_array::<8>()
                 .expect("already validated"),
         );
 

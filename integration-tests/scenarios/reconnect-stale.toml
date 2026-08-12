@@ -1,0 +1,86 @@
+# Reconnect at the wrong difficulty — cold-start-after-drift.
+#
+# Failure mode: a miner disconnects, its TRUE hashrate changes a lot while it's
+# gone, then it reconnects — and the pool re-opens the channel at the miner's
+# ORIGINAL reported_hashrate (that's how reconnect works), so it comes back
+# badly mis-targeted. flaky/churn reconnect miners whose rate never moved; none
+# reconnects one whose true rate shifted ~10x during the outage.
+#
+# The trick: the miner reports its ORIGINAL hashrate at open (reported_hashrate),
+# so the channel always re-opens at that difficulty, but a set_hashrate during
+# the disconnect window changes the TRUE rate. On reconnect the pool is targeting
+# the old rate against the new reality and must re-converge from a cold, wrong
+# start — in both directions.
+#
+# Watch: post-reconnect convergence time and overshoot vs a fresh cold start.
+name = "reconnect-stale"
+duration_secs = 900
+
+# Grew 10x while away: opens soft (reports 50T), must tighten hard on reconnect.
+[[miners]]
+name = "grew-while-gone"
+hashrate = 50e12
+reported_hashrate = 50e12
+[[miners.events]]
+at = 120
+action = "disconnect"
+[[miners.events]]
+at = 150
+action = "set_hashrate"
+hashrate = 500e12
+[[miners.events]]
+at = 300
+action = "reconnect"
+
+# Shrank 10x while away: opens hard (reports 400T), must loosen on reconnect.
+[[miners]]
+name = "shrank-while-gone"
+hashrate = 400e12
+reported_hashrate = 400e12
+[[miners.events]]
+at = 180
+action = "disconnect"
+[[miners.events]]
+at = 210
+action = "set_hashrate"
+hashrate = 40e12
+[[miners.events]]
+at = 360
+action = "reconnect"
+
+# Repeated flap, each time returning to a rate different from its report.
+[[miners]]
+name = "flap-drift"
+hashrate = 100e12
+reported_hashrate = 100e12
+[[miners.events]]
+at = 240
+action = "set_hashrate"
+hashrate = 300e12
+[[miners.events]]
+at = 420
+action = "disconnect"
+[[miners.events]]
+at = 480
+action = "reconnect"
+[[miners.events]]
+at = 600
+action = "set_hashrate"
+hashrate = 30e12
+[[miners.events]]
+at = 660
+action = "disconnect"
+[[miners.events]]
+at = 720
+action = "reconnect"
+
+# Control: reconnects unchanged, should snap right back.
+[[miners]]
+name = "clean-flap"
+hashrate = 100e12
+[[miners.events]]
+at = 300
+action = "disconnect"
+[[miners.events]]
+at = 420
+action = "reconnect"

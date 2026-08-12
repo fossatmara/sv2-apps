@@ -383,7 +383,7 @@ async fn jds_reject_declare_mining_job_with_invalid_mining_job_token() {
     let unallocated_token_declare = AnyMessage::JobDeclaration(
         parsers_sv2::JobDeclaration::DeclareMiningJob(DeclareMiningJob {
             request_id: 11,
-            mining_job_token: 42_u64.to_le_bytes().to_vec().try_into().unwrap(),
+            mining_job_token: 42_u64.to_le_bytes().try_into().unwrap(),
             version: 0,
             coinbase_tx_prefix: Vec::<u8>::new().try_into().unwrap(),
             coinbase_tx_suffix: Vec::<u8>::new().try_into().unwrap(),
@@ -540,14 +540,15 @@ async fn jds_receive_solution_while_processing_declared_job_test() {
     let (pool, pool_addr, jds_addr, _) =
         start_pool_with_jds(tp_1.bitcoin_core(), vec![], vec![], false).await;
 
-    let prev_hash = U256::Owned(vec![
+    let prev_hash = U256::from([
         184, 103, 138, 88, 153, 105, 236, 29, 123, 246, 107, 203, 1, 33, 10, 122, 188, 139, 218,
         141, 62, 177, 158, 101, 125, 92, 214, 150, 199, 220, 29, 8,
     ]);
-    let extranonce = B032::Owned(vec![
+    let extranonce = B032::try_from([
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0,
         0, 0,
-    ]);
+    ])
+    .unwrap();
     let submit_solution_replace = ReplaceMessage::new(
         MessageDirection::ToUpstream,
         MESSAGE_TYPE_PROVIDE_MISSING_TRANSACTIONS_SUCCESS,
@@ -762,9 +763,9 @@ async fn jdc_group_extended_channels() {
         let open_extended_mining_channel = AnyMessage::Mining(Mining::OpenExtendedMiningChannel(
             OpenExtendedMiningChannel {
                 request_id: i,
-                user_identity: b"user_identity".to_vec().try_into().unwrap(),
+                user_identity: "user_identity".try_into().unwrap(),
                 nominal_hash_rate: 1000.0,
-                max_target: vec![0xff; 32].try_into().unwrap(),
+                max_target: [0xff; 32].into(),
                 min_extranonce_size: 0,
             },
         ));
@@ -947,7 +948,7 @@ async fn jdc_group_standard_channels() {
         let open_standard_mining_channel = AnyMessage::Mining(Mining::OpenStandardMiningChannel(
             OpenStandardMiningChannel {
                 request_id: i.into(),
-                user_identity: b"user_identity".to_vec().try_into().unwrap(),
+                user_identity: "user_identity".try_into().unwrap(),
                 nominal_hash_rate: 1000.0,
                 max_target: vec![0xff; 32].try_into().unwrap(),
             },
@@ -1141,7 +1142,7 @@ async fn jdc_require_standard_jobs_set_does_not_group_standard_channels() {
         let open_standard_mining_channel = AnyMessage::Mining(Mining::OpenStandardMiningChannel(
             OpenStandardMiningChannel {
                 request_id: i.into(),
-                user_identity: b"user_identity".to_vec().try_into().unwrap(),
+                user_identity: "user_identity".try_into().unwrap(),
                 nominal_hash_rate: 1000.0,
                 max_target: vec![0xff; 32].try_into().unwrap(),
             },
@@ -1275,7 +1276,7 @@ async fn jdc_require_standard_jobs_set_does_not_group_standard_channels() {
 #[tokio::test]
 async fn jdc_require_standard_jobs_set_rejects_open_extended_mining_channel() {
     start_tracing();
-    let bitcoin_core = start_bitcoin_core(DifficultyLevel::Low);
+    let bitcoin_core = start_bitcoin_core_latest(DifficultyLevel::Low);
     let (pool, pool_addr, jds_addr, _) =
         start_pool_with_jds(&bitcoin_core, vec![], vec![], true).await;
 
@@ -1310,7 +1311,7 @@ async fn jdc_require_standard_jobs_set_rejects_open_extended_mining_channel() {
     let open_extended_mining_channel = AnyMessage::Mining(Mining::OpenExtendedMiningChannel(
         OpenExtendedMiningChannel {
             request_id: 100u32.into(),
-            user_identity: b"user_identity".to_vec().try_into().unwrap(),
+            user_identity: "user_identity".try_into().unwrap(),
             nominal_hash_rate: 1000.0,
             max_target: vec![0xff; 32].try_into().unwrap(),
             min_extranonce_size: 8,

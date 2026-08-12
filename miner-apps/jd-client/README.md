@@ -77,9 +77,11 @@ The configuration file contains the following information:
      - `address` - The Template Provider's network address
      - `public_key` - (Optional) The TP's authority public key for connection verification
    - `[template_provider_type.BitcoinCoreIpc]` - Connects directly to Bitcoin Core via IPC, with the following parameters:
+     - `version` - Required Bitcoin Core IPC schema major version (`30` or `31`, any other value fails startup)
      - `network` - Bitcoin network (mainnet, testnet4, signet, regtest) for determining socket path
      - `data_dir` - (Optional) Custom Bitcoin data directory. Uses OS default if not set
      - `fee_threshold` - Minimum fee threshold to trigger new templates
+     - `min_interval` - Minimum interval between template updates in seconds
 
 For connections with a Sv2 Template Provider, you may want to verify that your TP connection is authentic. You can get the `public_key` from the logs of your TP, for example:
 
@@ -147,4 +149,3 @@ JDC is built from several modules that divide responsibility for handling differ
      * Maintains **upstream channel state**.
      * Maintains most of the **Job Declarator state**.
      * Orchestrates job lifecycle and state synchronization across upstream and downstream roles.
-

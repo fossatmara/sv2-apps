@@ -2,7 +2,7 @@ use crate::{
     downstream::Downstream,
     error::{self, JDCError, JDCErrorKind},
 };
-use std::convert::TryInto;
+use std::{convert::TryInto, sync::atomic::Ordering};
 use stratum_apps::{
     stratum_core::{
         common_messages_sv2::{
@@ -26,9 +26,7 @@ impl HandleCommonMessagesFromClientAsync for Downstream {
         &self,
         _client_id: Option<usize>,
     ) -> Result<Vec<u16>, Self::Error> {
-        Ok(self
-            .downstream_data
-            .super_safe_lock(|data| data.negotiated_extensions.clone()))
+        self.negotiated_extensions.get().map_err(JDCError::shutdown)
     }
     // Handles the initial [`SetupConnection`] message from a downstream client.
     //
@@ -47,7 +45,7 @@ impl HandleCommonMessagesFromClientAsync for Downstream {
     //
     // 3. Standard job requirement
     //    - If the downstream sets the `requires_standard_job` flag, it is recorded in
-    //      [`DownstreamData::require_std_job`].
+    //      [`Downstream::require_std_job`].
     //
     // 4. Successful setup
     //    - If all validations pass, a [`SetupConnectionSuccess`] message is
@@ -110,8 +108,7 @@ impl HandleCommonMessagesFromClientAsync for Downstream {
         }
 
         if has_requires_std_job(msg.flags) {
-            self.downstream_data
-                .super_safe_lock(|data| data.require_std_job = true);
+            self.require_std_job.store(true, Ordering::Relaxed);
         }
         let response = SetupConnectionSuccess {
             used_version: 2,

@@ -1,0 +1,4 @@
+# Raw per-run CSVs are large (~55 MB) and regenerable via benchmark/benchmark.sh.
+# The self-contained HTML report + analysis.json ARE committed (viewable without a rerun).
+raw-csv/
+raw-csv.zip

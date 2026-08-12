@@ -1,0 +1,35 @@
+# Aggressive ramps: a miner that multiplies its hashrate 4x every minute up
+# to 64x, then crashes back down in two big steps. Tests reaction latency,
+# per-step clamping, and overshoot in both directions.
+name = "aggressive-ramp"
+duration_secs = 720
+
+[[miners]]
+name = "ramper"
+hashrate = 10e12
+
+[[miners.events]]
+at = 120
+action = "set_hashrate"
+hashrate = 40e12
+[[miners.events]]
+at = 180
+action = "set_hashrate"
+hashrate = 160e12
+[[miners.events]]
+at = 240
+action = "set_hashrate"
+hashrate = 640e12
+[[miners.events]]
+at = 420
+action = "set_hashrate"
+hashrate = 80e12
+[[miners.events]]
+at = 480
+action = "set_hashrate"
+hashrate = 10e12
+
+# Control miner for churn comparison.
+[[miners]]
+name = "steady"
+hashrate = 100e12

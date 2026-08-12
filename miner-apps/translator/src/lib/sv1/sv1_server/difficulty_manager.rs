@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use crate::sv1::sv1_server::PendingTargetUpdate;
+use crate::sv1::sv1_server::{
+    PendingTargetUpdate, SV1_MIN_DIFFICULTY_FOR_INTEGER_POWER_OF_TWO_ROUNDING,
+};
 
 use stratum_apps::{
     stratum_core::{
@@ -8,7 +10,7 @@ use stratum_apps::{
         channels_sv2::{target::hash_rate_to_target, Vardiff},
         mining_sv2::{SetTarget, UpdateChannel},
         parsers_sv2::Mining,
-        stratum_translation::sv2_to_sv1::build_sv1_set_difficulty_from_sv2_target,
+        stratum_translation::sv2_to_sv1::build_sv1_set_difficulty_from_sv2_target_with_integer_power_of_two_rounding,
     },
     utils::types::{ChannelId, DownstreamId, Hashrate},
 };
@@ -159,7 +161,12 @@ impl Sv1Server {
         // Process immediate set_difficulty updates (for new_target >= upstream_target)
         for (_channel_id, downstream_id, target) in immediate_updates {
             // Send set_difficulty message immediately
-            if let Ok(set_difficulty_msg) = build_sv1_set_difficulty_from_sv2_target(target) {
+            if let Ok(set_difficulty_msg) =
+                build_sv1_set_difficulty_from_sv2_target_with_integer_power_of_two_rounding(
+                    target,
+                    SV1_MIN_DIFFICULTY_FOR_INTEGER_POWER_OF_TWO_ROUNDING,
+                )
+            {
                 let downstream_id = downstream_id.unwrap_or(0);
                 if let Some(sender) = self
                     .sv1_server_io
@@ -302,8 +309,7 @@ impl Sv1Server {
     /// Non-aggregated mode: Each SetTarget updates one specific downstream and processes its
     /// pending update
     pub(super) async fn handle_set_target_message(&self, set_target: SetTarget<'_>) {
-        let new_upstream_target =
-            Target::from_le_bytes(set_target.maximum_target.inner_as_ref().try_into().unwrap());
+        let new_upstream_target = Target::from_le_bytes(set_target.maximum_target.to_array());
         debug!(
             "Received SetTarget for channel {}: new_upstream_target = {}",
             set_target.channel_id, new_upstream_target
@@ -432,7 +438,10 @@ impl Sv1Server {
     ) {
         for update in difficulty_updates {
             let set_difficulty_msg =
-                match build_sv1_set_difficulty_from_sv2_target(update.new_target) {
+                match build_sv1_set_difficulty_from_sv2_target_with_integer_power_of_two_rounding(
+                    update.new_target,
+                    SV1_MIN_DIFFICULTY_FOR_INTEGER_POWER_OF_TWO_ROUNDING,
+                ) {
                     Ok(msg) => msg,
                     Err(e) => {
                         error!(

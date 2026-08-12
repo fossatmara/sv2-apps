@@ -6,7 +6,7 @@ use std::sync::{
 use stratum_apps::{
     key_utils::Secp256k1PublicKey,
     stratum_core::{
-        binary_sv2::{Sv2DataType, U256},
+        binary_sv2::U256,
         bitcoin::{
             block::{Header, Version},
             hashes::Hash,
@@ -75,8 +75,9 @@ pub fn validate_sv1_share(
     let mask = version_rolling_mask.unwrap_or(HexU32Be(0x1FFFE000_u32)).0;
     let version = (job.version.0 & !mask) | (share_version & mask);
 
-    let prev_hash_vec: Vec<u8> = job.prev_hash.clone().into();
-    let prev_hash = U256::from_vec_(prev_hash_vec).map_err(TproxyErrorKind::BinarySv2)?;
+    let prev_hash: U256<'static> = Vec::<u8>::from(job.prev_hash.clone())
+        .try_into()
+        .map_err(TproxyErrorKind::BinarySv2)?;
 
     // calculate the merkle root from:
     // - job coinbase_tx_prefix

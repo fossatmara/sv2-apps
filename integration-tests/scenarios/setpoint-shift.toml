@@ -1,0 +1,43 @@
+# Setpoint policy change under a running fleet.
+#
+# Failure mode (needs the set_spm scenario action): the pool operator changes
+# the vardiff target (shares/minute) mid-run — e.g. raising it to cut per-share
+# variance, or lowering it to shed share-processing load. Every channel's
+# difficulty must re-converge to the NEW setpoint from a fully-converged state.
+# No other scenario moves the setpoint; each run was previously a single static
+# spm.
+#
+# The setpoint starts at the run's --shares-per-minute (use 4), steps to 12 at
+# t=240, then down to 2 at t=540. A steady fleet of varied sizes must track each
+# change together. The set_spm action is global (not per-miner), but the schema
+# hangs events off a miner, so it rides on the "anchor" block below.
+#
+# Watch: how fast the whole fleet re-converges realized_spm to the new target
+# after each shift, and whether difficulty moves the right direction (higher
+# setpoint => easier target => lower difficulty).
+name = "setpoint-shift"
+duration_secs = 900
+
+[[miners]]
+name = "anchor"
+hashrate = 100e12
+[[miners.events]]
+at = 240
+action = "set_spm"
+spm = 12.0
+[[miners.events]]
+at = 540
+action = "set_spm"
+spm = 2.0
+
+[[miners]]
+name = "big"
+hashrate = 400e12
+
+[[miners]]
+name = "small"
+hashrate = 20e12
+
+[[miners]]
+name = "medium"
+hashrate = 150e12

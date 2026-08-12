@@ -19,7 +19,6 @@
 //! - Checking if a token is active.
 
 use super::{ACTIVE_TOKEN_TIMEOUT_SECS, ALLOCATED_TOKEN_TIMEOUT_SECS, JANITOR_INTERVAL_SECS};
-use bitcoin_core_sv2::job_declaration_protocol::CancellationToken;
 use dashmap::DashMap;
 use std::{
     sync::{
@@ -29,6 +28,7 @@ use std::{
     time::{Duration, Instant},
 };
 use stratum_apps::{
+    bitcoin_core_sv2::common::job_declaration_protocol::CancellationToken,
     task_manager::TaskManager,
     utils::types::{DownstreamId, JdToken},
 };

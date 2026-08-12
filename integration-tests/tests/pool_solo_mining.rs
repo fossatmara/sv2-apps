@@ -40,9 +40,9 @@ fn build_coinbase_tx(
     channel_success: &OpenExtendedMiningChannelSuccess,
     new_job: &NewExtendedMiningJob,
 ) -> Transaction {
-    let prefix = new_job.coinbase_tx_prefix.inner_as_ref();
-    let suffix = new_job.coinbase_tx_suffix.inner_as_ref();
-    let extranonce_prefix = channel_success.extranonce_prefix.inner_as_ref();
+    let prefix = new_job.coinbase_tx_prefix.as_bytes();
+    let suffix = new_job.coinbase_tx_suffix.as_bytes();
+    let extranonce_prefix = channel_success.extranonce_prefix.as_bytes();
     let extranonce_suffix = vec![0; channel_success.extranonce_size as usize];
     let mut coinbase = Vec::new();
 
@@ -222,9 +222,9 @@ async fn pool_solo_mining_wrong_user_identity() {
     let open_extended = AnyMessage::Mining(Mining::OpenExtendedMiningChannel(
         OpenExtendedMiningChannel {
             request_id: 0u32,
-            user_identity: "sri/worker.1".to_string().try_into().unwrap(),
+            user_identity: "sri/worker.1".try_into().unwrap(),
             nominal_hash_rate: 1000.0,
-            max_target: vec![0xff; 32].try_into().unwrap(),
+            max_target: [0xff; 32].into(),
             min_extranonce_size: 8,
         },
     ));
@@ -254,9 +254,9 @@ async fn pool_solo_mining_wrong_user_identity() {
     let open_standard = AnyMessage::Mining(Mining::OpenStandardMiningChannel(
         OpenStandardMiningChannel {
             request_id: 0u32.into(),
-            user_identity: "sri/worker.1".to_string().try_into().unwrap(),
+            user_identity: "sri/worker.1".try_into().unwrap(),
             nominal_hash_rate: 1000.0,
-            max_target: vec![0xff; 32].try_into().unwrap(),
+            max_target: [0xff; 32].into(),
         },
     ));
     send_to_pool.send(open_standard).await.unwrap();
@@ -309,9 +309,9 @@ async fn pool_solo_mining_random_user_identity() {
     let open_extended = AnyMessage::Mining(Mining::OpenExtendedMiningChannel(
         OpenExtendedMiningChannel {
             request_id: 0u32,
-            user_identity: "cool_miner/worker.1".to_string().try_into().unwrap(),
+            user_identity: "cool_miner/worker.1".try_into().unwrap(),
             nominal_hash_rate: 1000.0,
-            max_target: vec![0xff; 32].try_into().unwrap(),
+            max_target: [0xff; 32].into(),
             min_extranonce_size: 8,
         },
     ));
@@ -431,9 +431,9 @@ async fn pool_solo_mining_random_user_identity() {
     let open_standard = AnyMessage::Mining(Mining::OpenStandardMiningChannel(
         OpenStandardMiningChannel {
             request_id: 0u32.into(),
-            user_identity: "cool_miner/worker.1".to_string().try_into().unwrap(),
+            user_identity: "cool_miner/worker.1".try_into().unwrap(),
             nominal_hash_rate: 1000.0,
-            max_target: vec![0xff; 32].try_into().unwrap(),
+            max_target: [0xff; 32].into(),
         },
     ));
     send_to_pool.send(open_standard).await.unwrap();
@@ -473,9 +473,9 @@ async fn pool_solo_mining_legacy_pattern() {
     let open_extended = AnyMessage::Mining(Mining::OpenExtendedMiningChannel(
         OpenExtendedMiningChannel {
             request_id: 0u32,
-            user_identity: MINER_COINBASE_REWARD_ADDR.to_string().try_into().unwrap(),
+            user_identity: MINER_COINBASE_REWARD_ADDR.try_into().unwrap(),
             nominal_hash_rate: 1000.0,
-            max_target: vec![0xff; 32].try_into().unwrap(),
+            max_target: [0xff; 32].into(),
             min_extranonce_size: 8,
         },
     ));
@@ -595,9 +595,9 @@ async fn pool_solo_mining_legacy_pattern() {
     let open_standard = AnyMessage::Mining(Mining::OpenStandardMiningChannel(
         OpenStandardMiningChannel {
             request_id: 0u32.into(),
-            user_identity: MINER_COINBASE_REWARD_ADDR.to_string().try_into().unwrap(),
+            user_identity: MINER_COINBASE_REWARD_ADDR.try_into().unwrap(),
             nominal_hash_rate: 1000.0,
-            max_target: vec![0xff; 32].try_into().unwrap(),
+            max_target: [0xff; 32].into(),
         },
     ));
     send_to_pool.send(open_standard).await.unwrap();
@@ -805,9 +805,9 @@ async fn pool_solo_mining_full_donate() {
     let open_extended = AnyMessage::Mining(Mining::OpenExtendedMiningChannel(
         OpenExtendedMiningChannel {
             request_id: 0u32,
-            user_identity: "sri/donate/worker.1".to_string().try_into().unwrap(),
+            user_identity: "sri/donate/worker.1".try_into().unwrap(),
             nominal_hash_rate: 1000.0,
-            max_target: vec![0xff; 32].try_into().unwrap(),
+            max_target: [0xff; 32].into(),
             min_extranonce_size: 8,
         },
     ));
@@ -927,9 +927,9 @@ async fn pool_solo_mining_full_donate() {
     let open_standard = AnyMessage::Mining(Mining::OpenStandardMiningChannel(
         OpenStandardMiningChannel {
             request_id: 0u32.into(),
-            user_identity: "sri/donate/worker.1".to_string().try_into().unwrap(),
+            user_identity: "sri/donate/worker.1".try_into().unwrap(),
             nominal_hash_rate: 1000.0,
-            max_target: vec![0xff; 32].try_into().unwrap(),
+            max_target: [0xff; 32].into(),
         },
     ));
     send_to_pool.send(open_standard).await.unwrap();
@@ -969,9 +969,9 @@ async fn pool_solo_mining_full_donate_no_worker_name() {
     let open_extended = AnyMessage::Mining(Mining::OpenExtendedMiningChannel(
         OpenExtendedMiningChannel {
             request_id: 0u32,
-            user_identity: "sri/donate".to_string().try_into().unwrap(),
+            user_identity: "sri/donate".try_into().unwrap(),
             nominal_hash_rate: 1000.0,
-            max_target: vec![0xff; 32].try_into().unwrap(),
+            max_target: [0xff; 32].into(),
             min_extranonce_size: 8,
         },
     ));
@@ -1091,9 +1091,9 @@ async fn pool_solo_mining_full_donate_no_worker_name() {
     let open_standard = AnyMessage::Mining(Mining::OpenStandardMiningChannel(
         OpenStandardMiningChannel {
             request_id: 0u32.into(),
-            user_identity: "sri/donate".to_string().try_into().unwrap(),
+            user_identity: "sri/donate".try_into().unwrap(),
             nominal_hash_rate: 1000.0,
-            max_target: vec![0xff; 32].try_into().unwrap(),
+            max_target: [0xff; 32].into(),
         },
     ));
     send_to_pool.send(open_standard).await.unwrap();

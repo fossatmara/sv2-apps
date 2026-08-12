@@ -27,12 +27,12 @@ impl WithSetup {
             min_version: 2,
             max_version: 2,
             flags,
-            endpoint_host: b"0.0.0.0".to_vec().try_into().unwrap(),
+            endpoint_host: "0.0.0.0".try_into().unwrap(),
             endpoint_port: 0,
-            vendor: b"integration-test".to_vec().try_into().unwrap(),
-            hardware_version: b"".to_vec().try_into().unwrap(),
-            firmware: b"".to_vec().try_into().unwrap(),
-            device_id: b"".to_vec().try_into().unwrap(),
+            vendor: "integration-test".try_into().unwrap(),
+            hardware_version: "".try_into().unwrap(),
+            firmware: "".try_into().unwrap(),
+            device_id: "".try_into().unwrap(),
         })
     }
 
@@ -224,10 +224,7 @@ impl MockUpstream {
                         }
                     }
                 } else {
-                    panic!(
-                        "MockUpstream: first message must be SetupConnection, got {}",
-                        msg_type
-                    );
+                    panic!("MockUpstream: first message must be SetupConnection, got {msg_type}");
                 }
             }
 

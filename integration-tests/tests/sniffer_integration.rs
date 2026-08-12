@@ -25,12 +25,12 @@ async fn test_sniffer_interception() {
             min_version: 2,
             max_version: 2,
             flags: 0,
-            endpoint_host: b"0.0.0.0".to_vec().try_into().unwrap(),
+            endpoint_host: "0.0.0.0".try_into().unwrap(),
             endpoint_port: 8081,
-            vendor: b"Bitmain".to_vec().try_into().unwrap(),
-            hardware_version: b"901".to_vec().try_into().unwrap(),
-            firmware: b"abcX".to_vec().try_into().unwrap(),
-            device_id: b"89567".to_vec().try_into().unwrap(),
+            vendor: "Bitmain".try_into().unwrap(),
+            hardware_version: "901".try_into().unwrap(),
+            firmware: "abcX".try_into().unwrap(),
+            device_id: "89567".try_into().unwrap(),
         }));
     let setup_connection_replacement = ReplaceMessage::new(
         MessageDirection::ToUpstream,

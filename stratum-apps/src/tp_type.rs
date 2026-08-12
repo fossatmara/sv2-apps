@@ -1,5 +1,11 @@
-use crate::{config_helpers::opt_path_from_toml, key_utils::Secp256k1PublicKey};
+use crate::key_utils::Secp256k1PublicKey;
 use std::path::PathBuf;
+
+#[cfg(feature = "bitcoin-core-sv2")]
+use crate::config_helpers::opt_path_from_toml;
+
+#[cfg(feature = "bitcoin-core-sv2")]
+use bitcoin_core_sv2::common::BitcoinCoreVersion;
 
 /// Bitcoin network for determining node.sock location
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -9,6 +15,19 @@ pub enum BitcoinNetwork {
     Testnet4,
     Signet,
     Regtest,
+}
+
+#[cfg(feature = "bitcoin-core-sv2")]
+fn deserialize_bitcoin_core_version<'de, D>(deserializer: D) -> Result<BitcoinCoreVersion, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let major = <u8 as serde::Deserialize>::deserialize(deserializer)?;
+    BitcoinCoreVersion::try_from(major).map_err(|unsupported| {
+        serde::de::Error::custom(format!(
+            "unsupported Bitcoin Core IPC version: {unsupported}. expected 30 or 31"
+        ))
+    })
 }
 
 impl BitcoinNetwork {
@@ -64,7 +83,11 @@ pub enum TemplateProviderType {
         address: String,
         public_key: Option<Secp256k1PublicKey>,
     },
+    #[cfg(feature = "bitcoin-core-sv2")]
     BitcoinCoreIpc {
+        /// Bitcoin Core IPC schema major version.
+        #[serde(deserialize_with = "deserialize_bitcoin_core_version")]
+        version: BitcoinCoreVersion,
         /// Network for determining socket path subdirectory.
         network: BitcoinNetwork,
         /// Custom Bitcoin data directory. Uses OS default if not set.
@@ -115,5 +138,25 @@ mod tests {
         assert!(result.is_some());
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         assert!(result.is_none());
+    }
+
+    #[cfg(feature = "bitcoin-core-sv2")]
+    #[test]
+    fn bitcoin_core_version_accepts_30_and_31() {
+        assert!(matches!(
+            BitcoinCoreVersion::try_from(30),
+            Ok(BitcoinCoreVersion::V30X)
+        ));
+        assert!(matches!(
+            BitcoinCoreVersion::try_from(31),
+            Ok(BitcoinCoreVersion::V31X)
+        ));
+    }
+
+    #[cfg(feature = "bitcoin-core-sv2")]
+    #[test]
+    fn bitcoin_core_version_rejects_unsupported_values() {
+        assert!(BitcoinCoreVersion::try_from(29).is_err());
+        assert!(BitcoinCoreVersion::try_from(32).is_err());
     }
 }

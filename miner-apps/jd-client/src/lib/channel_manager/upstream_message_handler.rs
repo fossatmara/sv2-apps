@@ -35,9 +35,9 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
         &self,
         _server_id: Option<usize>,
     ) -> Result<Vec<u16>, Self::Error> {
-        Ok(self
-            .channel_manager_data
-            .super_safe_lock(|data| data.negotiated_extensions.clone()))
+        self.negotiated_extensions
+            .with(|data| data.clone())
+            .map_err(JDCError::shutdown)
     }
 
     fn get_channel_type_for_server(&self, _server_id: Option<usize>) -> SupportedChannelTypes {
@@ -89,9 +89,7 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
     ) -> Result<(), Self::Error> {
         info!("Received: {}", msg);
 
-        let coinbase_outputs = self
-            .channel_manager_data
-            .super_safe_lock(|data| data.coinbase_outputs.clone());
+        let coinbase_outputs = self.coinbase_outputs.get().map_err(JDCError::shutdown)?;
 
         let outputs = deserialize_outputs(coinbase_outputs)
             .map_err(|_| JDCError::shutdown(JDCErrorKind::DeclaredJobHasBadCoinbaseOutputs))?;
@@ -112,145 +110,164 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
             return Err(JDCError::fallback(JDCErrorKind::ExtranonceSizeTooSmall));
         }
 
-        let (channel_state, template, custom_job, close_channel) =
-            self.channel_manager_data.super_safe_lock(|data| {
-                let Some(pending_request) = data.pending_downstream_requests.front() else {
-                    self.upstream_state.set(UpstreamState::NoChannel);
-                    let close_channel =
-                        create_close_channel_msg(msg.channel_id, "downstream not available");
-                    return (self.upstream_state.get(), None, None, Some(close_channel));
-                };
+        let Some(hashrate) = self
+            .pending_downstream_requests
+            .with(|pending| pending.front().map(|request| request.hashrate()))
+            .map_err(JDCError::shutdown)?
+        else {
+            self.upstream_state.set(UpstreamState::NoChannel);
+            let close_channel =
+                create_close_channel_msg(msg.channel_id, "downstream not available");
+            let close_channel = Mining::CloseChannel(close_channel);
+            let sv2_frame: Sv2Frame = AnyMessage::Mining(close_channel)
+                .try_into()
+                .map_err(JDCError::shutdown)?;
+            self.channel_manager_io
+                .upstream_sender
+                .send(sv2_frame)
+                .await
+                .map_err(|_e| JDCError::fallback(JDCErrorKind::ChannelErrorSender))?;
+            return Ok(());
+        };
 
-                let hashrate = pending_request.hashrate();
+        let prefix_len = msg.extranonce_prefix.len();
+        let total_len = prefix_len as u16 + msg.extranonce_size;
+        debug!(
+            prefix_len,
+            extranonce_size = msg.extranonce_size,
+            total_len,
+            "Calculated extranonce ranges"
+        );
 
-                let prefix_len = msg.extranonce_prefix.len();
+        let extranonce_allocator = match ExtranonceAllocator::from_upstream_prefix(
+            msg.extranonce_prefix.to_owned_bytes(),
+            Vec::new(),
+            total_len as u8,
+            JDC_MAX_CHANNELS,
+        ) {
+            Ok(allocator) => allocator,
+            Err(e) => {
+                warn!("Failed to build extranonce allocator: {e:?}");
+                self.upstream_state.set(UpstreamState::NoChannel);
+                let close_channel =
+                    create_close_channel_msg(msg.channel_id, "downstream not available");
+                let close_channel = Mining::CloseChannel(close_channel);
+                let sv2_frame: Sv2Frame = AnyMessage::Mining(close_channel)
+                    .try_into()
+                    .map_err(JDCError::shutdown)?;
+                self.channel_manager_io
+                    .upstream_sender
+                    .send(sv2_frame)
+                    .await
+                    .map_err(|_e| JDCError::fallback(JDCErrorKind::ChannelErrorSender))?;
+                return Ok(());
+            }
+        };
 
-                let total_len = prefix_len as u16 + msg.extranonce_size;
+        let pool_tag_string = self.pool_tag_string.get().map_err(JDCError::shutdown)?;
+        let job_factory =
+            JobFactory::new(true, pool_tag_string, Some(self.miner_tag_string.clone()));
+        let extranonce_prefix = ExtranoncePrefix::from_wire(msg.extranonce_prefix.to_owned_bytes())
+            .expect("prefix length already validated by allocator");
+        let mut extended_channel = ExtendedChannel::new(
+            msg.channel_id,
+            self.user_identity().to_string(),
+            extranonce_prefix,
+            Target::from_le_bytes(*msg.target.as_array()),
+            hashrate,
+            true,
+            msg.extranonce_size,
+        );
 
-                debug!(
-                    prefix_len,
-                    extranonce_size = msg.extranonce_size,
-                    total_len,
-                    "Calculated extranonce ranges"
-                );
+        if let Some(prevhash) = self.last_new_prev_hash.get().map_err(JDCError::shutdown)? {
+            _ = extended_channel.on_chain_tip_update(prevhash.clone().into());
+            debug!("Applied last_new_prev_hash to new extended channel");
+        }
 
-                let extranonce_allocator = match ExtranonceAllocator::from_upstream_prefix(
-                    msg.extranonce_prefix.to_vec(),
-                    Vec::new(),
-                    total_len as u8,
-                    JDC_MAX_CHANNELS,
-                ) {
-                    Ok(e) => e,
-                    Err(e) => {
-                        warn!("Failed to build extranonce allocator: {e:?}");
-                        self.upstream_state.set(UpstreamState::NoChannel);
-                        let close_channel =
-                            create_close_channel_msg(msg.channel_id, "downstream not available");
-                        return (self.upstream_state.get(), None, None, Some(close_channel));
-                    }
-                };
-
-                let job_factory = JobFactory::new(
-                    true,
-                    data.pool_tag_string.clone(),
-                    Some(self.miner_tag_string.clone()),
-                );
-
-                // `expect` is safe here: the same `msg.extranonce_prefix`
-                // bytes were already accepted by `ExtranonceAllocator::
-                // from_upstream_prefix` a few lines above, which enforces
-                // `total_extranonce_len <= MAX_EXTRANONCE_LEN` (and the
-                // prefix is bounded by `total_extranonce_len`).
-                let extranonce_prefix = ExtranoncePrefix::from_wire(msg.extranonce_prefix.to_vec())
-                    .expect("prefix length already validated by allocator");
-                let mut extended_channel = ExtendedChannel::new(
-                    msg.channel_id,
-                    self.user_identity().to_string(),
-                    extranonce_prefix,
-                    Target::from_le_bytes(msg.target.inner_as_ref().try_into().unwrap()),
-                    hashrate,
-                    true,
-                    msg.extranonce_size,
-                );
-
-                if let Some(ref mut prevhash) = data.last_new_prev_hash {
-                    _ = extended_channel.on_chain_tip_update(prevhash.clone().into());
-                    debug!("Applied last_new_prev_hash to new extended channel");
-                }
-
-                let set_custom_job = if self.mode.is_coinbase_only()
-                    && data.job_factory.is_some()
-                    && data.last_future_template.is_some()
-                    && data.last_new_prev_hash.is_some()
-                {
-                    if let Some(token) = data.allocate_tokens.pop_front() {
-                        let job_factory = data.job_factory.as_mut().expect("this must be some");
-                        let template = data
-                            .last_future_template
-                            .clone()
-                            .expect("this must be some");
-                        let prevhash = data.last_new_prev_hash.clone().expect("this must be some");
-                        let request_id = data.request_id_factory.fetch_add(1, Ordering::Relaxed);
-
-                        let full_extranonce_size = extended_channel.get_full_extranonce_size();
-
-                        if let Ok(custom_job) = job_factory.new_custom_job(
-                            extended_channel.get_channel_id(),
-                            request_id,
-                            token.mining_job_token,
-                            prevhash.clone().into(),
-                            template.clone(),
-                            outputs,
-                            full_extranonce_size,
-                        ) {
-                            let last_declare = DeclaredJob {
-                                declare_mining_job: None,
-                                template: template.into_static(),
-                                prev_hash: Some(prevhash.into_static()),
-                                set_custom_mining_job: Some(custom_job.clone().into_static()),
-                                coinbase_output: data.coinbase_outputs.clone(),
-                                tx_list: vec![],
-                            };
-
-                            data.last_declare_job_store.insert(request_id, last_declare);
-                            Some(custom_job)
-                        } else {
-                            None
-                        }
-                    } else {
-                        warn!("No token available, discarding custom job");
-                        None
-                    }
-                } else {
-                    None
-                };
-
+        let last_future_template = self
+            .last_future_template
+            .get()
+            .map_err(JDCError::shutdown)?;
+        let last_new_prev_hash = self.last_new_prev_hash.get().map_err(JDCError::shutdown)?;
+        let had_job_factory = self
+            .job_factory
+            .with(|job_factory| job_factory.is_some())
+            .map_err(JDCError::shutdown)?;
+        let set_custom_job = if self.mode.is_coinbase_only()
+            && had_job_factory
+            && last_future_template.is_some()
+            && last_new_prev_hash.is_some()
+        {
+            if let Some(token) = self
+                .allocate_tokens
+                .with(|tokens| tokens.pop_front())
+                .map_err(JDCError::shutdown)?
+            {
+                let template = last_future_template.expect("checked above");
+                let prevhash = last_new_prev_hash.expect("checked above");
+                let request_id = self.request_id_factory.fetch_add(1, Ordering::Relaxed);
                 let full_extranonce_size = extended_channel.get_full_extranonce_size();
 
-                data.extranonce_allocator = extranonce_allocator;
-                data.upstream_channel = Some(extended_channel);
-                data.job_factory = Some(job_factory);
-                self.upstream_state.set(UpstreamState::Connected);
-
-                // set the full extranonce size for the group channel of all downstream clients
-                for (_downstream_id, downstream) in data.downstream.iter_mut() {
-                    downstream
-                        .downstream_data
-                        .super_safe_lock(|downstream_data| {
-                            downstream_data
-                                .group_channel
-                                .set_full_extranonce_size(full_extranonce_size);
-                        });
+                if let Ok(custom_job) = job_factory.new_custom_job(
+                    extended_channel.get_channel_id(),
+                    request_id,
+                    token.mining_job_token,
+                    prevhash.clone().into(),
+                    template.clone(),
+                    outputs,
+                    full_extranonce_size,
+                ) {
+                    self.last_declare_job_store.insert(
+                        request_id,
+                        DeclaredJob {
+                            declare_mining_job: None,
+                            template: template.into_static(),
+                            prev_hash: Some(prevhash.into_static()),
+                            set_custom_mining_job: Some(custom_job.clone().into_static()),
+                            coinbase_output: self
+                                .coinbase_outputs
+                                .get()
+                                .map_err(JDCError::shutdown)?,
+                            tx_list: vec![],
+                        },
+                    );
+                    Some(custom_job)
+                } else {
+                    None
                 }
+            } else {
+                warn!("No token available, discarding custom job");
+                None
+            }
+        } else {
+            None
+        };
 
-                info!("Extended mining channel successfully initialized");
-                (
-                    self.upstream_state.get(),
-                    data.last_future_template.clone(),
-                    set_custom_job,
-                    None,
-                )
-            });
+        let full_extranonce_size = extended_channel.get_full_extranonce_size();
+        self.extranonce_allocator
+            .set(extranonce_allocator)
+            .map_err(JDCError::shutdown)?;
+        self.upstream_channel
+            .set(Some(extended_channel))
+            .map_err(JDCError::shutdown)?;
+        self.job_factory
+            .set(Some(job_factory))
+            .map_err(JDCError::shutdown)?;
+        self.upstream_state.set(UpstreamState::Connected);
+
+        let template = self
+            .last_future_template
+            .get()
+            .map_err(JDCError::shutdown)?;
+        self.downstream.try_for_each(|_, downstream| {
+            downstream
+                .group_channel
+                .with(|group_channel| group_channel.set_full_extranonce_size(full_extranonce_size))
+                .map_err(JDCError::shutdown)
+        })?;
+
+        info!("Extended mining channel successfully initialized");
+        let channel_state = self.upstream_state.get();
 
         if channel_state == UpstreamState::Connected {
             if self.mode.is_full_template() {
@@ -268,7 +285,7 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
             }
 
             if self.mode.is_coinbase_only() {
-                if let Some(custom_job) = custom_job {
+                if let Some(custom_job) = set_custom_job {
                     let set_custom_job = Mining::SetCustomMiningJob(custom_job);
                     let sv2_frame: Sv2Frame = AnyMessage::Mining(set_custom_job)
                         .try_into()
@@ -283,8 +300,9 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
             }
 
             let pending_downstreams = self
-                .channel_manager_data
-                .super_safe_lock(|data| std::mem::take(&mut data.pending_downstream_requests));
+                .pending_downstream_requests
+                .with(std::mem::take)
+                .map_err(JDCError::shutdown)?;
 
             for pending_downstream_message in pending_downstreams {
                 self.send_open_channel_request_to_mining_handler(
@@ -294,19 +312,6 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
                 )
                 .await?;
             }
-        }
-
-        // In case of failure, close the channel with upstream.
-        if let Some(close_channel) = close_channel {
-            let close_channel = Mining::CloseChannel(close_channel);
-            let sv2_frame: Sv2Frame = AnyMessage::Mining(close_channel)
-                .try_into()
-                .map_err(JDCError::shutdown)?;
-            self.channel_manager_io
-                .upstream_sender
-                .send(sv2_frame)
-                .await
-                .map_err(|_e| JDCError::fallback(JDCErrorKind::ChannelErrorSender))?;
         }
 
         Ok(())
@@ -352,9 +357,9 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
     ) -> Result<(), Self::Error> {
         info!("Received: {}", msg);
 
-        self.channel_manager_data.super_safe_lock(|data| {
-            data.upstream_channel = None;
-        });
+        self.upstream_channel
+            .set(None)
+            .map_err(JDCError::fallback)?;
         Err(JDCError::fallback(JDCErrorKind::CloseChannel))
     }
 
@@ -370,156 +375,147 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
         _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         info!("Received: {}", msg);
-        let messages_results =
-            self.channel_manager_data
-                .super_safe_lock(|channel_manager_data| {
-                    let mut messages_results: Vec<Result<RouteMessageTo, Self::Error>> = vec![];
-                    if let Some(upstream_channel) = channel_manager_data.upstream_channel.as_mut() {
-                        // Wire-sourced prefix: upstream could legitimately
-                        // send a malformed (over-size) value. Treat as a
-                        // protocol-level error and fall back.
-                        let new_extranonce_prefix =
-                            match ExtranoncePrefix::from_wire(msg.extranonce_prefix.to_vec()) {
-                                Ok(p) => p,
-                                Err(e) => {
-                                    warn!("Upstream SetExtranoncePrefix rejected: {e:?}");
-                                    return Err(JDCError::fallback(
-                                        JDCErrorKind::ExtranonceSizeTooLarge,
-                                    ));
-                                }
-                            };
-                        if let Err(e) =
-                            upstream_channel.set_extranonce_prefix(new_extranonce_prefix)
-                        {
-                            return Err(JDCError::fallback(e));
-                        }
-
-                        let new_prefix_len = msg.extranonce_prefix.len();
-                        let rollable_extranonce_size =
-                            upstream_channel.get_rollable_extranonce_size();
-                        let full_extranonce_size =
-                            new_prefix_len + rollable_extranonce_size as usize;
-                        if full_extranonce_size > MAX_EXTRANONCE_LEN as usize {
-                            return Err(JDCError::fallback(JDCErrorKind::ExtranonceSizeTooLarge));
-                        }
-
-                        debug!(
-                            new_prefix_len,
-                            rollable_extranonce_size,
-                            full_extranonce_size,
-                            "Calculated extranonce ranges"
-                        );
-                        // `ExtranonceAllocator::from_upstream_prefix` validates on
-                        // its own that the new upstream prefix leaves room for
-                        // JDC's `local_index` (and therefore for downstream
-                        // allocation). If it doesn't, we fall back.
-                        let extranonce_allocator = match ExtranonceAllocator::from_upstream_prefix(
-                            msg.extranonce_prefix.to_vec(),
-                            Vec::new(),
-                            full_extranonce_size as u8,
-                            JDC_MAX_CHANNELS,
-                        ) {
-                            Ok(e) => e,
+        let mut messages_results: Vec<Result<RouteMessageTo, Self::Error>> = vec![];
+        self.upstream_channel
+            .with(|upstream_channel| -> Result<(), Self::Error> {
+                if let Some(upstream_channel) = upstream_channel.as_mut() {
+                    // Wire-sourced prefix: upstream could legitimately
+                    // send a malformed (over-size) value. Treat as a
+                    // protocol-level error and fall back.
+                    let new_extranonce_prefix =
+                        match ExtranoncePrefix::from_wire(msg.extranonce_prefix.to_owned_bytes()) {
+                            Ok(p) => p,
                             Err(e) => {
-                                warn!(
-                                    "Failed to build extranonce allocator from SetExtranoncePrefix \
-                                     (new_prefix_len={}, full_extranonce_size={}): {e:?}",
-                                    new_prefix_len, full_extranonce_size
-                                );
-                                return Err(JDCError::fallback(e));
+                                warn!("Upstream SetExtranoncePrefix rejected: {e:?}");
+                                return Err(JDCError::fallback(
+                                    JDCErrorKind::ExtranonceSizeTooLarge,
+                                ));
                             }
                         };
-
-                        channel_manager_data.extranonce_allocator = extranonce_allocator;
-
-                        for (downstream_id, downstream) in
-                            channel_manager_data.downstream.iter_mut()
-                        {
-                            downstream.downstream_data.super_safe_lock(|data| {
-                                for (channel_id, standard_channel) in
-                                    data.standard_channels.iter_mut()
-                                {
-                                    match channel_manager_data
-                                        .extranonce_allocator
-                                        .allocate_standard()
-                                    {
-                                        Ok(prefix) => {
-                                            let prefix_bytes = prefix.as_bytes().to_vec();
-                                            if let Err(e) =
-                                                standard_channel.set_extranonce_prefix(prefix)
-                                            {
-                                                messages_results.push(Err(JDCError::shutdown(e)));
-                                                continue;
-                                            }
-                                            let extranonce_prefix = match prefix_bytes.try_into() {
-                                                Ok(p) => p,
-                                                Err(e) => {
-                                                    messages_results
-                                                        .push(Err(JDCError::shutdown(e)));
-                                                    continue;
-                                                }
-                                            };
-                                            messages_results.push(Ok((
-                                                *downstream_id,
-                                                Mining::SetExtranoncePrefix(SetExtranoncePrefix {
-                                                    channel_id: *channel_id,
-                                                    extranonce_prefix,
-                                                }),
-                                            )
-                                                .into()));
-                                        }
-                                        Err(e) => {
-                                            messages_results
-                                                .push(Err(JDCError::disconnect(e, *downstream_id)));
-                                        }
-                                    }
-                                }
-                                for (channel_id, extended_channel) in
-                                    data.extended_channels.iter_mut()
-                                {
-                                    match channel_manager_data
-                                        .extranonce_allocator
-                                        .allocate_extended(
-                                            extended_channel.get_rollable_extranonce_size()
-                                                as usize,
-                                        ) {
-                                        Ok(prefix) => {
-                                            let prefix_bytes = prefix.as_bytes().to_vec();
-                                            if let Err(e) =
-                                                extended_channel.set_extranonce_prefix(prefix)
-                                            {
-                                                messages_results.push(Err(JDCError::shutdown(e)));
-                                                continue;
-                                            }
-
-                                            let extranonce_prefix = match prefix_bytes.try_into() {
-                                                Ok(p) => p,
-                                                Err(e) => {
-                                                    messages_results
-                                                        .push(Err(JDCError::shutdown(e)));
-                                                    continue;
-                                                }
-                                            };
-                                            messages_results.push(Ok((
-                                                *downstream_id,
-                                                Mining::SetExtranoncePrefix(SetExtranoncePrefix {
-                                                    channel_id: *channel_id,
-                                                    extranonce_prefix,
-                                                }),
-                                            )
-                                                .into()));
-                                        }
-                                        Err(e) => {
-                                            messages_results
-                                                .push(Err(JDCError::disconnect(e, *downstream_id)));
-                                        }
-                                    }
-                                }
-                            });
-                        }
+                    if let Err(e) = upstream_channel.set_extranonce_prefix(new_extranonce_prefix) {
+                        return Err(JDCError::fallback(e));
                     }
-                    Ok(messages_results)
-                })?;
+
+                    let new_prefix_len = msg.extranonce_prefix.len();
+                    let rollable_extranonce_size = upstream_channel.get_rollable_extranonce_size();
+                    let full_extranonce_size = new_prefix_len + rollable_extranonce_size as usize;
+                    if full_extranonce_size > MAX_EXTRANONCE_LEN as usize {
+                        return Err(JDCError::fallback(JDCErrorKind::ExtranonceSizeTooLarge));
+                    }
+
+                    debug!(
+                        new_prefix_len,
+                        rollable_extranonce_size,
+                        full_extranonce_size,
+                        "Calculated extranonce ranges"
+                    );
+                    // `ExtranonceAllocator::from_upstream_prefix` validates on
+                    // its own that the new upstream prefix leaves room for
+                    // JDC's `local_index` (and therefore for downstream
+                    // allocation). If it doesn't, we fall back.
+                    let extranonce_allocator = match ExtranonceAllocator::from_upstream_prefix(
+                        msg.extranonce_prefix.to_owned_bytes(),
+                        Vec::new(),
+                        full_extranonce_size as u8,
+                        JDC_MAX_CHANNELS,
+                    ) {
+                        Ok(e) => e,
+                        Err(e) => {
+                            warn!(
+                                "Failed to build extranonce allocator from SetExtranoncePrefix \
+                                     (new_prefix_len={}, full_extranonce_size={}): {e:?}",
+                                new_prefix_len, full_extranonce_size
+                            );
+                            return Err(JDCError::fallback(e));
+                        }
+                    };
+
+                    self.extranonce_allocator
+                        .set(extranonce_allocator)
+                        .map_err(JDCError::shutdown)?;
+
+                    self.downstream.for_each(|downstream_id, downstream| {
+                        downstream.standard_channels.for_each_mut(
+                            |channel_id, standard_channel| match self
+                                .extranonce_allocator
+                                .with(|allocator| allocator.allocate_standard())
+                            {
+                                Ok(Ok(prefix)) => {
+                                    let prefix_bytes = prefix.as_bytes().to_vec();
+                                    if let Err(e) = standard_channel.set_extranonce_prefix(prefix) {
+                                        messages_results.push(Err(JDCError::shutdown(e)));
+                                        return;
+                                    }
+                                    let extranonce_prefix = match prefix_bytes.try_into() {
+                                        Ok(p) => p,
+                                        Err(e) => {
+                                            messages_results.push(Err(JDCError::shutdown(e)));
+                                            return;
+                                        }
+                                    };
+                                    messages_results.push(Ok((
+                                        downstream_id,
+                                        Mining::SetExtranoncePrefix(SetExtranoncePrefix {
+                                            channel_id,
+                                            extranonce_prefix,
+                                        }),
+                                    )
+                                        .into()));
+                                }
+                                Ok(Err(e)) => {
+                                    messages_results
+                                        .push(Err(JDCError::disconnect(e, downstream_id)));
+                                }
+                                Err(e) => {
+                                    messages_results.push(Err(JDCError::shutdown(e)));
+                                }
+                            },
+                        );
+                        downstream.extended_channels.for_each_mut(
+                            |channel_id, extended_channel| match self.extranonce_allocator.with(
+                                |allocator| {
+                                    allocator.allocate_extended(
+                                        extended_channel.get_rollable_extranonce_size() as usize,
+                                    )
+                                },
+                            ) {
+                                Ok(Ok(prefix)) => {
+                                    let prefix_bytes = prefix.as_bytes().to_vec();
+                                    if let Err(e) = extended_channel.set_extranonce_prefix(prefix) {
+                                        messages_results.push(Err(JDCError::shutdown(e)));
+                                        return;
+                                    }
+
+                                    let extranonce_prefix = match prefix_bytes.try_into() {
+                                        Ok(p) => p,
+                                        Err(e) => {
+                                            messages_results.push(Err(JDCError::shutdown(e)));
+                                            return;
+                                        }
+                                    };
+                                    messages_results.push(Ok((
+                                        downstream_id,
+                                        Mining::SetExtranoncePrefix(SetExtranoncePrefix {
+                                            channel_id,
+                                            extranonce_prefix,
+                                        }),
+                                    )
+                                        .into()));
+                                }
+                                Ok(Err(e)) => {
+                                    messages_results
+                                        .push(Err(JDCError::disconnect(e, downstream_id)));
+                                }
+                                Err(e) => {
+                                    messages_results.push(Err(JDCError::shutdown(e)));
+                                }
+                            },
+                        );
+                    });
+                }
+                Ok(())
+            })
+            .map_err(JDCError::shutdown)??;
 
         for message in messages_results.into_iter().flatten() {
             // A send can only fail if the receiver side of the channel is closed.
@@ -541,13 +537,16 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
     ) -> Result<(), Self::Error> {
         info!("Received: {} ✅", msg);
 
-        self.channel_manager_data.super_safe_lock(|data| {
-            // if None, upstream is not currently available, so we skip accounting update
-            if let Some(upstream_channel) = data.upstream_channel.as_mut() {
-                upstream_channel
-                    .on_share_acknowledgement(msg.new_submits_accepted_count, msg.new_shares_sum);
-            }
-        });
+        self.upstream_channel
+            .with(|upstream_channel| {
+                if let Some(upstream_channel) = upstream_channel.as_mut() {
+                    upstream_channel.on_share_acknowledgement(
+                        msg.new_submits_accepted_count,
+                        msg.new_shares_sum,
+                    );
+                }
+            })
+            .map_err(JDCError::shutdown)?;
 
         Ok(())
     }
@@ -562,12 +561,13 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
         warn!("Received: {} ❌", msg);
         let error_code = msg.error_code.as_utf8_or_hex();
 
-        self.channel_manager_data.super_safe_lock(|data| {
-            // if None, upstream is not currently available, so we skip accounting update
-            if let Some(upstream_channel) = data.upstream_channel.as_mut() {
-                upstream_channel.on_share_rejection(error_code.clone());
-            }
-        });
+        self.upstream_channel
+            .with(|upstream_channel| {
+                if let Some(upstream_channel) = upstream_channel.as_mut() {
+                    upstream_channel.on_share_rejection(error_code.clone());
+                }
+            })
+            .map_err(JDCError::shutdown)?;
 
         Ok(())
     }
@@ -624,66 +624,70 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
 
         let mut shares_to_submit_upstream = Vec::new();
 
-        self.channel_manager_data.super_safe_lock(|data| {
-            let Some(last_declare_job) = data.last_declare_job_store.remove(&msg.request_id) else {
-                warn!(
-                    request_id = msg.request_id,
-                    "No matching declare job found for custom job success"
-                );
-                return Err(JDCError::fallback(JDCErrorKind::LastDeclareJobNotFound(
-                    msg.request_id,
-                )));
-            };
-
-            let template_id = last_declare_job.template.template_id;
-
-            data.template_id_to_upstream_job_id
-                .insert(template_id, msg.job_id);
-
-            let job_id = msg.job_id;
-
-            let cached_shares = data.cached_shares.remove(&template_id);
-
-            let Some(upstream_channel) = data.upstream_channel.as_mut() else {
-                // This may occur during a fallback transition.
-                // A `SetCustomMiningJob.Success` task can be buffered while the
-                // cleanup task executes first, clearing the upstream channel
-                // before this handler runs.
-                debug!("No upstream channel available");
-                return Err(JDCError::log(JDCErrorKind::UpstreamNotFound));
-            };
-
-            let Some(set_custom_job) = last_declare_job.set_custom_mining_job else {
-                error!("DeclareMiningJob present but SetCustomMiningJob missing");
-                return Err(JDCError::shutdown(JDCErrorKind::CustomJobError));
-            };
-
-            if let Err(e) = upstream_channel.on_set_custom_mining_job_success(set_custom_job, msg) {
-                error!("SetCustomMiningJob.Success validation failed: {e:#?}");
-                match e {
-                    ExtendedChannelError::ChainTipMismatch => return Err(JDCError::log(e)),
-                    // Other variants of this error may occur due to mismatched message fields
-                    // or issues with the coinbase data provided by the upstream. So, triggering
-                    // fallback make sense.
-                    _ => return Err(JDCError::fallback(e)),
-                };
-            }
-
-            let cached_shares = cached_shares.unwrap_or_default();
-
-            debug!(
-                "Handling {} cached shares for template_id={}",
-                cached_shares.len(),
-                template_id
+        let Some((_, last_declare_job)) = self.last_declare_job_store.remove(&msg.request_id)
+        else {
+            warn!(
+                request_id = msg.request_id,
+                "No matching declare job found for custom job success"
             );
+            return Err(JDCError::fallback(JDCErrorKind::LastDeclareJobNotFound(
+                msg.request_id,
+            )));
+        };
 
-            for mut share in cached_shares {
-                share.share.job_id = job_id;
+        let template_id = last_declare_job.template.template_id;
+        let job_id = msg.job_id;
+        self.template_id_to_upstream_job_id
+            .insert(template_id, job_id);
+        let cached_shares = self
+            .cached_shares
+            .remove(&template_id)
+            .map(|(_, shares)| shares);
+        let prev_hash = self.last_new_prev_hash.get().map_err(JDCError::shutdown)?;
 
-                validate_cached_share(share.share, data, &mut shares_to_submit_upstream);
-            }
-            Ok(())
-        })?;
+        self.upstream_channel
+            .with(|upstream_channel| -> Result<(), Self::Error> {
+                let Some(upstream_channel) = upstream_channel.as_mut() else {
+                    debug!("No upstream channel available");
+                    return Err(JDCError::log(JDCErrorKind::UpstreamNotFound));
+                };
+
+                let Some(set_custom_job) = last_declare_job.set_custom_mining_job else {
+                    error!("DeclareMiningJob present but SetCustomMiningJob missing");
+                    return Err(JDCError::shutdown(JDCErrorKind::CustomJobError));
+                };
+
+                if let Err(e) =
+                    upstream_channel.on_set_custom_mining_job_success(set_custom_job, msg)
+                {
+                    error!("SetCustomMiningJob.Success validation failed: {e:#?}");
+                    return match e {
+                        ExtendedChannelError::ChainTipMismatch => Err(JDCError::log(e)),
+                        _ => Err(JDCError::fallback(e)),
+                    };
+                }
+
+                if let (Some(prev_hash), Some(cached_shares)) = (prev_hash.as_ref(), cached_shares)
+                {
+                    debug!(
+                        "Handling {} cached shares for template_id={}",
+                        cached_shares.len(),
+                        template_id
+                    );
+                    for mut share in cached_shares {
+                        share.share.job_id = job_id;
+                        validate_cached_share(
+                            share.share,
+                            upstream_channel,
+                            prev_hash,
+                            &self.sequence_number_factory,
+                            &mut shares_to_submit_upstream,
+                        );
+                    }
+                }
+                Ok(())
+            })
+            .map_err(JDCError::shutdown)??;
 
         // The result can be safely ignored. A send failure usually means the channel
         // endpoint has been dropped (e.g., during disconnect or shutdown).
@@ -715,12 +719,10 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
                 "Received non-fatal SetCustomMiningJobError from upstream: stale-chain-tip (request_id={})",
                 msg.request_id
             );
-            self.channel_manager_data.super_safe_lock(|data| {
-                if let Some(declared_job) = data.last_declare_job_store.remove(&msg.request_id) {
-                    data.cached_shares
-                        .remove(&declared_job.template.template_id);
-                }
-            });
+            if let Some((_, declared_job)) = self.last_declare_job_store.remove(&msg.request_id) {
+                self.cached_shares
+                    .remove(&declared_job.template.template_id);
+            }
             return Ok(());
         }
 
@@ -740,13 +742,15 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
         _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         info!("Received: {}", msg);
-        self.channel_manager_data.super_safe_lock(|data| {
-            if let Some(ref mut upstream) = data.upstream_channel {
-                upstream.set_target(Target::from_le_bytes(
-                    msg.maximum_target.clone().as_ref().try_into().unwrap(),
-                ));
-            }
-        });
+        self.upstream_channel
+            .with(|upstream_channel| {
+                if let Some(upstream) = upstream_channel.as_mut() {
+                    upstream.set_target(Target::from_le_bytes(
+                        msg.maximum_target.clone().as_ref().try_into().unwrap(),
+                    ));
+                }
+            })
+            .map_err(JDCError::shutdown)?;
         Ok(())
     }
 

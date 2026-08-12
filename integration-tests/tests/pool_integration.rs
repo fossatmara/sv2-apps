@@ -8,7 +8,7 @@ use integration_tests_sv2::{
     *,
 };
 use stratum_apps::stratum_core::{
-    binary_sv2::{Seq0255, U256},
+    binary_sv2::Seq0255,
     common_messages_sv2::{has_work_selection, Protocol, SetupConnection, *},
     mining_sv2::*,
     parsers_sv2::{self, AnyMessage, CommonMessages, Mining, TemplateDistribution},
@@ -385,11 +385,11 @@ async fn pool_reject_setup_connection_with_non_mining_protocol() {
     start_tracing();
     let (_tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
     let (pool, pool_addr, _) = start_pool(sv2_tp_config(tp_addr), vec![], vec![], false).await;
-    let endpoint_host = "127.0.0.1".to_string().into_bytes().try_into().unwrap();
-    let vendor = String::new().try_into().unwrap();
-    let hardware_version = String::new().try_into().unwrap();
-    let firmware = String::new().try_into().unwrap();
-    let device_id = String::new().try_into().unwrap();
+    let endpoint_host = "127.0.0.1".try_into().unwrap();
+    let vendor = "".try_into().unwrap();
+    let hardware_version = "".try_into().unwrap();
+    let firmware = "".try_into().unwrap();
+    let device_id = "".try_into().unwrap();
 
     let setup_connection_replace = ReplaceMessage::new(
         MessageDirection::ToUpstream,
@@ -485,9 +485,9 @@ async fn pool_without_jds_rejects_set_custom_mining_job() {
         AnyMessage::Mining(Mining::SetCustomMiningJob(SetCustomMiningJob {
             channel_id: 1,
             request_id: 7,
-            token: 42_u64.to_le_bytes().to_vec().try_into().unwrap(),
+            token: 42_u64.to_le_bytes().try_into().unwrap(),
             version: 0,
-            prev_hash: U256::Owned(vec![0_u8; 32]),
+            prev_hash: [0_u8; 32].into(),
             min_ntime: 0,
             nbits: 0,
             coinbase_tx_version: 0,
@@ -556,9 +556,9 @@ async fn pool_group_extended_channels() {
         let open_extended_mining_channel = AnyMessage::Mining(Mining::OpenExtendedMiningChannel(
             OpenExtendedMiningChannel {
                 request_id: i.into(),
-                user_identity: b"user_identity".to_vec().try_into().unwrap(),
+                user_identity: "user_identity".try_into().unwrap(),
                 nominal_hash_rate: 1000.0,
-                max_target: vec![0xff; 32].try_into().unwrap(),
+                max_target: [0xff; 32].into(),
                 min_extranonce_size: 0,
             },
         ));
@@ -723,7 +723,7 @@ async fn pool_group_standard_channels() {
         let open_standard_mining_channel = AnyMessage::Mining(Mining::OpenStandardMiningChannel(
             OpenStandardMiningChannel {
                 request_id: i.into(),
-                user_identity: b"user_identity".to_vec().try_into().unwrap(),
+                user_identity: "user_identity".try_into().unwrap(),
                 nominal_hash_rate: 1000.0,
                 max_target: vec![0xff; 32].try_into().unwrap(),
             },
@@ -906,7 +906,7 @@ async fn pool_require_standard_jobs_set_does_not_group_standard_channels() {
         let open_standard_mining_channel = AnyMessage::Mining(Mining::OpenStandardMiningChannel(
             OpenStandardMiningChannel {
                 request_id: i.into(),
-                user_identity: b"user_identity".to_vec().try_into().unwrap(),
+                user_identity: "user_identity".try_into().unwrap(),
                 nominal_hash_rate: 1000.0,
                 max_target: vec![0xff; 32].try_into().unwrap(),
             },
@@ -1035,7 +1035,7 @@ async fn pool_require_standard_jobs_set_does_not_group_standard_channels() {
 #[tokio::test]
 async fn pool_require_standard_jobs_set_rejects_open_extended_mining_channel() {
     start_tracing();
-    let bitcoin_core = start_bitcoin_core(DifficultyLevel::Low);
+    let bitcoin_core = start_bitcoin_core_latest(DifficultyLevel::Low);
     let (pool, pool_addr, _) = start_pool(
         ipc_config(
             bitcoin_core.data_dir().clone(),
@@ -1066,7 +1066,7 @@ async fn pool_require_standard_jobs_set_rejects_open_extended_mining_channel() {
     let open_extended_mining_channel = AnyMessage::Mining(Mining::OpenExtendedMiningChannel(
         OpenExtendedMiningChannel {
             request_id: 100u32.into(),
-            user_identity: b"user_identity".to_vec().try_into().unwrap(),
+            user_identity: "user_identity".try_into().unwrap(),
             nominal_hash_rate: 1000.0,
             max_target: vec![0xff; 32].try_into().unwrap(),
             min_extranonce_size: 8,

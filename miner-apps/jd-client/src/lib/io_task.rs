@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use async_channel::{Receiver, Sender};
-use bitcoin_core_sv2::template_distribution_protocol::CancellationToken;
 use stratum_apps::{
+    bitcoin_core_sv2::common::template_distribution_protocol::CancellationToken,
     channel_utils::ReceiverCleanup,
     fallback_coordinator::{FallbackCoordinator, FallbackHandler},
     network_helpers::noise_stream::{NoiseTcpReadHalf, NoiseTcpWriteHalf},

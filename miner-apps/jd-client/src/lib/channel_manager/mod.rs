@@ -1,5 +1,5 @@
 use std::{
-    collections::{BinaryHeap, HashMap, VecDeque},
+    collections::{BinaryHeap, VecDeque},
     net::SocketAddr,
     sync::{
         atomic::{AtomicU32, AtomicUsize, Ordering},
@@ -8,11 +8,10 @@ use std::{
 };
 
 use async_channel::{unbounded, Receiver, Sender};
-use bitcoin_core_sv2::template_distribution_protocol::CancellationToken;
 use stratum_apps::{
+    bitcoin_core_sv2::common::template_distribution_protocol::CancellationToken,
     channel_utils::ReceiverCleanup,
     coinbase_output_constraints::coinbase_output_constraints_message,
-    custom_mutex::Mutex,
     fallback_coordinator::FallbackCoordinator,
     key_utils::{Secp256k1PublicKey, Secp256k1SecretKey},
     network_helpers::accept_noise_connection,
@@ -22,14 +21,7 @@ use stratum_apps::{
             client::extended::ExtendedChannel,
             extranonce_manager::{bytes_needed, ExtranonceAllocator},
             outputs::deserialize_outputs,
-            server::{
-                group::GroupChannel,
-                jobs::{
-                    extended::ExtendedJob, factory::JobFactory, job_store::DefaultJobStore,
-                    standard::StandardJob,
-                },
-                standard::StandardChannel,
-            },
+            server::{group::GroupChannel, jobs::factory::JobFactory, standard::StandardChannel},
             Vardiff, VardiffState,
         },
         framing_sv2,
@@ -45,6 +37,7 @@ use stratum_apps::{
         parsers_sv2::{AnyMessage, JobDeclaration, Mining, TemplateDistribution, Tlv},
         template_distribution_sv2::{NewTemplate, SetNewPrevHash as SetNewPrevHashTdp},
     },
+    sync::{SharedLock, SharedMap},
     task_manager::TaskManager,
     utils::{
         protocol_message_type::{protocol_message_type, MessageType},
@@ -68,6 +61,8 @@ use crate::{
         SharesOrderedByDiff, UpstreamState,
     },
 };
+#[cfg(feature = "monitoring")]
+use stratum_apps::monitoring::MinerTelemetry;
 pub mod downstream_message_handler;
 mod extensions_message_handler;
 mod jd_message_handler;
@@ -133,103 +128,6 @@ pub struct DeclaredJob {
     tx_list: Vec<Vec<u8>>,
 }
 
-/// Central state container for the **Channel Manager**.
-///
-/// `ChannelManagerData` holds all runtime state that the JDC
-/// needs to manage downstream clients, upstream connections, extranonce allocation,
-/// job tracking, and various ID factories.  
-pub struct ChannelManagerData {
-    // Mapping of `downstream_id` → `Downstream` object,
-    // used by the channel manager to locate and interact with downstream clients.
-    pub downstream: HashMap<DownstreamId, Downstream>,
-    // Unified extranonce prefix allocator shared by standard and extended
-    // downstream channels. Rebuilt with the upstream-assigned prefix whenever
-    // the upstream connection is (re)negotiated or `SetExtranoncePrefix` is
-    // received. The allocated [`ExtranoncePrefix`] is stored on the channel
-    // itself, so dropping the channel automatically releases the slot.
-    extranonce_allocator: ExtranonceAllocator,
-    // Factory that generates **monotonically increasing request IDs**
-    // for messages sent from the JDC.
-    request_id_factory: AtomicU32,
-    // Factory that assigns a unique ID to each new **downstream connection**.
-    downstream_id_factory: AtomicUsize,
-    // Factory that assigns a unique **sequence number** to each share
-    // submitted from the JDC to the upstream.
-    pub sequence_number_factory: AtomicU32,
-    // The last **future template** received from the upstream.
-    last_future_template: Option<NewTemplate<'static>>,
-    // The last **new prevhash** received from the upstream.
-    pub last_new_prev_hash: Option<SetNewPrevHashTdp<'static>>,
-    // FIFO buffer of allocation tokens received from the JDS.
-    // Oldest token is consumed first to minimize risk of JDS-side expiration.
-    allocate_tokens: VecDeque<AllocateMiningJobTokenSuccess<'static>>,
-    // Stores new templates as they arrive, mapped by their **template ID**.
-    template_store: HashMap<TemplateId, NewTemplate<'static>>,
-    // Stores the last declared job, keyed by the `request_id` used when
-    // declaring the job to the JDS.
-    // This is later used to send a `SetCustomMiningJob`.
-    last_declare_job_store: HashMap<RequestId, DeclaredJob>,
-    // Maps a template ID → corresponding upstream job ID.
-    template_id_to_upstream_job_id: HashMap<TemplateId, UpstreamJobId>,
-    // Maps a downstream ID + channel_id + job ID → corresponding template ID.
-    downstream_channel_id_and_job_id_to_template_id: HashMap<DownstreamChannelJobId, TemplateId>,
-    // The coinbase outputs currently in use.
-    coinbase_outputs: Vec<u8>,
-    // The active upstream extended channel (client-side instance), if any.
-    pub upstream_channel: Option<ExtendedChannel<'static>>,
-    // Optional "pool tag" string, identifying the pool.
-    pool_tag_string: Option<String>,
-    // List of pending downstream connection requests,
-    // persisted while the JDC is opening a channel with the upstream.
-    pending_downstream_requests: VecDeque<PendingChannelRequest>,
-    // Factory for creating **custom mining jobs**, if available.
-    job_factory: Option<JobFactory>,
-    // Mapping of `(downstream_id, channel_id)` → vardiff controller.
-    // Each entry manages variable difficulty for a specific downstream channel.
-    vardiff: HashMap<VardiffKey, VardiffState>,
-    /// Extensions that have been successfully negotiated with the upstream server
-    negotiated_extensions: Vec<u16>,
-    /// Extensions that the JDC supports
-    supported_extensions: Vec<u16>,
-    /// Extensions that the JDC requires
-    required_extensions: Vec<u16>,
-    /// Cached shares waiting for `SetCustomMiningJob.Success` to be propagated upstream
-    cached_shares: HashMap<TemplateId, BinaryHeap<SharesOrderedByDiff>>,
-}
-
-impl ChannelManagerData {
-    /// Resets the internal state of the Channel Manager.
-    ///
-    /// This method is primarily used during **fallback scenarios** to clear and
-    /// reinitialize all internal data structures. It ensures that the Channel Manager
-    /// returns to a clean state, ready to handle fresh upstream or downstream connections.
-    pub fn reset(&mut self, coinbase_outputs: Vec<u8>) {
-        self.downstream.clear();
-        self.template_store.clear();
-        self.last_declare_job_store.clear();
-        self.template_id_to_upstream_job_id.clear();
-        self.downstream_channel_id_and_job_id_to_template_id.clear();
-        self.pending_downstream_requests.clear();
-        self.cached_shares.clear();
-
-        self.downstream_id_factory = AtomicUsize::new(0);
-        self.request_id_factory = AtomicU32::new(0);
-
-        // Reset the allocator to its solo-mining default. When upstream
-        // reconnects with a new extranonce prefix it will be rebuilt via
-        // [`ExtranonceAllocator::from_upstream_prefix`] in the upstream handler.
-        self.extranonce_allocator =
-            ExtranonceAllocator::new(Vec::new(), SOLO_FULL_EXTRANONCE_SIZE, JDC_MAX_CHANNELS)
-                .expect("Failed to create ExtranonceAllocator with valid parameters");
-
-        self.allocate_tokens.clear();
-        self.upstream_channel = None;
-        self.pool_tag_string = None;
-
-        self.coinbase_outputs = coinbase_outputs;
-    }
-}
-
 /// Represents all communication channels managed by the Channel Manager.
 ///
 /// The `ChannelManagerIo` holds all the asynchronous communication primitives
@@ -264,7 +162,7 @@ pub struct ChannelManagerIo {
     jd_receiver: Receiver<JobDeclaration<'static>>,
     tp_sender: Sender<TemplateDistribution<'static>>,
     tp_receiver: Receiver<TemplateDistribution<'static>>,
-    downstream_sender: Arc<Mutex<HashMap<DownstreamId, Sender<DownstreamMessage>>>>,
+    downstream_sender: SharedMap<DownstreamId, Sender<DownstreamMessage>>,
     downstream_receiver: Receiver<(DownstreamId, Mining<'static>, Option<Vec<Tlv>>)>,
 }
 
@@ -279,12 +177,8 @@ impl ChannelManagerIo {
             self.tp_receiver.close_and_drain();
         }
         self.downstream_receiver.close_and_drain();
-        self.downstream_sender.super_safe_lock(|downstreams| {
-            for sender in downstreams.values() {
-                sender.close();
-            }
-            downstreams.clear();
-        });
+        self.downstream_sender.for_each(|_, sender| sender.close());
+        self.downstream_sender.clear();
     }
 }
 
@@ -293,8 +187,64 @@ impl ChannelManagerIo {
 /// to perform message traversal.
 #[derive(Clone)]
 pub struct ChannelManager {
-    pub channel_manager_data: Arc<Mutex<ChannelManagerData>>,
     channel_manager_io: ChannelManagerIo,
+    // Mapping of `downstream_id` -> `Downstream` object,
+    // used by the channel manager to locate and interact with downstream clients.
+    pub downstream: SharedMap<DownstreamId, Downstream>,
+    // Unified extranonce prefix allocator shared by standard and extended
+    // downstream channels. Rebuilt with the upstream-assigned prefix whenever
+    // the upstream connection is (re)negotiated or `SetExtranoncePrefix` is
+    // received. The allocated prefix is stored on the channel itself, so
+    // dropping the channel automatically releases the slot.
+    pub extranonce_allocator: SharedLock<ExtranonceAllocator>,
+    // Factory that generates monotonically increasing request IDs
+    // for messages sent from the JDC.
+    pub request_id_factory: Arc<AtomicU32>,
+    // Factory that assigns a unique ID to each new downstream connection.
+    pub downstream_id_factory: Arc<AtomicUsize>,
+    // Factory that assigns a unique sequence number to each share
+    // submitted from the JDC to the upstream.
+    pub sequence_number_factory: Arc<AtomicU32>,
+    // The last future template received from the template provider.
+    pub last_future_template: SharedLock<Option<NewTemplate<'static>>>,
+    // The last new-prevhash received from the template provider.
+    pub last_new_prev_hash: SharedLock<Option<SetNewPrevHashTdp<'static>>>,
+    // FIFO buffer of allocation tokens received from the JDS.
+    // Oldest token is consumed first to minimize risk of JDS-side expiration.
+    pub allocate_tokens: SharedLock<VecDeque<AllocateMiningJobTokenSuccess<'static>>>,
+    // Stores templates as they arrive, keyed by template ID.
+    pub template_store: SharedMap<TemplateId, NewTemplate<'static>>,
+    // Stores the last declared job, keyed by the request ID used
+    // when declaring the job to the JDS.
+    pub last_declare_job_store: SharedMap<RequestId, DeclaredJob>,
+    // Maps a template ID to the corresponding upstream job ID.
+    pub template_id_to_upstream_job_id: SharedMap<TemplateId, UpstreamJobId>,
+    // Maps a downstream ID + channel ID + job ID to the corresponding template ID.
+    pub downstream_channel_id_and_job_id_to_template_id:
+        SharedMap<DownstreamChannelJobId, TemplateId>,
+    // The coinbase outputs currently in use.
+    pub coinbase_outputs: SharedLock<Vec<u8>>,
+    // The active upstream extended channel (client-side instance), if any.
+    pub upstream_channel: SharedLock<Option<ExtendedChannel<'static>>>,
+    // Optional "pool tag" string identifying the upstream pool.
+    pub pool_tag_string: SharedLock<Option<String>>,
+    // Pending downstream open-channel requests buffered while JDC is
+    // bringing up or re-establishing the upstream channel.
+    pub pending_downstream_requests: SharedLock<VecDeque<PendingChannelRequest>>,
+    // Factory used to create custom mining jobs, when available.
+    pub job_factory: SharedLock<Option<JobFactory>>,
+    // Mapping of `(downstream_id, channel_id)` -> vardiff controller.
+    // Each entry manages variable difficulty for a specific downstream channel.
+    pub vardiff: SharedMap<VardiffKey, VardiffState>,
+    /// Extensions that have been successfully negotiated with the upstream server.
+    pub negotiated_extensions: SharedLock<Vec<u16>>,
+    /// Extensions that the JDC supports.
+    pub supported_extensions: Vec<u16>,
+    /// Extensions that the JDC requires.
+    pub required_extensions: Vec<u16>,
+    /// Cached shares waiting for `SetCustomMiningJob.Success` before they can be
+    /// validated again and propagated upstream.
+    pub cached_shares: SharedMap<TemplateId, BinaryHeap<SharesOrderedByDiff>>,
     miner_tag_string: String,
     share_batch_size: SharesBatchSize,
     shares_per_minute: SharesPerMinute,
@@ -307,10 +257,64 @@ pub struct ChannelManager {
     /// 4. SoloMining: No upstream is available; the JDC operates in solo mining mode. case.
     pub upstream_state: AtomicUpstreamState,
     pub mode: JDMode,
+    #[cfg(feature = "monitoring")]
+    pub(crate) miner_telemetry: SharedMap<DownstreamId, MinerTelemetry>,
 }
 
 #[cfg_attr(not(test), hotpath::measure_all)]
 impl ChannelManager {
+    #[allow(clippy::result_large_err)]
+    fn reset_runtime_state(
+        &self,
+        coinbase_outputs: Vec<u8>,
+    ) -> JDCResult<(), error::ChannelManager> {
+        self.downstream.clear();
+        self.template_store.clear();
+        self.last_declare_job_store.clear();
+        self.template_id_to_upstream_job_id.clear();
+        self.downstream_channel_id_and_job_id_to_template_id.clear();
+        self.pending_downstream_requests
+            .with(|pending| pending.clear())
+            .map_err(JDCError::shutdown)?;
+        self.cached_shares.clear();
+        self.allocate_tokens
+            .with(|tokens| tokens.clear())
+            .map_err(JDCError::shutdown)?;
+        self.upstream_channel
+            .with(|channel| *channel = None)
+            .map_err(JDCError::shutdown)?;
+        self.pool_tag_string
+            .with(|pool_tag| *pool_tag = None)
+            .map_err(JDCError::shutdown)?;
+        self.job_factory
+            .with(|job_factory| *job_factory = None)
+            .map_err(JDCError::shutdown)?;
+        self.last_future_template
+            .with(|template| *template = None)
+            .map_err(JDCError::shutdown)?;
+        self.last_new_prev_hash
+            .with(|prev_hash| *prev_hash = None)
+            .map_err(JDCError::shutdown)?;
+        self.negotiated_extensions
+            .with(|extensions| extensions.clear())
+            .map_err(JDCError::shutdown)?;
+        self.coinbase_outputs
+            .with(|outputs| *outputs = coinbase_outputs)
+            .map_err(JDCError::shutdown)?;
+        self.request_id_factory.store(0, Ordering::Relaxed);
+        self.downstream_id_factory.store(0, Ordering::Relaxed);
+        self.sequence_number_factory.store(1, Ordering::Relaxed);
+        self.vardiff.clear();
+
+        let allocator =
+            ExtranonceAllocator::new(Vec::new(), SOLO_FULL_EXTRANONCE_SIZE, JDC_MAX_CHANNELS)
+                .expect("Failed to create ExtranonceAllocator with valid parameters");
+        self.extranonce_allocator
+            .with(|inner| *inner = allocator)
+            .map_err(JDCError::shutdown)?;
+        Ok(())
+    }
+
     fn handle_error_action(
         &self,
         context: &str,
@@ -393,31 +397,6 @@ impl ChannelManager {
             ExtranonceAllocator::new(Vec::new(), SOLO_FULL_EXTRANONCE_SIZE, JDC_MAX_CHANNELS)
                 .map_err(JDCError::<error::ChannelManager>::shutdown)?;
 
-        let channel_manager_data = Arc::new(Mutex::new(ChannelManagerData {
-            downstream: HashMap::new(),
-            extranonce_allocator,
-            downstream_id_factory: AtomicUsize::new(0),
-            request_id_factory: AtomicU32::new(0),
-            sequence_number_factory: AtomicU32::new(1),
-            last_future_template: None,
-            last_new_prev_hash: None,
-            allocate_tokens: VecDeque::new(),
-            template_store: HashMap::new(),
-            last_declare_job_store: HashMap::new(),
-            template_id_to_upstream_job_id: HashMap::new(),
-            downstream_channel_id_and_job_id_to_template_id: HashMap::new(),
-            coinbase_outputs,
-            upstream_channel: None,
-            pool_tag_string: None,
-            pending_downstream_requests: VecDeque::new(),
-            job_factory: None,
-            vardiff: HashMap::new(),
-            negotiated_extensions: vec![],
-            supported_extensions,
-            required_extensions,
-            cached_shares: HashMap::new(),
-        }));
-
         let channel_manager_io = ChannelManagerIo {
             upstream_sender,
             upstream_receiver,
@@ -425,13 +404,34 @@ impl ChannelManager {
             jd_receiver,
             tp_sender,
             tp_receiver,
-            downstream_sender: Arc::new(Mutex::new(HashMap::new())),
+            downstream_sender: SharedMap::new(),
             downstream_receiver,
         };
 
         let channel_manager = ChannelManager {
-            channel_manager_data,
             channel_manager_io,
+            downstream: SharedMap::new(),
+            extranonce_allocator: SharedLock::new(extranonce_allocator),
+            request_id_factory: Arc::new(AtomicU32::new(0)),
+            downstream_id_factory: Arc::new(AtomicUsize::new(0)),
+            sequence_number_factory: Arc::new(AtomicU32::new(1)),
+            last_future_template: SharedLock::new(None),
+            last_new_prev_hash: SharedLock::new(None),
+            allocate_tokens: SharedLock::new(VecDeque::new()),
+            template_store: SharedMap::new(),
+            last_declare_job_store: SharedMap::new(),
+            template_id_to_upstream_job_id: SharedMap::new(),
+            downstream_channel_id_and_job_id_to_template_id: SharedMap::new(),
+            coinbase_outputs: SharedLock::new(coinbase_outputs),
+            upstream_channel: SharedLock::new(None),
+            pool_tag_string: SharedLock::new(None),
+            pending_downstream_requests: SharedLock::new(VecDeque::new()),
+            job_factory: SharedLock::new(None),
+            vardiff: SharedMap::new(),
+            negotiated_extensions: SharedLock::new(vec![]),
+            supported_extensions,
+            required_extensions,
+            cached_shares: SharedMap::new(),
             share_batch_size: config.share_batch_size(),
             shares_per_minute: config.shares_per_minute(),
             miner_tag_string: config.jdc_signature().to_string(),
@@ -440,6 +440,8 @@ impl ChannelManager {
                 .reserved_downstream_rollable_extranonce_size(),
             upstream_state: AtomicUpstreamState::new(UpstreamState::SoloMining),
             mode,
+            #[cfg(feature = "monitoring")]
+            miner_telemetry: SharedMap::new(),
         };
 
         Ok(channel_manager)
@@ -459,35 +461,45 @@ impl ChannelManager {
     // Returns a `GroupChannel` if successful, otherwise returns `None`.
     //
     // To be called before calling Downstream::new.
-    fn bootstrap_group_channel(
-        &self,
-        channel_id: ChannelId,
-    ) -> Option<GroupChannel<'static, DefaultJobStore<ExtendedJob<'static>>>> {
-        let (full_extranonce_size, pool_tag_string, last_future_template, last_new_prev_hash) =
-            self.channel_manager_data.super_safe_lock(|data| {
-                (
-                    data.upstream_channel
-                        .as_ref()
-                        .map(|channel| channel.get_full_extranonce_size())
-                        .unwrap_or(SOLO_FULL_EXTRANONCE_SIZE as usize), /* Default to
-                                                                         * SOLO_FULL_EXTRANONCE_SIZE if
-                                                                         * upstream channel is
-                                                                         * not
-                                                                         * present
-                                                                         * (solo mining mode) */
-                    data.pool_tag_string.clone(),
-                    data.last_future_template
-                        .clone()
-                        .expect("No future template found after readiness check"),
-                    data.last_new_prev_hash
-                        .clone()
-                        .expect("No new prevhash found after readiness check"),
-                )
-            });
+    fn bootstrap_group_channel(&self, channel_id: ChannelId) -> Option<GroupChannel<'static>> {
+        let full_extranonce_size = match self.upstream_channel.with(|channel| {
+            channel
+                .as_ref()
+                .map(|channel| channel.get_full_extranonce_size())
+                .unwrap_or(SOLO_FULL_EXTRANONCE_SIZE as usize)
+        }) {
+            Ok(size) => size,
+            Err(e) => {
+                error!(error = ?JDCErrorKind::from(e), "Failed to access upstream channel state");
+                return None;
+            }
+        };
+        let pool_tag_string = match self.pool_tag_string.get() {
+            Ok(pool_tag_string) => pool_tag_string,
+            Err(e) => {
+                error!(error = ?JDCErrorKind::from(e), "Failed to access pool tag state");
+                return None;
+            }
+        };
+        let last_future_template = match self.last_future_template.get() {
+            Ok(Some(template)) => template,
+            Ok(None) => unreachable!("No future template found after readiness check"),
+            Err(e) => {
+                error!(error = ?JDCErrorKind::from(e), "Failed to access template state");
+                return None;
+            }
+        };
+        let last_new_prev_hash = match self.last_new_prev_hash.get() {
+            Ok(Some(prev_hash)) => prev_hash,
+            Ok(None) => unreachable!("No new prevhash found after readiness check"),
+            Err(e) => {
+                error!(error = ?JDCErrorKind::from(e), "Failed to access prevhash state");
+                return None;
+            }
+        };
         let miner_tag_string = self.miner_tag_string.clone();
         let mut group_channel = match GroupChannel::new_for_job_declaration_client(
             channel_id,
-            DefaultJobStore::new(),
             full_extranonce_size,
             pool_tag_string.clone(),
             miner_tag_string.clone(),
@@ -499,9 +511,13 @@ impl ChannelManager {
             }
         };
 
-        let coinbase_outputs = self
-            .channel_manager_data
-            .super_safe_lock(|data| data.coinbase_outputs.clone());
+        let coinbase_outputs = match self.coinbase_outputs.get() {
+            Ok(outputs) => outputs,
+            Err(e) => {
+                error!(error = ?JDCErrorKind::from(e), "Failed to access channel manager state");
+                return None;
+            }
+        };
         let mut coinbase_outputs = match deserialize_outputs(coinbase_outputs) {
             Ok(outputs) => outputs,
             Err(e) => {
@@ -549,9 +565,14 @@ impl ChannelManager {
         // Wait for initial template and prevhash before accepting connections
         let fallback_token = fallback_coordinator.token();
         loop {
-            let has_required_data = this.channel_manager_data.super_safe_lock(|data| {
-                data.last_future_template.is_some() && data.last_new_prev_hash.is_some()
-            });
+            let has_required_data = this
+                .last_future_template
+                .with(|template| template.is_some())
+                .map_err(JDCError::shutdown)?
+                && this
+                    .last_new_prev_hash
+                    .with(|prev_hash| prev_hash.is_some())
+                    .map_err(JDCError::shutdown)?;
 
             if has_required_data {
                 info!("Required template data received, ready to accept connections");
@@ -625,8 +646,7 @@ impl ChannelManager {
                                         }
                                     };
 
-                                    let downstream_id = this.channel_manager_data
-                                        .super_safe_lock(|data| data.downstream_id_factory.fetch_add(1, Ordering::Relaxed));
+                                    let downstream_id = this.downstream_id_factory.fetch_add(1, Ordering::Relaxed);
 
                                     let channel_id_factory = AtomicU32::new(1);
                                     let group_channel_id = channel_id_factory.fetch_add(1, Ordering::SeqCst);
@@ -654,13 +674,15 @@ impl ChannelManager {
                                         task_manager_inner.clone(),
                                         supported_extensions_inner,
                                         required_extensions_inner,
+                                        #[cfg(feature = "monitoring")]
+                                        socket_address.ip(),
                                     );
 
-                                    this.channel_manager_io.downstream_sender.super_safe_lock(|map| map.insert(downstream_id, channel_manager_sender_downstream));
+                                    this.channel_manager_io
+                                        .downstream_sender
+                                        .insert(downstream_id, channel_manager_sender_downstream);
 
-                                    this.channel_manager_data.super_safe_lock(|data| {
-                                        data.downstream.insert(downstream_id, downstream.clone());
-                                    });
+                                    this.downstream.insert(downstream_id, downstream.clone());
 
                                     downstream
                                         .start(
@@ -739,7 +761,10 @@ impl ChannelManager {
                     _ = fallback_token.cancelled() => {
                         info!("Channel Manager: fallback triggered, resetting state");
                         self.upstream_state.set(UpstreamState::SoloMining);
-                        self.channel_manager_data.super_safe_lock(|data| data.reset(serialized_coinbase_outputs.clone()));
+                        if let Err(e) = self.reset_runtime_state(serialized_coinbase_outputs.clone()) {
+                            error!(error = ?e, "Failed to reset channel manager state");
+                            cancellation_token.cancel();
+                        }
 
                         break;
                     }
@@ -821,20 +846,16 @@ impl ChannelManager {
     // 1. Removes the corresponding downstream from the `downstream` map.
     #[allow(clippy::result_large_err)]
     pub fn remove_downstream(&self, downstream_id: DownstreamId) {
-        self.channel_manager_data.super_safe_lock(|cm_data| {
-            if let Some(downstream) = cm_data.downstream.remove(&downstream_id) {
-                downstream.downstream_cancellation_token.cancel();
-            }
-            cm_data
-                .downstream_channel_id_and_job_id_to_template_id
-                .retain(|key, _| key.downstream_id != downstream_id);
-            cm_data
-                .vardiff
-                .retain(|key, _| key.downstream_id != downstream_id);
-        });
+        if let Some((_, downstream)) = self.downstream.remove(&downstream_id) {
+            downstream.downstream_cancellation_token.cancel();
+        }
+        self.downstream_channel_id_and_job_id_to_template_id
+            .retain(|key, _| key.downstream_id != downstream_id);
+        self.vardiff
+            .retain(|key, _| key.downstream_id != downstream_id);
         self.channel_manager_io
             .downstream_sender
-            .super_safe_lock(|map| map.remove(&downstream_id));
+            .remove(&downstream_id);
     }
 
     /// Handles messages received from the JDS subsystem.  
@@ -869,10 +890,12 @@ impl ChannelManager {
             .recv()
             .await
             .map_err(JDCError::fallback)?;
-        let header = sv2_frame.get_header().ok_or_else(|| {
+        let header = if let Some(header) = sv2_frame.get_header() {
+            header
+        } else {
             error!("SV2 frame missing header");
-            JDCError::fallback(framing_sv2::Error::MissingHeader)
-        })?;
+            return Err(JDCError::fallback(framing_sv2::Error::MissingHeader));
+        };
         let message_type = header.msg_type();
         let extension_type = header.ext_type();
         let payload = sv2_frame.payload();
@@ -962,10 +985,11 @@ impl ChannelManager {
 
                 match self.upstream_state.get() {
                     UpstreamState::NoChannel => {
-                        self.channel_manager_data.super_safe_lock(|data| {
-                            data.pending_downstream_requests
-                                .push_front((downstream_id, downstream_msg).into());
-                        });
+                        self.pending_downstream_requests
+                            .with(|data| {
+                                data.push_front((downstream_id, downstream_msg).into());
+                            })
+                            .map_err(JDCError::shutdown)?;
 
                         if self
                             .upstream_state
@@ -1008,10 +1032,11 @@ impl ChannelManager {
                         }
                     }
                     UpstreamState::Pending => {
-                        self.channel_manager_data.super_safe_lock(|data| {
-                            data.pending_downstream_requests
-                                .push_back((downstream_id, downstream_msg).into());
-                        });
+                        self.pending_downstream_requests
+                            .with(|data| {
+                                data.push_back((downstream_id, downstream_msg).into());
+                            })
+                            .map_err(JDCError::shutdown)?;
                     }
                     UpstreamState::Connected => {
                         self.send_open_channel_request_to_mining_handler(
@@ -1036,10 +1061,9 @@ impl ChannelManager {
 
                 match self.upstream_state.get() {
                     UpstreamState::NoChannel => {
-                        self.channel_manager_data.super_safe_lock(|data| {
-                            data.pending_downstream_requests
-                                .push_front((downstream_id, downstream_msg).into())
-                        });
+                        self.pending_downstream_requests
+                            .with(|data| data.push_front((downstream_id, downstream_msg).into()))
+                            .map_err(JDCError::shutdown)?;
 
                         if self
                             .upstream_state
@@ -1078,10 +1102,9 @@ impl ChannelManager {
                         }
                     }
                     UpstreamState::Pending => {
-                        self.channel_manager_data.super_safe_lock(|data| {
-                            data.pending_downstream_requests
-                                .push_back((downstream_id, downstream_msg).into())
-                        });
+                        self.pending_downstream_requests
+                            .with(|data| data.push_back((downstream_id, downstream_msg).into()))
+                            .map_err(JDCError::shutdown)?;
                     }
                     UpstreamState::Connected => {
                         self.send_open_channel_request_to_mining_handler(
@@ -1135,9 +1158,7 @@ impl ChannelManager {
         debug!("Allocating {} job tokens", token_to_allocate);
 
         for i in 0..token_to_allocate {
-            let request_id = self
-                .channel_manager_data
-                .super_safe_lock(|data| data.request_id_factory.fetch_add(1, Ordering::Relaxed));
+            let request_id = self.request_id_factory.fetch_add(1, Ordering::Relaxed);
 
             debug!(
                 request_id,
@@ -1172,10 +1193,7 @@ impl ChannelManager {
     fn run_vardiff_on_extended_channel(
         downstream_id: DownstreamId,
         channel_id: ChannelId,
-        channel_state: &mut stratum_apps::stratum_core::channels_sv2::server::extended::ExtendedChannel<
-            'static,
-            DefaultJobStore<ExtendedJob<'static>>,
-        >,
+        channel_state: &mut stratum_apps::stratum_core::channels_sv2::server::extended::ExtendedChannel<'static>,
         vardiff_state: &mut VardiffState,
         updates: &mut Vec<RouteMessageTo>,
     ) {
@@ -1223,7 +1241,7 @@ impl ChannelManager {
     fn run_vardiff_on_standard_channel(
         downstream_id: DownstreamId,
         channel_id: ChannelId,
-        channel: &mut StandardChannel<'static, DefaultJobStore<StandardJob<'static>>>,
+        channel: &mut StandardChannel<'static>,
         vardiff_state: &mut VardiffState,
         updates: &mut Vec<RouteMessageTo>,
     ) {
@@ -1290,66 +1308,67 @@ impl ChannelManager {
     //   upstream if applicable.
     async fn run_vardiff(&self) -> JDCResult<(), error::ChannelManager> {
         let mut messages: Vec<RouteMessageTo> = vec![];
-        self.channel_manager_data
-            .super_safe_lock(|channel_manager_data| {
-                for (vardiff_key, vardiff_state) in channel_manager_data.vardiff.iter_mut() {
-                    let channel_id = &vardiff_key.channel_id;
-                    let downstream_id = &vardiff_key.downstream_id;
+        for vardiff_key in self.vardiff.keys() {
+            let channel_id = vardiff_key.channel_id;
+            let downstream_id = vardiff_key.downstream_id;
 
-                    let Some(downstream) = channel_manager_data.downstream.get_mut(downstream_id)
-                    else {
-                        continue;
-                    };
-                    downstream.downstream_data.super_safe_lock(|data| {
-                        if let Some(standard_channel) = data.standard_channels.get_mut(channel_id) {
-                            Self::run_vardiff_on_standard_channel(
-                                *downstream_id,
-                                *channel_id,
-                                standard_channel,
-                                vardiff_state,
-                                &mut messages,
-                            );
-                        }
-                        if let Some(extended_channel) = data.extended_channels.get_mut(channel_id) {
-                            Self::run_vardiff_on_extended_channel(
-                                *downstream_id,
-                                *channel_id,
-                                extended_channel,
-                                vardiff_state,
-                                &mut messages,
-                            );
-                        }
+            if self
+                .downstream
+                .with(&downstream_id, |downstream| {
+                    self.vardiff.with_mut(&vardiff_key, |vardiff_state| {
+                        downstream
+                            .standard_channels
+                            .with_mut(&channel_id, |standard_channel| {
+                                Self::run_vardiff_on_standard_channel(
+                                    downstream_id,
+                                    channel_id,
+                                    standard_channel,
+                                    vardiff_state,
+                                    &mut messages,
+                                );
+                            });
+                        downstream
+                            .extended_channels
+                            .with_mut(&channel_id, |extended_channel| {
+                                Self::run_vardiff_on_extended_channel(
+                                    downstream_id,
+                                    channel_id,
+                                    extended_channel,
+                                    vardiff_state,
+                                    &mut messages,
+                                );
+                            });
                     });
-                }
+                })
+                .is_none()
+            {
+                self.vardiff.remove(&vardiff_key);
+                continue;
+            }
+        }
 
-                if !messages.is_empty() {
-                    let mut downstream_hashrate = 0.0;
-                    let mut min_target = [0xff; 32];
+        if !messages.is_empty() {
+            let mut downstream_hashrate = 0.0;
+            let mut min_target = [0xff; 32];
 
-                    for (_, downstream) in channel_manager_data.downstream.iter() {
-                        downstream.downstream_data.super_safe_lock(|data| {
-                            let mut update_from_channel = |hashrate: f32, target: &Target| {
-                                downstream_hashrate += hashrate;
-                                min_target = std::cmp::min(target.to_le_bytes(), min_target);
-                            };
+            self.downstream.for_each(|_, downstream| {
+                let mut update_from_channel = |hashrate: f32, target: &Target| {
+                    downstream_hashrate += hashrate;
+                    min_target = std::cmp::min(target.to_le_bytes(), min_target);
+                };
 
-                            for (_, channel) in data.standard_channels.iter() {
-                                update_from_channel(
-                                    channel.get_nominal_hashrate(),
-                                    channel.get_target(),
-                                );
-                            }
+                downstream.standard_channels.for_each(|_, channel| {
+                    update_from_channel(channel.get_nominal_hashrate(), channel.get_target());
+                });
 
-                            for (_, channel) in data.extended_channels.iter() {
-                                update_from_channel(
-                                    channel.get_nominal_hashrate(),
-                                    channel.get_target(),
-                                );
-                            }
-                        });
-                    }
+                downstream.extended_channels.for_each(|_, channel| {
+                    update_from_channel(channel.get_nominal_hashrate(), channel.get_target());
+                });
+            });
 
-                    if let Some(ref mut upstream_channel) = channel_manager_data.upstream_channel {
+            self.upstream_channel
+                .with(|maybe_upstream_channel| {
+                    if let Some(upstream_channel) = maybe_upstream_channel.as_mut() {
                         debug!(
                             "Checking upstream channel {} with hashrate {} and target {:?}",
                             upstream_channel.get_channel_id(),
@@ -1357,8 +1376,6 @@ impl ChannelManager {
                             upstream_channel.get_target()
                         );
 
-                        // Update the upstream channel's nominal hashrate to reflect
-                        // the aggregated downstream hashrate
                         upstream_channel.set_nominal_hashrate(downstream_hashrate);
 
                         info!("Sending update channel message upstream");
@@ -1369,10 +1386,11 @@ impl ChannelManager {
                                 maximum_target: min_target.into(),
                             })
                             .into(),
-                        )
+                        );
                     }
-                }
-            });
+                })
+                .map_err(JDCError::shutdown)?;
+        }
 
         for message in messages {
             // A send can only fail if the receiver side of the channel is closed.
@@ -1385,6 +1403,36 @@ impl ChannelManager {
 
         info!("Vardiff update cycle complete");
         Ok(())
+    }
+
+    /// Runs `f` while holding the downstream map entry guard.
+    ///
+    /// Use this when mutations must only happen if the downstream is still
+    /// registered in the ChannelManager. Keep `f` short: do not perform blocking
+    /// work, send/forward messages, or re-enter `self.downstream` inside it.
+    ///
+    /// Returns the closure result if the downstream is registered. Returns
+    /// `DownstreamNotFound` with a disconnect action if the downstream is no
+    /// longer registered.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn with_registered_downstream<R, F>(
+        &self,
+        downstream_id: DownstreamId,
+        f: F,
+    ) -> JDCResult<R, error::ChannelManager>
+    where
+        F: FnOnce(&Downstream) -> JDCResult<R, error::ChannelManager>,
+    {
+        match self
+            .downstream
+            .with(&downstream_id, |downstream| f(downstream))
+        {
+            Some(result) => result,
+            None => Err(JDCError::disconnect(
+                JDCErrorKind::DownstreamNotFound(downstream_id),
+                downstream_id,
+            )),
+        }
     }
 
     /// Sends a CoinbaseOutputConstraints message to the template provider.

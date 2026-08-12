@@ -16,6 +16,7 @@ This crate is organized into several main modules:
 - **`fallback_coordinator`** - Runtime fallback cancellation and acknowledgement helpers
 
 The crate also re-exports `stratum-core`, the central hub for the Stratum V2 ecosystem that provides a cohesive API for all low-level protocol functionality.
+With the `bitcoin-core-sv2` feature enabled, it also re-exports `bitcoin_core_sv2` runtime APIs.
 
 ## Quick Start
 
@@ -43,15 +44,16 @@ use stratum_apps::{network_helpers, config_helpers};
   - Uses vendored Swagger UI assets to support offline/sandboxed documentation builds
 - `std` - Standard-library support for key and random utilities (enabled by default)
 - `core` - Re-export and enable `stratum-core`
+- `bitcoin-core-sv2` - Re-export and enable `bitcoin_core_sv2`
 
 ### Protocol Features
 - `sv1` - Enable SV1 protocol support (includes translation utilities)
 - `with_buffer_pool` - Enable buffer pooling for better performance
 
 ### Role-Specific Bundles
-- `pool` - Pool application helpers, including networking, config, buffer pooling, core protocol types, and payout helpers
-- `jd_client` - Job Declaration Client helpers, including networking, fallback coordination, config, buffer pooling, and core protocol types
-- `jd_server` - Job Declaration Server config helpers
+- `pool` - Pool application helpers, including networking, config, buffer pooling, core protocol types, payout helpers, and Bitcoin Core IPC runtime APIs
+- `jd_client` - Job Declaration Client helpers, including networking, fallback coordination, config, buffer pooling, core protocol types, and Bitcoin Core IPC runtime APIs
+- `jd_server` - Job Declaration Server config helpers and Bitcoin Core IPC runtime APIs
 - `translator` - Translator Proxy helpers, including networking, fallback coordination, config, SV1 translation, buffer pooling, and payout helpers
 - `mining_device` - Mining device config helpers
 

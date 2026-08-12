@@ -1,10 +1,17 @@
 use async_channel::{Receiver, Sender};
-use bitcoin_core_sv2::template_distribution_protocol::{BitcoinCoreSv2TDP, CancellationToken};
 use std::{path::PathBuf, sync::Arc, thread::JoinHandle};
-use stratum_apps::{stratum_core::parsers_sv2::TemplateDistribution, task_manager::TaskManager};
+use stratum_apps::{
+    bitcoin_core_sv2::common::{
+        template_distribution_protocol::{self, CancellationToken},
+        BitcoinCoreVersion,
+    },
+    stratum_core::parsers_sv2::TemplateDistribution,
+    task_manager::TaskManager,
+};
 
 #[derive(Clone)]
 pub struct BitcoinCoreSv2TDPConfig {
+    pub version: BitcoinCoreVersion,
     pub unix_socket_path: PathBuf,
     pub fee_threshold: u64,
     pub min_interval: u8,
@@ -51,7 +58,8 @@ pub async fn connect_to_bitcoin_core(
 
         tokio_local_set.block_on(&rt, async move {
             // create a new BitcoinCoreSv2TDP instance
-            let mut sv2_bitcoin_core = match BitcoinCoreSv2TDP::new(
+            let mut sv2_bitcoin_core = match template_distribution_protocol::new(
+                bitcoin_core_config.version,
                 &bitcoin_core_config.unix_socket_path,
                 bitcoin_core_config.fee_threshold,
                 bitcoin_core_config.min_interval,

@@ -1,35 +1,14 @@
-use std::{
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-    thread::JoinHandle,
+use error::PoolErrorKind;
+use pool_runtime::{Init, PoolRuntime};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
 };
-
-use async_channel::unbounded;
-
-use bitcoin_core_sv2::template_distribution_protocol::CancellationToken;
-use stratum_apps::{
-    stratum_core::bitcoin::consensus::Encodable, task_manager::TaskManager,
-    tp_type::TemplateProviderType, utils::types::GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS,
-};
+use stratum_apps::bitcoin_core_sv2::common::template_distribution_protocol::CancellationToken;
 use tokio::sync::Notify;
-use tracing::{debug, error, info, warn};
+use tracing::info;
 
-use jd_server_sv2::job_declarator::{
-    job_validation::{bitcoin_core_ipc::BitcoinCoreIPCEngine, JobValidationEngine},
-    JobDeclarator,
-};
-
-use crate::{
-    channel_manager::ChannelManager,
-    config::PoolConfig,
-    error::PoolErrorKind,
-    template_receiver::{
-        bitcoin_core::{connect_to_bitcoin_core, BitcoinCoreSv2TDPConfig},
-        sv2_tp::Sv2Tp,
-    },
-};
+use crate::config::PoolConfig;
 
 pub mod channel_manager;
 pub mod config;
@@ -38,6 +17,7 @@ pub mod error;
 mod io_task;
 #[cfg(feature = "monitoring")]
 mod monitoring;
+mod pool_runtime;
 pub mod template_receiver;
 pub mod utils;
 
@@ -60,282 +40,32 @@ impl PoolSv2 {
         }
     }
 
-    /// Starts the Pool main loop.
+    /// Starts the Pool server and blocks asynchronously on the [`PoolRuntime`].
+    ///
+    /// The startup and execution sequence follows:
+    /// 1. **Initialize:** Sets up the pool runtime state machine.
+    /// 2. **Bootstrap:** Configures internal channels, starts the Job Declarator Server (JDS),
+    ///    connects to the Template Provider, and initializes the Channel Manager.
+    /// 3. **Run & Block:** Spawns active background loops/servers and blocks the caller while
+    ///    awaiting the runtime's shutdown signal (e.g., Ctrl+C or program cancellation).
+    /// 4. **Teardown:** Performs a coordinated graceful cleanup of all services and tasks,
+    ///    remaining blocked until all sub-services have exited.
+    ///
+    /// If any error occurs during bootstrapping, the runtime automatically initiates a
+    /// graceful shutdown of any partially initialized components before returning the error.
     pub async fn start(&self) -> Result<(), PoolErrorKind> {
-        let coinbase_outputs = vec![self.config.get_txout()];
-        let mut encoded_outputs = vec![];
+        let runtime = PoolRuntime::<Init>::new(self.clone())?;
 
-        coinbase_outputs
-            .consensus_encode(&mut encoded_outputs)
-            .expect("Invalid coinbase output in config");
-
-        let cancellation_token = self.cancellation_token.clone();
-
-        let task_manager = Arc::new(TaskManager::new());
-
-        let (downstream_to_channel_manager_sender, downstream_to_channel_manager_receiver) =
-            unbounded();
-
-        let (channel_manager_to_tp_sender, channel_manager_to_tp_receiver) = unbounded();
-        let (tp_to_channel_manager_sender, tp_to_channel_manager_receiver) = unbounded();
-
-        debug!("Channels initialized.");
-
-        // Build and launch embedded JDS if configured.
-        let jds_config = self.config.build_jds_config()?;
-        let mut job_declarator_for_shutdown = None;
-
-        let job_declarator = if let Some(jds_config) = jds_config {
-            info!("JDS config present — initializing embedded Job Declaration Server");
-
-            let ipc_engine: Arc<dyn JobValidationEngine> =
-                match self.config.template_provider_type() {
-                    TemplateProviderType::BitcoinCoreIpc {
-                        network, data_dir, ..
-                    } => Arc::new(
-                        BitcoinCoreIPCEngine::new(
-                            network.clone(),
-                            data_dir.clone(),
-                            cancellation_token.clone(),
-                        )
-                        .await?,
-                    ),
-                    TemplateProviderType::Sv2Tp { .. } => {
-                        return Err(PoolErrorKind::Configuration(
-                            "[jds] requires template_provider_type = BitcoinCoreIpc \
-                         (JDS needs direct IPC access to Bitcoin Core)"
-                                .to_string(),
-                        ));
-                    }
-                };
-
-            let jd = JobDeclarator::new(
-                ipc_engine,
-                cancellation_token.clone(),
-                jds_config.coinbase_reward_script().clone(),
-                task_manager.clone(),
-            )
-            .await
-            .map_err(PoolErrorKind::Jds)?;
-
-            jd.clone()
-                .start(cancellation_token.clone(), task_manager.clone())
-                .await
-                .map_err(|e| PoolErrorKind::Jds(e.into()))?;
-
-            jd.clone()
-                .start_downstream_server(
-                    *jds_config.authority_public_key(),
-                    *jds_config.authority_secret_key(),
-                    jds_config.cert_validity_sec(),
-                    *jds_config.listen_address(),
-                    task_manager.clone(),
-                    cancellation_token.clone(),
-                    jds_config.supported_extensions().to_vec(),
-                    jds_config.required_extensions().to_vec(),
-                )
-                .await
-                .map_err(|e| PoolErrorKind::Jds(e.into()))?;
-
-            info!(
-                "JDS listening for JDP connections on {}",
-                jds_config.listen_address()
-            );
-
-            job_declarator_for_shutdown = Some(jd.clone());
-            Some(jd)
-        } else {
-            info!("No [jds] config — Job Declaration not available");
-            None
+        let runtime = match runtime.bootstrap().await {
+            Ok(runtime) => runtime,
+            Err(err) => {
+                return Err(err);
+            }
         };
 
-        let channel_manager = ChannelManager::new(
-            self.config.clone(),
-            channel_manager_to_tp_sender.clone(),
-            tp_to_channel_manager_receiver,
-            downstream_to_channel_manager_receiver,
-            encoded_outputs.clone(),
-            job_declarator,
-        )
-        .await?;
+        runtime.wait_for_shutdown().await;
+        runtime.shutdown().await;
 
-        // Start monitoring server if configured
-        #[cfg(feature = "monitoring")]
-        if let Some(monitoring_addr) = self.config.monitoring_address() {
-            info!(
-                "Initializing monitoring server on http://{}",
-                monitoring_addr
-            );
-
-            let monitoring_server = stratum_apps::monitoring::MonitoringServer::new(
-                monitoring_addr,
-                None, // Pool doesn't have channels opened with servers
-                Some(Arc::new(channel_manager.clone())), // channels opened with clients
-                std::time::Duration::from_secs(
-                    self.config.monitoring_cache_refresh_secs().unwrap_or(15),
-                ),
-            )
-            .expect("Failed to initialize monitoring server");
-
-            let cancellation_token_clone = cancellation_token.clone();
-            let shutdown_signal = async move {
-                cancellation_token_clone.cancelled().await;
-            };
-
-            task_manager.spawn({
-                let cancellation_token = cancellation_token.clone();
-                async move {
-                    if let Err(e) = monitoring_server.run(shutdown_signal).await {
-                        error!("Monitoring server error: {}", e);
-                        cancellation_token.cancel();
-                    }
-                }
-            });
-        }
-
-        let channel_manager_clone = channel_manager.clone();
-        let mut bitcoin_core_sv2_join_handle: Option<JoinHandle<()>> = None;
-        let mut bitcoin_core_sv2_cancellation_token: Option<CancellationToken> = None;
-
-        match self.config.template_provider_type().clone() {
-            TemplateProviderType::Sv2Tp {
-                address,
-                public_key,
-            } => {
-                let sv2_tp = Sv2Tp::new(
-                    address.clone(),
-                    public_key,
-                    channel_manager_to_tp_receiver,
-                    tp_to_channel_manager_sender,
-                    cancellation_token.clone(),
-                    task_manager.clone(),
-                )
-                .await?;
-
-                sv2_tp
-                    .start(address, cancellation_token.clone(), task_manager.clone())
-                    .await?;
-
-                info!("Sv2 Template Provider setup done");
-            }
-            TemplateProviderType::BitcoinCoreIpc {
-                network,
-                data_dir,
-                fee_threshold,
-                min_interval,
-            } => {
-                let unix_socket_path =
-                    stratum_apps::tp_type::resolve_ipc_socket_path(&network, data_dir)
-                        .ok_or_else(|| PoolErrorKind::Configuration(
-                            "Could not determine Bitcoin data directory. Please set data_dir in config.".to_string()
-                        ))?;
-
-                info!(
-                    "Using Bitcoin Core IPC socket at: {}",
-                    unix_socket_path.display()
-                );
-
-                // incoming and outgoing TDP channels from the perspective of BitcoinCoreSv2TDP
-                let incoming_tdp_receiver = channel_manager_to_tp_receiver.clone();
-                let outgoing_tdp_sender = tp_to_channel_manager_sender.clone();
-
-                let bitcoin_core_cancellation_token = CancellationToken::new();
-                let bitcoin_core_config = BitcoinCoreSv2TDPConfig {
-                    unix_socket_path,
-                    fee_threshold,
-                    min_interval,
-                    incoming_tdp_receiver,
-                    outgoing_tdp_sender,
-                    cancellation_token: bitcoin_core_cancellation_token.clone(),
-                };
-
-                bitcoin_core_sv2_cancellation_token = Some(bitcoin_core_cancellation_token);
-                bitcoin_core_sv2_join_handle = Some(
-                    connect_to_bitcoin_core(
-                        bitcoin_core_config,
-                        cancellation_token.clone(),
-                        task_manager.clone(),
-                    )
-                    .await,
-                );
-            }
-        }
-
-        channel_manager
-            .start(
-                cancellation_token.clone(),
-                task_manager.clone(),
-                coinbase_outputs,
-            )
-            .await?;
-
-        channel_manager_clone
-            .start_downstream_server(
-                *self.config.authority_public_key(),
-                *self.config.authority_secret_key(),
-                self.config.cert_validity_sec(),
-                *self.config.listen_address(),
-                task_manager.clone(),
-                cancellation_token.clone(),
-                downstream_to_channel_manager_sender,
-            )
-            .await?;
-
-        info!("Spawning status listener task...");
-
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                info!("Ctrl+C received — initiating graceful shutdown...");
-                cancellation_token.cancel();
-            }
-            _ = cancellation_token.cancelled() => {}
-        }
-
-        if let Some(ref jd) = job_declarator_for_shutdown {
-            info!("Shutting down embedded JDS...");
-            jd.shutdown();
-        }
-
-        if let Some(bitcoin_core_sv2_cancellation_token) = bitcoin_core_sv2_cancellation_token {
-            bitcoin_core_sv2_cancellation_token.cancel();
-        }
-
-        if let Some(bitcoin_core_sv2_join_handle) = bitcoin_core_sv2_join_handle {
-            info!("Waiting for BitcoinCoreSv2TDP dedicated thread to shutdown...");
-            match bitcoin_core_sv2_join_handle.join() {
-                Ok(_) => info!("BitcoinCoreSv2TDP dedicated thread shutdown complete."),
-                Err(e) => error!("BitcoinCoreSv2TDP dedicated thread error: {e:?}"),
-            }
-        }
-
-        warn!(
-            "Graceful shutdown: waiting {} seconds for tasks to finish",
-            GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS
-        );
-
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS),
-            task_manager.join_all(),
-        )
-        .await
-        {
-            Ok(_) => {
-                info!("All tasks joined cleanly");
-            }
-            Err(_) => {
-                warn!(
-                    "Tasks did not finish within {} seconds, aborting",
-                    GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS
-                );
-                task_manager.abort_all().await;
-                info!("Joining aborted tasks...");
-                task_manager.join_all().await;
-                warn!("Forced shutdown complete");
-            }
-        }
-        self.shutdown_notify.notify_waiters();
-        self.is_alive.store(false, Ordering::Relaxed);
-        info!("Pool shutdown complete.");
         Ok(())
     }
 

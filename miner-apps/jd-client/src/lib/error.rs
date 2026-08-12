@@ -15,6 +15,7 @@ use ext_config::ConfigError;
 use std::{
     fmt::{self, Formatter},
     marker::PhantomData,
+    sync::PoisonError,
 };
 use stratum_apps::{
     network_helpers,
@@ -165,6 +166,8 @@ pub enum JDCErrorKind {
     Io(std::io::Error),
     /// Errors on bad `String` to `int` conversion.
     ParseInt(std::num::ParseIntError),
+    /// Mutex poison lock error.
+    PoisonLock,
     Parser(ParserError),
     /// Channel receiver error
     ChannelErrorReceiver(async_channel::RecvError),
@@ -271,6 +274,7 @@ impl fmt::Display for JDCErrorKind {
             FramingSv2(ref e) => write!(f, "Framing SV2 error: `{e:?}`"),
             Io(ref e) => write!(f, "I/O error: `{e:?}"),
             ParseInt(ref e) => write!(f, "Bad convert from `String` to `int`: `{e:?}`"),
+            PoisonLock => write!(f, "Mutex poison lock error"),
             ChannelErrorReceiver(ref e) => write!(f, "Channel receive error: `{e:?}`"),
             Parser(ref e) => write!(f, "Parser error: `{e:?}`"),
             ChannelErrorSender => write!(f, "Sender error"),
@@ -432,6 +436,12 @@ impl From<std::io::Error> for JDCErrorKind {
 impl From<std::num::ParseIntError> for JDCErrorKind {
     fn from(e: std::num::ParseIntError) -> Self {
         JDCErrorKind::ParseInt(e)
+    }
+}
+
+impl<T> From<PoisonError<T>> for JDCErrorKind {
+    fn from(_e: PoisonError<T>) -> Self {
+        JDCErrorKind::PoisonLock
     }
 }
 

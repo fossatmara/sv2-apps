@@ -108,6 +108,7 @@ impl<T> SharedRw<T> {
 }
 
 /// Concurrent map wrapper over `DashMap` providing ergonomic scoped access.
+#[derive(Debug)]
 pub struct SharedMap<K: Eq + Clone + Hash, V>(Arc<DashMap<K, V>>);
 
 impl<K: Eq + Clone + Hash, V> Clone for SharedMap<K, V> {
@@ -120,6 +121,19 @@ impl<K: Eq + Hash + Clone, V> SharedMap<K, V> {
     /// Create a new concurrent map.
     pub fn new() -> Self {
         SharedMap(Arc::new(DashMap::new()))
+    }
+
+    /// Get an owned clone of a value.
+    ///
+    /// This releases the map entry guard immediately, so the entry may be removed
+    /// or replaced while the caller is still using the clone. Use this only when
+    /// stale clones are acceptable. Prefer [`Self::with`] or [`Self::with_mut`]
+    /// when later work depends on the entry still being present.
+    pub fn get_cloned(&self, key: &K) -> Option<V>
+    where
+        V: Clone,
+    {
+        self.0.get(key).map(|refc| refc.value().clone())
     }
 
     /// Read a value for a key using a closure.
@@ -147,6 +161,25 @@ impl<K: Eq + Hash + Clone, V> SharedMap<K, V> {
         let mut guard = self.0.get_mut(key)?;
         let result = f(guard.value_mut());
         Some(result)
+    }
+
+    /// Mutate an entry, inserting a value produced by `default` when absent.
+    pub fn with_mut_or_insert_with<F, D, R>(&self, key: K, default: D, f: F) -> R
+    where
+        F: FnOnce(&mut V) -> R,
+        D: FnOnce() -> V,
+    {
+        let mut entry = self.0.entry(key).or_insert_with(default);
+        f(entry.value_mut())
+    }
+
+    /// Mutate an entry, inserting its default value when absent.
+    pub fn with_mut_or_default<F, R>(&self, key: K, f: F) -> R
+    where
+        V: Default,
+        F: FnOnce(&mut V) -> R,
+    {
+        self.with_mut_or_insert_with(key, V::default, f)
     }
 
     /// Iterate over all entries immutably.
@@ -193,9 +226,9 @@ impl<K: Eq + Hash + Clone, V> SharedMap<K, V> {
     ///
     /// Caution: `f` runs while an iterator entry guard is held. Avoid
     /// re-entering this `SharedMap` from inside the closure.
-    pub fn try_for_each<F, E>(&self, f: F) -> Result<(), E>
+    pub fn try_for_each<F, E>(&self, mut f: F) -> Result<(), E>
     where
-        F: Fn(K, &V) -> Result<(), E>,
+        F: FnMut(K, &V) -> Result<(), E>,
     {
         for entry in self.0.iter() {
             f(entry.key().clone(), entry.value())?;
@@ -246,6 +279,11 @@ impl<K: Eq + Hash + Clone, V> SharedMap<K, V> {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+
+    /// Clears the collection.
+    pub fn clear(&self) {
+        self.0.clear()
+    }
 }
 
 impl<K: Eq + Hash + Clone, V> Default for SharedMap<K, V> {
@@ -294,9 +332,12 @@ mod tests {
         map.with_mut(&"a", |v| *v += 10);
         assert_eq!(map.with(&"a", |v| *v).unwrap(), 11);
 
+        map.with_mut_or_default("c", |v| *v += 3);
+        assert_eq!(map.get_cloned(&"c"), Some(3));
+
         let mut sum = 0;
         map.for_each(|_, v| sum += v);
-        assert_eq!(sum, 13);
+        assert_eq!(sum, 16);
 
         map.remove(&"a");
         assert!(!map.contains_key(&"a"));

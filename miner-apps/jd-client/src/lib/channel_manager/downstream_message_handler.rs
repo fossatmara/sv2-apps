@@ -10,7 +10,6 @@ use stratum_apps::{
             server::{
                 error::{ExtendedChannelError, StandardChannelError},
                 extended::ExtendedChannel,
-                jobs::job_store::DefaultJobStore,
                 share_accounting::{ShareValidationError, ShareValidationResult},
                 standard::StandardChannel,
             },
@@ -109,7 +108,7 @@ impl RouteMessageTo<'_> {
             RouteMessageTo::Downstream((downstream_id, message)) => {
                 let sender = channel_manager_io
                     .downstream_sender
-                    .super_safe_lock(|map| map.get(&downstream_id).cloned());
+                    .get_cloned(&downstream_id);
                 if let Some(sender) = sender {
                     sender.send((message.into_static(), None)).await?;
                 } else {
@@ -148,16 +147,11 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
     ) -> Result<Vec<u16>, Self::Error> {
         let downstream_id =
             client_id.expect("client_id must be present for downstream_id extraction");
-        self.channel_manager_data.super_safe_lock(|data| {
-            let Some(downstream) = data.downstream.get(&downstream_id) else {
-                return Err(JDCError::disconnect(
-                    JDCErrorKind::DownstreamNotFound(downstream_id),
-                    downstream_id,
-                ));
-            };
+        self.with_registered_downstream(downstream_id, |downstream| {
             downstream
-                .downstream_data
-                .super_safe_lock(|data| Ok(data.negotiated_extensions.clone()))
+                .negotiated_extensions
+                .get()
+                .map_err(JDCError::shutdown)
         })
     }
 
@@ -188,27 +182,21 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
         info!("Received: {}", msg);
         let downstream_id =
             client_id.expect("client_id must be present for downstream_id extraction");
-        self.channel_manager_data
-            .super_safe_lock(|channel_manager_data| {
-                let Some(downstream) = channel_manager_data.downstream.get(&downstream_id) else {
-                    error!(
-                        "No downstream with channel_id: {:?} and downstream_id: {:?}, found",
-                        msg.channel_id, downstream_id
-                    );
-                    return Err(JDCError::disconnect(
-                        JDCErrorKind::DownstreamNotFound(downstream_id),
-                        downstream_id,
-                    ));
-                };
-                downstream.downstream_data.super_safe_lock(|data| {
-                    data.extended_channels.remove(&msg.channel_id);
-                    data.standard_channels.remove(&msg.channel_id);
-                });
-                channel_manager_data
-                    .vardiff
-                    .remove(&(downstream_id, msg.channel_id).into());
-                Ok(())
-            })
+        self.with_registered_downstream(downstream_id, |downstream| {
+            downstream
+                .group_channel
+                .with(|gc| {
+                    if gc.has_channel_id(msg.channel_id) {
+                        gc.remove_channel_id(msg.channel_id);
+                    }
+                })
+                .map_err(JDCError::shutdown)?;
+            downstream.extended_channels.remove(&msg.channel_id);
+            downstream.standard_channels.remove(&msg.channel_id);
+            Ok(())
+        })?;
+        self.vardiff.remove(&(downstream_id, msg.channel_id).into());
+        Ok(())
     }
 
     // Handles an `OpenStandardMiningChannel` message from a downstream.
@@ -240,9 +228,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
         let downstream_id =
             client_id.expect("client_id must be present for downstream_id extraction");
 
-        let coinbase_outputs = self
-            .channel_manager_data
-            .super_safe_lock(|data| data.coinbase_outputs.clone());
+        let coinbase_outputs = self.coinbase_outputs.get().map_err(JDCError::shutdown)?;
 
         let mut coinbase_outputs = deserialize_outputs(coinbase_outputs)
             .map_err(|_| JDCError::shutdown(JDCErrorKind::ChannelManagerHasBadCoinbaseOutputs))?;
@@ -252,198 +238,182 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
         let build_error = |code: &str| {
             Mining::OpenMiningChannelError(OpenMiningChannelError {
                 request_id,
-                error_code: code.to_string().try_into().expect("valid error code"),
+                error_code: code.try_into().expect("valid error code"),
             })
         };
 
-        let messages: Vec<RouteMessageTo> =
-            self.channel_manager_data
-                .super_safe_lock(|channel_manager_data| {
-                    let Some(last_future_template) =
-                        channel_manager_data.last_future_template.clone()
-                    else {
-                        error!("Missing last_future_template, cannot open channel");
-                        return Err(JDCError::disconnect(
-                            JDCErrorKind::FutureTemplateNotPresent,
-                            downstream_id,
-                        ));
-                    };
+        let last_future_template = self
+            .last_future_template
+            .get()
+            .map_err(JDCError::shutdown)?;
+        let Some(last_future_template) = last_future_template else {
+            error!("Missing last_future_template, cannot open channel");
+            return Err(JDCError::disconnect(
+                JDCErrorKind::FutureTemplateNotPresent,
+                downstream_id,
+            ));
+        };
 
-                    let Some(last_new_prev_hash) = channel_manager_data.last_new_prev_hash.clone()
-                    else {
-                        error!("Missing last_new_prev_hash, cannot open channel");
-                        return Err(JDCError::disconnect(
-                            JDCErrorKind::LastNewPrevhashNotFound,
-                            downstream_id,
-                        ));
-                    };
+        let last_new_prev_hash = self.last_new_prev_hash.get().map_err(JDCError::shutdown)?;
+        let Some(last_new_prev_hash) = last_new_prev_hash else {
+            error!("Missing last_new_prev_hash, cannot open channel");
+            return Err(JDCError::disconnect(
+                JDCErrorKind::LastNewPrevhashNotFound,
+                downstream_id,
+            ));
+        };
 
-                    let Some(downstream) = channel_manager_data.downstream.get(&downstream_id)
-                    else {
-                        error!(downstream_id, "Downstream not registered");
-                        return Err(JDCError::disconnect(
-                            JDCErrorKind::DownstreamNotFound(downstream_id),
-                            downstream_id,
-                        ));
-                    };
+        coinbase_outputs[0].value =
+            Amount::from_sat(last_future_template.coinbase_tx_value_remaining);
+        let nominal_hash_rate = msg.nominal_hash_rate;
+        let requested_max_target = Target::from_le_bytes(msg.max_target.to_array());
+        let pool_tag_string = self.pool_tag_string.get().map_err(JDCError::shutdown)?;
+        let messages = self.with_registered_downstream(downstream_id, |downstream| {
+            let group_channel_id = downstream
+                .group_channel
+                .with(|channel| channel.get_group_channel_id())
+                .map_err(JDCError::shutdown)?;
 
-                    coinbase_outputs[0].value =
-                        Amount::from_sat(last_future_template.coinbase_tx_value_remaining);
+            let standard_channel_id = downstream
+                .channel_id_factory
+                .fetch_add(1, Ordering::Relaxed);
 
-                    downstream.downstream_data.super_safe_lock(|data| {
-                        let mut messages: Vec<RouteMessageTo> = vec![];
+            let extranonce_prefix = match self
+                .extranonce_allocator
+                .with(|allocator| allocator.allocate_standard())
+                .map_err(JDCError::shutdown)?
+            {
+                Ok(prefix) => prefix,
+                Err(e) => {
+                    error!(?e, "Failed to get extranonce prefix");
+                    return Err(JDCError::shutdown(e));
+                }
+            };
 
-                        let nominal_hash_rate = msg.nominal_hash_rate;
-                        let requested_max_target = Target::from_le_bytes(
-                            msg.max_target.inner_as_ref().try_into().unwrap(),
-                        );
-
-                        let group_channel_id = data.group_channel.get_group_channel_id();
-
-                        let standard_channel_id =
-                            data.channel_id_factory.fetch_add(1, Ordering::Relaxed);
-
-                        let extranonce_prefix = match channel_manager_data
-                            .extranonce_allocator
-                            .allocate_standard()
-                        {
-                            Ok(p) => p,
-                            Err(e) => {
-                                error!(?e, "Failed to get extranonce prefix");
-                                return Err(JDCError::shutdown(e));
-                            }
-                        };
-
-                        let job_store = DefaultJobStore::new();
-                        let mut standard_channel =
-                            match StandardChannel::new_for_job_declaration_client(
-                                standard_channel_id,
-                                user_identity.to_string(),
-                                extranonce_prefix,
-                                requested_max_target,
-                                nominal_hash_rate,
-                                self.share_batch_size,
-                                self.shares_per_minute,
-                                job_store,
-                                channel_manager_data.pool_tag_string.clone(),
-                                self.miner_tag_string.clone(),
-                            ) {
-                                Ok(channel) => channel,
-                                Err(e) => {
-                                    error!(?e, "Failed to create standard channel");
-                                    return match e {
-                                        StandardChannelError::OpenChannelInvalidNominalHashrate(
-                                            code,
-                                        ) => Ok(vec![(downstream_id, build_error(code)).into()]),
-                                        other => Err(JDCError::disconnect(other, downstream_id)),
-                                    };
-                                }
-                            };
-
-                        let extranonce_prefix_size = standard_channel.get_extranonce_prefix().len();
-
-                        let open_standard_mining_channel_success =
-                            OpenStandardMiningChannelSuccess {
-                                request_id: msg.request_id.clone(),
-                                channel_id: standard_channel_id,
-                                target: standard_channel.get_target().to_le_bytes().into(),
-                                extranonce_prefix: standard_channel
-                                    .get_extranonce_prefix()
-                                    .to_vec()
-                                    .try_into()
-                                    .map_err(JDCError::shutdown)?,
-                                group_channel_id,
-                            }
-                            .into_static();
-
-                        messages.push(
-                            (
-                                downstream_id,
-                                Mining::OpenStandardMiningChannelSuccess(
-                                    open_standard_mining_channel_success,
-                                ),
-                            )
-                                .into(),
-                        );
-
-                        if let Err(e) = standard_channel
-                            .on_new_template(last_future_template.clone(), coinbase_outputs.clone())
-                        {
-                            error!(?e, "Failed to apply template to standard channel");
-                            return Err(JDCError::shutdown(e));
+            let mut messages: Vec<RouteMessageTo> = Vec::new();
+            let standard_channel = match StandardChannel::new_for_job_declaration_client(
+                standard_channel_id,
+                user_identity.to_string(),
+                extranonce_prefix,
+                requested_max_target,
+                nominal_hash_rate,
+                self.share_batch_size,
+                self.shares_per_minute,
+                pool_tag_string,
+                self.miner_tag_string.clone(),
+            ) {
+                Ok(standard_channel) => Some(standard_channel),
+                Err(e) => {
+                    error!(?e, "Failed to create standard channel");
+                    match e {
+                        StandardChannelError::OpenChannelInvalidNominalHashrate(code) => {
+                            messages.push((downstream_id, build_error(code)).into());
+                            None
                         }
+                        other => return Err(JDCError::disconnect(other, downstream_id)),
+                    }
+                }
+            };
 
-                        let future_standard_job_id = standard_channel
-                            .get_future_job_id_from_template_id(last_future_template.template_id)
-                            .expect("future job id must exist");
+            if let Some(mut standard_channel) = standard_channel {
+                let extranonce_prefix_size = standard_channel.get_extranonce_prefix().len();
+                let open_standard_mining_channel_success = OpenStandardMiningChannelSuccess {
+                    request_id: msg.request_id,
+                    channel_id: standard_channel_id,
+                    target: standard_channel.get_target().to_le_bytes().into(),
+                    extranonce_prefix: standard_channel
+                        .get_extranonce_prefix()
+                        .to_vec()
+                        .try_into()
+                        .map_err(JDCError::shutdown)?,
+                    group_channel_id,
+                }
+                .into_static();
 
-                        let future_standard_job = standard_channel
-                            .get_future_job(future_standard_job_id)
-                            .expect("future job must exist");
+                messages.push(
+                    (
+                        downstream_id,
+                        Mining::OpenStandardMiningChannelSuccess(
+                            open_standard_mining_channel_success,
+                        ),
+                    )
+                        .into(),
+                );
 
-                        let future_standard_job_message =
-                            future_standard_job.get_job_message().clone().into_static();
+                standard_channel
+                    .on_new_template(last_future_template.clone(), coinbase_outputs.clone())
+                    .map_err(|e| {
+                        error!(?e, "Failed to apply template to standard channel");
+                        JDCError::shutdown(e)
+                    })?;
 
-                        messages.push(
-                            (
-                                downstream_id,
-                                Mining::NewMiningJob(future_standard_job_message),
-                            )
-                                .into(),
-                        );
+                let future_standard_job_id = standard_channel
+                    .get_future_job_id_from_template_id(last_future_template.template_id)
+                    .expect("future job id must exist");
+                let future_standard_job_message = standard_channel
+                    .get_future_job(future_standard_job_id)
+                    .expect("future job must exist")
+                    .get_job_message()
+                    .clone()
+                    .into_static();
+                messages.push(
+                    (
+                        downstream_id,
+                        Mining::NewMiningJob(future_standard_job_message),
+                    )
+                        .into(),
+                );
 
-                        let prev_hash = last_new_prev_hash.prev_hash.clone();
-                        let header_timestamp = last_new_prev_hash.header_timestamp;
-                        let n_bits = last_new_prev_hash.n_bits;
-                        let set_new_prev_hash_mining = SetNewPrevHash {
-                            channel_id: standard_channel_id,
-                            job_id: future_standard_job_id,
-                            prev_hash,
-                            min_ntime: header_timestamp,
-                            nbits: n_bits,
-                        };
+                let set_new_prev_hash_mining = SetNewPrevHash {
+                    channel_id: standard_channel_id,
+                    job_id: future_standard_job_id,
+                    prev_hash: last_new_prev_hash.prev_hash.clone(),
+                    min_ntime: last_new_prev_hash.header_timestamp,
+                    nbits: last_new_prev_hash.n_bits,
+                };
 
-                        if let Err(e) =
-                            standard_channel.on_set_new_prev_hash(last_new_prev_hash.clone())
-                        {
-                            error!(?e, "Failed to apply prevhash to standard channel");
-                            return Err(JDCError::shutdown(e));
-                        }
-                        messages.push(
-                            (
-                                downstream_id,
-                                Mining::SetNewPrevHash(set_new_prev_hash_mining),
-                            )
-                                .into(),
-                        );
+                standard_channel
+                    .on_set_new_prev_hash(last_new_prev_hash)
+                    .map_err(|e| {
+                        error!(?e, "Failed to apply prevhash to standard channel");
+                        JDCError::shutdown(e)
+                    })?;
+                messages.push(
+                    (
+                        downstream_id,
+                        Mining::SetNewPrevHash(set_new_prev_hash_mining),
+                    )
+                        .into(),
+                );
 
-                        let vardiff =
-                            VardiffState::new().expect("Vardiff state should instantiate.");
+                self.vardiff.insert(
+                    (downstream_id, standard_channel_id).into(),
+                    VardiffState::new().expect("Vardiff state should instantiate."),
+                );
+                downstream
+                    .standard_channels
+                    .insert(standard_channel_id, standard_channel);
+                self.downstream_channel_id_and_job_id_to_template_id.insert(
+                    (downstream_id, standard_channel_id, future_standard_job_id).into(),
+                    last_future_template.template_id,
+                );
 
-                        channel_manager_data
-                            .vardiff
-                            .insert((downstream_id, standard_channel_id).into(), vardiff);
-                        data.standard_channels
-                            .insert(standard_channel_id, standard_channel);
+                if !downstream.require_std_job.load(Ordering::Relaxed) {
+                    downstream
+                        .group_channel
+                        .with(|channel| {
+                            channel.add_channel_id(standard_channel_id, extranonce_prefix_size)
+                        })
+                        .map_err(JDCError::shutdown)?
+                        .map_err(|e| {
+                            error!("Failed to add channel id to group channel: {:?}", e);
+                            JDCError::shutdown(e)
+                        })?;
+                }
+            }
 
-                        channel_manager_data
-                            .downstream_channel_id_and_job_id_to_template_id
-                            .insert(
-                                (downstream_id, standard_channel_id, future_standard_job_id).into(),
-                                last_future_template.template_id,
-                            );
-                        if !data.require_std_job {
-                            data.group_channel
-                                .add_channel_id(standard_channel_id, extranonce_prefix_size)
-                                .map_err(|e| {
-                                    error!("Failed to add channel id to group channel: {:?}", e);
-                                    JDCError::shutdown(e)
-                                })?;
-                        }
-
-                        Ok(messages)
-                    })
-                })?;
+            Ok(messages)
+        })?;
 
         for message in messages {
             // A send can only fail if the receiver side of the channel is closed.
@@ -487,235 +457,232 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
         let request_id = msg.get_request_id_as_u32();
 
         let nominal_hash_rate = msg.nominal_hash_rate;
-        let requested_max_target =
-            Target::from_le_bytes(msg.max_target.inner_as_ref().try_into().unwrap());
+        let requested_max_target = Target::from_le_bytes(msg.max_target.to_array());
         let requested_min_rollable_extranonce_size = msg.min_extranonce_size;
 
         let build_error = |code: &str| {
             Mining::OpenMiningChannelError(OpenMiningChannelError {
                 request_id,
-                error_code: code.to_string().try_into().expect("valid error code"),
+                error_code: code.try_into().expect("valid error code"),
             })
         };
 
-        let messages = self
-            .channel_manager_data
-            .super_safe_lock(|channel_manager_data| {
-                let Some(last_future_template) = channel_manager_data.last_future_template.clone()
-                else {
-                    error!("No template to share");
-                    return Err(JDCError::disconnect(
-                        JDCErrorKind::FutureTemplateNotPresent,
+        let last_future_template = self
+            .last_future_template
+            .get()
+            .map_err(JDCError::shutdown)?;
+        let Some(last_future_template) = last_future_template else {
+            return Err(JDCError::disconnect(
+                JDCErrorKind::FutureTemplateNotPresent,
+                downstream_id,
+            ));
+        };
+        let last_new_prev_hash = self.last_new_prev_hash.get().map_err(JDCError::shutdown)?;
+        let Some(last_new_prev_hash) = last_new_prev_hash else {
+            return Err(JDCError::disconnect(
+                JDCErrorKind::LastNewPrevhashNotFound,
+                downstream_id,
+            ));
+        };
+        let messages = self.with_registered_downstream(downstream_id, |downstream| {
+            let mut messages: Vec<RouteMessageTo> = Vec::new();
+            let mut extended_channel = None;
+            let mut extended_channel_id = None;
+
+            if downstream.require_std_job.load(Ordering::Relaxed) {
+                messages.push(
+                    (
                         downstream_id,
-                    ));
-                };
-
-                let Some(last_new_prev_hash) = channel_manager_data.last_new_prev_hash.clone()
-                else {
-                    error!("No prevhash in system");
-                    return Err(JDCError::disconnect(
-                        JDCErrorKind::LastNewPrevhashNotFound,
-                        downstream_id,
-                    ));
-                };
-
-                let Some(downstream) = channel_manager_data.downstream.get_mut(&downstream_id)
-                else {
-                    error!(downstream_id, "Downstream not found");
-                    return Err(JDCError::disconnect(
-                        JDCErrorKind::DownstreamNotFound(downstream_id),
-                        downstream_id,
-                    ));
-                };
-
-                downstream.downstream_data.super_safe_lock(|data| {
-                    if data.require_std_job {
-                        return Ok(vec![(
-                            downstream_id,
-                            build_error(ERROR_CODE_OPEN_MINING_CHANNEL_EXTENDED_CHANNELS_NOT_SUPPORTED_FOR_STANDARD_JOBS),
-                        )
-                        .into()])
-                    }
-
-                    let mut messages: Vec<RouteMessageTo> = vec![];
-                    let extended_channel_id =
-                        data.channel_id_factory.fetch_add(1, Ordering::Relaxed);
-
-                    let extranonce_prefix = match channel_manager_data
-                            .extranonce_allocator
-                            .allocate_extended(requested_min_rollable_extranonce_size.into())
-                        {
-                            Ok(p) => p,
-                            Err(e) => {
-                                error!(?e, "Extranonce prefix error");
-                                return Ok(vec![(
-                                    downstream_id,
-                                    build_error(
-                                        ERROR_CODE_OPEN_MINING_CHANNEL_MIN_EXTRANONCE_SIZE_TOO_LARGE,
-                                    ),
-                                )
-                                    .into()]);
-                            }
-                        };
-                        let job_store = DefaultJobStore::new();
-
-                        let full_extranonce_size = channel_manager_data
-                            .upstream_channel
-                            .as_ref()
-                            .map(|channel| channel.get_full_extranonce_size())
-                            // Default to SOLO_FULL_EXTRANONCE_SIZE if upstream channel is not
-                            // present (solo mining mode)
-                            .unwrap_or(SOLO_FULL_EXTRANONCE_SIZE as usize);
-
-                        let rollable_extranonce_size =
-                            full_extranonce_size - extranonce_prefix.len();
-
-                        let mut extended_channel =
-                            match ExtendedChannel::new_for_job_declaration_client(
-                                extended_channel_id,
-                                user_identity.to_string(),
-                                extranonce_prefix,
-                                requested_max_target,
-                                nominal_hash_rate,
-                                true,
-                                rollable_extranonce_size as u16,
-                                self.share_batch_size,
-                                self.shares_per_minute,
-                                job_store,
-                                channel_manager_data.pool_tag_string.clone(),
-                                self.miner_tag_string.clone(),
-                            ) {
-                                Ok(c) => c,
-                                Err(e) => {
-                                    error!(?e, "Failed to create ExtendedChannel");
-                                    return match e {
-                                        ExtendedChannelError::OpenChannelInvalidNominalHashrate(code) => Ok(vec![(
-                                            downstream_id,
-                                            build_error(code),
-                                        )
-                                            .into()]),
-                                        other => Err(JDCError::disconnect(other, downstream_id)),
-                                    };
-                                }
-                            };
-
-                        let group_channel_id = data.group_channel.get_group_channel_id();
-
-                        let open_extended_mining_channel_success =
-                            OpenExtendedMiningChannelSuccess {
-                                request_id,
-                                channel_id: extended_channel_id,
-                                target: extended_channel.get_target().to_le_bytes().into(),
-                                extranonce_prefix: extended_channel
-                                    .get_extranonce_prefix()
-                                    .to_vec()
-                                    .try_into()
-                                    .expect("valid extranonce prefix"),
-                                extranonce_size: extended_channel.get_rollable_extranonce_size(),
-                                group_channel_id,
-                            }
-                            .into_static();
-
-                        let full_extranonce_size = extended_channel.get_full_extranonce_size();
-
+                        build_error(
+                            ERROR_CODE_OPEN_MINING_CHANNEL_EXTENDED_CHANNELS_NOT_SUPPORTED_FOR_STANDARD_JOBS,
+                        ),
+                    )
+                        .into(),
+                );
+            } else {
+                let next_extended_channel_id =
+                    downstream.channel_id_factory.fetch_add(1, Ordering::Relaxed);
+                let extranonce_prefix = match self
+                    .extranonce_allocator
+                    .with(|allocator| {
+                        allocator.allocate_extended(requested_min_rollable_extranonce_size.into())
+                    })
+                    .map_err(JDCError::shutdown)?
+                {
+                    Ok(prefix) => Some(prefix),
+                    Err(e) => {
+                        error!(?e, "Extranonce prefix error");
                         messages.push(
                             (
                                 downstream_id,
-                                Mining::OpenExtendedMiningChannelSuccess(
-                                    open_extended_mining_channel_success,
+                                build_error(
+                                    ERROR_CODE_OPEN_MINING_CHANNEL_MIN_EXTRANONCE_SIZE_TOO_LARGE,
                                 ),
                             )
                                 .into(),
                         );
+                        None
+                    }
+                };
 
-                        let mut coinbase_outputs = match deserialize_outputs(
-                            channel_manager_data.coinbase_outputs.clone(),
-                        ) {
-                            Ok(outputs) => outputs,
-                            Err(_) => {
-                                return Err(JDCError::shutdown(
-                                    JDCErrorKind::ChannelManagerHasBadCoinbaseOutputs,
-                                ))
+                if let Some(extranonce_prefix) = extranonce_prefix {
+                    let full_extranonce_size = self
+                        .upstream_channel
+                        .with(|channel| {
+                            channel
+                                .as_ref()
+                                .map(|channel| channel.get_full_extranonce_size())
+                                .unwrap_or(SOLO_FULL_EXTRANONCE_SIZE as usize)
+                        })
+                        .map_err(JDCError::shutdown)?;
+                    let rollable_extranonce_size = full_extranonce_size - extranonce_prefix.len();
+                    let pool_tag_string = self.pool_tag_string.get().map_err(JDCError::shutdown)?;
+
+                    let new_extended_channel = match ExtendedChannel::new_for_job_declaration_client(
+                        next_extended_channel_id,
+                        user_identity.to_string(),
+                        extranonce_prefix,
+                        requested_max_target,
+                        nominal_hash_rate,
+                        true,
+                        rollable_extranonce_size as u16,
+                        self.share_batch_size,
+                        self.shares_per_minute,
+                        pool_tag_string,
+                        self.miner_tag_string.clone(),
+                    ) {
+                        Ok(channel) => Some(channel),
+                        Err(e) => {
+                            error!(?e, "Failed to create ExtendedChannel");
+                            match e {
+                                ExtendedChannelError::OpenChannelInvalidNominalHashrate(code) => {
+                                    messages.push((downstream_id, build_error(code)).into());
+                                    None
+                                }
+                                other => return Err(JDCError::disconnect(other, downstream_id)),
                             }
-                        };
-                        coinbase_outputs[0].value =
-                            Amount::from_sat(last_future_template.coinbase_tx_value_remaining);
-
-                        // create a future extended job based on the last future template
-                        if let Err(e) = extended_channel
-                            .on_new_template(last_future_template.clone(), coinbase_outputs)
-                        {
-                            error!(?e, "Failed to apply template to extended channel");
-                            return Err(JDCError::shutdown(e));
                         }
+                    };
 
-                        let future_extended_job_id = extended_channel
-                            .get_future_job_id_from_template_id(last_future_template.template_id)
-                            .expect("future job id must exist");
-                        let future_extended_job = extended_channel
-                            .get_future_job(future_extended_job_id)
-                            .expect("future job must exist");
+                    if let Some(channel) = new_extended_channel {
+                        extended_channel_id = Some(next_extended_channel_id);
+                        extended_channel = Some(channel);
+                    }
+                }
+            }
 
-                        let future_extended_job_message =
-                            future_extended_job.get_job_message().clone().into_static();
+            if let Some(mut extended_channel) = extended_channel {
+                let extended_channel_id = extended_channel_id
+                    .expect("extended_channel_id must be set when channel exists");
+                let group_channel_id = downstream
+                    .group_channel
+                    .with(|channel| channel.get_group_channel_id())
+                    .map_err(JDCError::shutdown)?;
+                let open_extended_mining_channel_success = OpenExtendedMiningChannelSuccess {
+                    request_id,
+                    channel_id: extended_channel_id,
+                    target: extended_channel.get_target().to_le_bytes().into(),
+                    extranonce_prefix: extended_channel
+                        .get_extranonce_prefix()
+                        .to_vec()
+                        .try_into()
+                        .expect("valid extranonce prefix"),
+                    extranonce_size: extended_channel.get_rollable_extranonce_size(),
+                    group_channel_id,
+                }
+                .into_static();
 
-                        // send this future job as new job message
-                        // to be immediately activated with the subsequent SetNewPrevHash message
-                        messages.push(
-                            (
-                                downstream_id,
-                                Mining::NewExtendedMiningJob(future_extended_job_message),
-                            )
-                                .into(),
-                        );
+                let full_extranonce_size = extended_channel.get_full_extranonce_size();
+                messages.push(
+                    (
+                        downstream_id,
+                        Mining::OpenExtendedMiningChannelSuccess(
+                            open_extended_mining_channel_success,
+                        ),
+                    )
+                        .into(),
+                );
 
-                        // SetNewPrevHash message activates the future job
-                        let prev_hash = last_new_prev_hash.prev_hash.clone();
-                        let header_timestamp = last_new_prev_hash.header_timestamp;
-                        let n_bits = last_new_prev_hash.n_bits;
-                        let set_new_prev_hash_mining = SetNewPrevHash {
-                            channel_id: extended_channel_id,
-                            job_id: future_extended_job_id,
-                            prev_hash,
-                            min_ntime: header_timestamp,
-                            nbits: n_bits,
-                        };
-                        if let Err(e) = extended_channel.on_set_new_prev_hash(last_new_prev_hash) {
-                            error!(?e, "Failed to set prevhash on extended channel");
-                            return Err(JDCError::shutdown(e));
-                        }
-                        messages.push(
-                            (
-                                downstream_id,
-                                Mining::SetNewPrevHash(set_new_prev_hash_mining),
-                            )
-                                .into(),
-                        );
+                let mut coinbase_outputs =
+                    deserialize_outputs(self.coinbase_outputs.get().map_err(JDCError::shutdown)?)
+                        .map_err(|_| {
+                            JDCError::shutdown(JDCErrorKind::ChannelManagerHasBadCoinbaseOutputs)
+                        })?;
+                coinbase_outputs[0].value =
+                    Amount::from_sat(last_future_template.coinbase_tx_value_remaining);
+                extended_channel
+                    .on_new_template(last_future_template.clone(), coinbase_outputs)
+                    .map_err(|e| {
+                        error!(?e, "Failed to apply template to extended channel");
+                        JDCError::shutdown(e)
+                    })?;
 
-                        let vardiff = VardiffState::new().expect("Vardiff should instantiate.");
-                        data.extended_channels
-                            .insert(extended_channel_id, extended_channel);
+                let future_extended_job_id = extended_channel
+                    .get_future_job_id_from_template_id(last_future_template.template_id)
+                    .expect("future job id must exist");
+                let future_extended_job_message = extended_channel
+                    .get_future_job(future_extended_job_id)
+                    .expect("future job must exist")
+                    .get_job_message()
+                    .clone()
+                    .into_static();
+                messages.push(
+                    (
+                        downstream_id,
+                        Mining::NewExtendedMiningJob(future_extended_job_message),
+                    )
+                        .into(),
+                );
 
-                        channel_manager_data
-                            .downstream_channel_id_and_job_id_to_template_id
-                            .insert(
-                                (downstream_id, extended_channel_id, future_extended_job_id).into(),
-                                last_future_template.template_id,
-                            );
-                        channel_manager_data
-                            .vardiff
-                            .insert((downstream_id, extended_channel_id).into(), vardiff);
+                let prev_hash = last_new_prev_hash.prev_hash.clone();
+                let header_timestamp = last_new_prev_hash.header_timestamp;
+                let n_bits = last_new_prev_hash.n_bits;
+                let set_new_prev_hash_mining = SetNewPrevHash {
+                    channel_id: extended_channel_id,
+                    job_id: future_extended_job_id,
+                    prev_hash,
+                    min_ntime: header_timestamp,
+                    nbits: n_bits,
+                };
+                extended_channel
+                    .on_set_new_prev_hash(last_new_prev_hash)
+                    .map_err(|e| {
+                        error!(?e, "Failed to set prevhash on extended channel");
+                        JDCError::shutdown(e)
+                    })?;
+                messages.push(
+                    (
+                        downstream_id,
+                        Mining::SetNewPrevHash(set_new_prev_hash_mining),
+                    )
+                        .into(),
+                );
 
-                        data.group_channel
-                            .add_channel_id(extended_channel_id, full_extranonce_size)
-                            .map_err(|e| {
-                                error!("Failed to add channel id to group channel: {:?}", e);
-                                JDCError::shutdown(e)
-                            })?;
-
-                        Ok(messages)
+                downstream
+                    .extended_channels
+                    .insert(extended_channel_id, extended_channel);
+                self.downstream_channel_id_and_job_id_to_template_id.insert(
+                    (downstream_id, extended_channel_id, future_extended_job_id).into(),
+                    last_future_template.template_id,
+                );
+                self.vardiff.insert(
+                    (downstream_id, extended_channel_id).into(),
+                    VardiffState::new().expect("Vardiff should instantiate."),
+                );
+                downstream
+                    .group_channel
+                    .with(|channel| {
+                        channel.add_channel_id(extended_channel_id, full_extranonce_size)
                     })
-            })?;
+                    .map_err(JDCError::shutdown)?
+                    .map_err(|e| {
+                        error!("Failed to add channel id to group channel: {:?}", e);
+                        JDCError::shutdown(e)
+                    })?;
+            }
+
+            Ok(messages)
+        })?;
 
         for message in messages {
             // A send can only fail if the receiver side of the channel is closed.
@@ -752,142 +719,121 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
         info!("Received: {}", msg);
         let channel_id = msg.channel_id;
         let new_nominal_hash_rate = msg.nominal_hash_rate;
-        let requested_maximum_target =
-            Target::from_le_bytes(msg.maximum_target.inner_as_ref().try_into().unwrap());
+        let requested_maximum_target = Target::from_le_bytes(msg.maximum_target.to_array());
         let downstream_id =
             client_id.expect("client_id must be present for downstream_id extraction");
 
-        let messages = self
-            .channel_manager_data
-            .super_safe_lock(|channel_manager_data| {
-                let mut messages: Vec<RouteMessageTo> = vec![];
+        let build_error = |code: &str| {
+            error!(channel_id, error_code = code, "UpdateChannelError");
+            Mining::UpdateChannelError(UpdateChannelError {
+                channel_id,
+                error_code: code.to_string().try_into().expect("valid error code"),
+            })
+        };
+        let mut messages = self.with_registered_downstream(downstream_id, |downstream| {
+            let channel_messages = if let Some(messages_) =
+                downstream
+                    .standard_channels
+                    .with_mut(&channel_id, |standard_channel| {
+                        let mut messages: Vec<RouteMessageTo> = vec![];
+                        let update_channel = standard_channel
+                            .update_channel(new_nominal_hash_rate, Some(requested_maximum_target));
+                        let new_target = standard_channel.get_target();
 
-                if let Some(downstream) = channel_manager_data.downstream.get_mut(&downstream_id) {
-                    messages.extend_from_slice(&downstream.downstream_data.super_safe_lock(
-                        |data| {
-                            let mut messages: Vec<RouteMessageTo> = vec![];
-
-                            let build_error = |code: &str| {
-                                error!(channel_id, error_code = code, "UpdateChannelError");
-                                Mining::UpdateChannelError(UpdateChannelError {
-                                    channel_id,
-                                    error_code: code
-                                        .to_string()
-                                        .try_into()
-                                        .expect("valid error code"),
-                                })
+                        if let Err(e) = update_channel {
+                            error!(channel_id, ?e, "StandardChannel update failed");
+                            let err_code = match e {
+                                StandardChannelError::UpdateChannelInvalidNominalHashrate(code) => {
+                                    code
+                                }
+                                _ => "internal-error",
                             };
-
-                            if let Some(standard_channel) =
-                                data.standard_channels.get_mut(&channel_id)
-                            {
-                                let update_channel = standard_channel.update_channel(
-                                    new_nominal_hash_rate,
-                                    Some(requested_maximum_target),
-                                );
-                                let new_target = standard_channel.get_target();
-
-                                if let Err(e) = update_channel {
-                                    error!(channel_id, ?e, "StandardChannel update failed");
-
-                                    let err_code = match e {
-                                    StandardChannelError::UpdateChannelInvalidNominalHashrate(
-                                        code,
-                                    ) => code,
-                                    _ => "internal-error",
-                                };
-                                    if err_code == "internal-error" {
-                                        warn!("Failed to update standard channel {channel_id}");
-                                    } else {
-                                        return vec![(downstream_id, build_error(err_code)).into()];
-                                    }
-                                }
-
-                                messages.push(
-                                    (
-                                        downstream_id,
-                                        Mining::SetTarget(SetTarget {
-                                            channel_id,
-                                            maximum_target: new_target.to_le_bytes().into(),
-                                        }),
-                                    )
-                                        .into(),
-                                );
-                            } else if let Some(extended_channel) =
-                                data.extended_channels.get_mut(&channel_id)
-                            {
-                                let update_channel = extended_channel.update_channel(
-                                    new_nominal_hash_rate,
-                                    Some(requested_maximum_target),
-                                );
-                                let new_target = extended_channel.get_target();
-
-                                if let Err(e) = update_channel {
-                                    error!(channel_id, ?e, "ExtendedChannel update failed");
-                                    let err_code = match e {
-                                    ExtendedChannelError::UpdateChannelInvalidNominalHashrate(
-                                        code,
-                                    ) => code,
-                                    _ => "internal-error",
-                                };
-                                    if err_code == "internal-error" {
-                                        warn!("Failed to update extended channel {channel_id}");
-                                    } else {
-                                        return vec![(downstream_id, build_error(err_code)).into()];
-                                    }
-                                }
-
-                                messages.push(
-                                    (
-                                        downstream_id,
-                                        Mining::SetTarget(SetTarget {
-                                            channel_id,
-                                            maximum_target: new_target.to_le_bytes().into(),
-                                        }),
-                                    )
-                                        .into(),
-                                );
-                            } else {
-                                error!("UpdateChannelError: invalid-channel-id");
-                                return vec![(
-                                    downstream_id,
-                                    build_error(ERROR_CODE_UPDATE_CHANNEL_INVALID_CHANNEL_ID),
-                                )
-                                    .into()];
+                            if err_code != "internal-error" {
+                                return vec![(downstream_id, build_error(err_code)).into()];
                             }
-
-                            messages
-                        },
-                    ));
-                }
-
-                let mut downstream_hashrate = 0.0;
-                let mut min_target = Target::from_le_bytes([0xff; 32]);
-
-                for (_, downstream) in channel_manager_data.downstream.iter() {
-                    downstream.downstream_data.super_safe_lock(|data| {
-                        let mut update_from_channel = |hashrate: f32, target: &Target| {
-                            downstream_hashrate += hashrate;
-                            min_target = std::cmp::min(*target, min_target);
-                        };
-
-                        for (_, channel) in data.standard_channels.iter() {
-                            update_from_channel(
-                                channel.get_nominal_hashrate(),
-                                channel.get_target(),
-                            );
+                            warn!("Failed to update standard channel {channel_id}");
                         }
 
-                        for (_, channel) in data.extended_channels.iter() {
-                            update_from_channel(
-                                channel.get_nominal_hashrate(),
-                                channel.get_target(),
-                            );
-                        }
-                    });
-                }
+                        messages.push(
+                            (
+                                downstream_id,
+                                Mining::SetTarget(SetTarget {
+                                    channel_id,
+                                    maximum_target: new_target.to_le_bytes().into(),
+                                }),
+                            )
+                                .into(),
+                        );
+                        messages
+                    }) {
+                messages_
+            } else if let Some(messages_) =
+                downstream
+                    .extended_channels
+                    .with_mut(&channel_id, |extended_channel| {
+                        let mut messages: Vec<RouteMessageTo> = vec![];
+                        let update_channel = extended_channel
+                            .update_channel(new_nominal_hash_rate, Some(requested_maximum_target));
+                        let new_target = extended_channel.get_target();
 
-                if let Some(ref mut upstream_channel) = channel_manager_data.upstream_channel {
+                        if let Err(e) = update_channel {
+                            error!(channel_id, ?e, "ExtendedChannel update failed");
+                            let err_code = match e {
+                                ExtendedChannelError::UpdateChannelInvalidNominalHashrate(code) => {
+                                    code
+                                }
+                                _ => "internal-error",
+                            };
+                            if err_code != "internal-error" {
+                                return vec![(downstream_id, build_error(err_code)).into()];
+                            }
+                            warn!("Failed to update extended channel {channel_id}");
+                        }
+
+                        messages.push(
+                            (
+                                downstream_id,
+                                Mining::SetTarget(SetTarget {
+                                    channel_id,
+                                    maximum_target: new_target.to_le_bytes().into(),
+                                }),
+                            )
+                                .into(),
+                        );
+                        messages
+                    })
+            {
+                messages_
+            } else {
+                vec![(
+                    downstream_id,
+                    build_error(ERROR_CODE_UPDATE_CHANNEL_INVALID_CHANNEL_ID),
+                )
+                    .into()]
+            };
+            Ok(channel_messages)
+        })?;
+
+        let mut downstream_hashrate = 0.0;
+        let mut min_target = Target::from_le_bytes([0xff; 32]);
+        self.downstream.for_each(|_, downstream| {
+            let mut update_from_channel = |hashrate: f32, target: &Target| {
+                downstream_hashrate += hashrate;
+                min_target = std::cmp::min(*target, min_target);
+            };
+
+            downstream.standard_channels.for_each(|_, channel| {
+                update_from_channel(channel.get_nominal_hashrate(), channel.get_target());
+            });
+
+            downstream.extended_channels.for_each(|_, channel| {
+                update_from_channel(channel.get_nominal_hashrate(), channel.get_target());
+            });
+        });
+
+        self.upstream_channel
+            .with(|upstream_channel| {
+                if let Some(upstream_channel) = upstream_channel.as_mut() {
                     debug!(
                         "Checking upstream channel {} with hashrate {} and target {:?}",
                         upstream_channel.get_channel_id(),
@@ -895,10 +841,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                         upstream_channel.get_target()
                     );
 
-                    // Update the upstream channel's nominal hashrate to reflect
-                    // the aggregated downstream hashrate
                     upstream_channel.set_nominal_hashrate(downstream_hashrate);
-
                     info!("Sending update channel message upstream");
                     messages.push(
                         Mining::UpdateChannel(UpdateChannel {
@@ -907,11 +850,10 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                             maximum_target: min_target.to_le_bytes().into(),
                         })
                         .into(),
-                    )
+                    );
                 }
-
-                messages
-            });
+            })
+            .map_err(JDCError::shutdown)?;
 
         for message in messages {
             // A send can only fail if the receiver side of the channel is closed.
@@ -952,39 +894,23 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
             Mining::SubmitSharesError(SubmitSharesError {
                 channel_id,
                 sequence_number: msg.sequence_number,
-                error_code: code.to_string().try_into().expect("valid error code"),
+                error_code: code.try_into().expect("valid error code"),
             })
         };
 
-        let messages = self.channel_manager_data.super_safe_lock(|channel_manager_data| {
-            let Some(downstream) = channel_manager_data.downstream.get_mut(&downstream_id) else {
-                warn!("No downstream found for downstream_id={downstream_id}");
-                return Err(JDCError::disconnect(JDCErrorKind::DownstreamNotFound(downstream_id), downstream_id));
-            };
-            let Some(prev_hash) = channel_manager_data.last_new_prev_hash.as_ref() else {
-                warn!("No prev_hash available yet, ignoring share");
-                return Err(JDCError::disconnect(JDCErrorKind::LastNewPrevhashNotFound, downstream_id));
-            };
+        let Some(prev_hash) = self.last_new_prev_hash.get().map_err(JDCError::shutdown)? else {
+            warn!("No prev_hash available yet, ignoring share");
+            return Err(JDCError::disconnect(
+                JDCErrorKind::LastNewPrevhashNotFound,
+                downstream_id,
+            ));
+        };
 
-            downstream.downstream_data.super_safe_lock(|data| {
+        let vardiff_key = (downstream_id, channel_id).into();
+        let messages = self.with_registered_downstream(downstream_id, |downstream| {
+            let validation = downstream.standard_channels.with_mut(&channel_id, |standard_channel| {
                 let mut messages: Vec<RouteMessageTo> = vec![];
 
-                let Some(standard_channel) = data.standard_channels.get_mut(&channel_id) else {
-                    error!(
-                        "SubmitSharesError: channel_id: {channel_id}, sequence_number: {}, error_code: {}",
-                        msg.sequence_number, ERROR_CODE_SUBMIT_SHARES_INVALID_CHANNEL_ID
-                    );
-                    return Ok(vec![(
-                        downstream_id,
-                        build_error(ERROR_CODE_SUBMIT_SHARES_INVALID_CHANNEL_ID),
-                    )
-                        .into()]);
-                };
-
-                let Some(vardiff) = channel_manager_data.vardiff.get_mut(&(downstream_id, channel_id).into()) else {
-                    return Ok(vec![(downstream_id, Mining::CloseChannel(create_close_channel_msg(channel_id, "invalid-channel-id"))).into()]);
-                };
-                vardiff.increment_shares_since_last_update();
                 let res = standard_channel.validate_share(msg.clone());
                 let mut is_downstream_share_valid = false;
                 let mut downstream_share_hash: Option<sha256d::Hash> = None;
@@ -1022,8 +948,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                                 header_nonce: msg.nonce,
                                 coinbase_tx: coinbase.try_into().map_err(JDCError::shutdown)?,
                             };
-
-                            messages.push(TemplateDistribution::SubmitSolution(solution.clone()).into());
+                            messages.push(TemplateDistribution::SubmitSolution(solution).into());
                         }
                         let share_accounting = standard_channel.get_share_accounting().clone();
                         let success = SubmitSharesSuccess {
@@ -1032,10 +957,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                             new_submits_accepted_count: share_accounting.get_last_batch_accepted(),
                             new_shares_sum: share_accounting.get_last_batch_work_sum(),
                         };
-                        messages.push((
-                            downstream.downstream_id,
-                            Mining::SubmitSharesSuccess(success),
-                        ).into());
+                        messages.push((downstream.downstream_id, Mining::SubmitSharesSuccess(success)).into());
                     }
                     Err(err) => {
                         let code = match err {
@@ -1047,7 +969,10 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                             ShareValidationError::VersionRollingNotAllowed(code) => code,
                             _ => unreachable!(),
                         };
-                        error!("❌ SubmitSharesError: ch={}, seq={}, error={code}", channel_id, msg.sequence_number);
+                        error!(
+                            "❌ SubmitSharesError: ch={}, seq={}, error={code}",
+                            channel_id, msg.sequence_number
+                        );
                         messages.push((downstream_id, build_error(code)).into());
                     }
                 }
@@ -1056,72 +981,79 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                     return Ok(messages);
                 }
 
-                if let Some(upstream_channel) = channel_manager_data.upstream_channel.as_mut() {
-                    let key = (downstream_id, channel_id, downstream_job_id).into();
+                let mapping_key = (downstream_id, channel_id, downstream_job_id).into();
+                let template_id = self
+                    .downstream_channel_id_and_job_id_to_template_id
+                    .get_cloned(&mapping_key);
+                let upstream_job_id = template_id
+                    .and_then(|tid| self.template_id_to_upstream_job_id.get_cloned(&tid));
 
-                    let template_id = channel_manager_data
-                        .downstream_channel_id_and_job_id_to_template_id
-                        .get(&key)
-                        .copied();
+                self.upstream_channel
+                    .with(|maybe_upstream_channel| -> Result<(), Self::Error> {
+                        let Some(upstream_channel) = maybe_upstream_channel.as_mut() else {
+                            return Ok(());
+                        };
 
-                    let upstream_job_id = template_id
-                        .and_then(|tid| channel_manager_data.template_id_to_upstream_job_id.get(&tid))
-                        .copied();
+                        let extranonce_prefix = standard_channel.get_extranonce_prefix();
+                        let upstream_extranonce_prefix = upstream_channel.get_extranonce_prefix();
+                        let extranonce = &extranonce_prefix[upstream_extranonce_prefix.len()..];
 
-                    let extranonce_prefix = standard_channel.get_extranonce_prefix();
-                    let upstream_extranonce_prefix = upstream_channel.get_extranonce_prefix();
-                    let extranonce = &extranonce_prefix[upstream_extranonce_prefix.len()..];
+                        let mut upstream_message = SubmitSharesExtended {
+                            channel_id: upstream_channel.get_channel_id(),
+                            job_id: 0, // set later if known
+                            extranonce: extranonce.to_vec().try_into().map_err(JDCError::shutdown)?,
+                            nonce: msg.nonce,
+                            ntime: msg.ntime,
+                            // We assign sequence number later, when we validate the share
+                            // and send it to upstream.
+                            sequence_number: 0,
+                            version: msg.version,
+                        };
 
-                    let mut upstream_message = SubmitSharesExtended {
-                        channel_id: upstream_channel.get_channel_id(),
-                        job_id: 0, // set later if known
-                        extranonce: extranonce.to_vec().try_into().map_err(JDCError::shutdown)?,
-                        nonce: msg.nonce,
-                        ntime: msg.ntime,
-                        // We assign sequence number later, when we validate the share
-                        // and send it to upstream.
-                        sequence_number: 0,
-                        version: msg.version,
-                    };
-
-                    match upstream_job_id {
-                        // The presence of an `upstream_job_id` indicates that the upstream
-                        // has acknowledged the custom job (`SetCustomMiningJob.Success` was received by JDC) 
-                        // and is ready to accept shares for it.
-                        //
-                        // We use optimistic mining: downstream miners are instructed to start
-                        // mining before the upstream acknowledgement arrives. Once the custom job
-                        // is acknowledged, shares can be safely submitted.
-                        //
-                        // See the Job Declaration Modes section for details:
-                        // https://stratumprotocol.org/specification/06-job-declaration-protocol/#63-job-declaration-modes
-                        Some(upstream_job_id) => {
-                            upstream_message.job_id = upstream_job_id;
-                            match upstream_channel.validate_share(upstream_message.clone()) {
-                                Ok(client::share_accounting::ShareValidationResult::Valid(share_hash)) => {
-                                    upstream_message.sequence_number = channel_manager_data.sequence_number_factory.fetch_add(1, Ordering::Relaxed);
-                                    info!(
+                        match upstream_job_id {
+                            // The presence of an `upstream_job_id` indicates that the upstream
+                            // has acknowledged the custom job (`SetCustomMiningJob.Success` was received by JDC) 
+                            // and is ready to accept shares for it.
+                            //
+                            // We use optimistic mining: downstream miners are instructed to start
+                            // mining before the upstream acknowledgement arrives. Once the custom job
+                            // is acknowledged, shares can be safely submitted.
+                            //
+                            // See the Job Declaration Modes section for details:
+                            // https://stratumprotocol.org/specification/06-job-declaration-protocol/#63-job-declaration-modes
+                            Some(upstream_job_id) => {
+                                upstream_message.job_id = upstream_job_id;
+                                match upstream_channel.validate_share(upstream_message.clone()) {
+                                    Ok(client::share_accounting::ShareValidationResult::Valid(share_hash)) => {
+                                        upstream_message.sequence_number =
+                                            self.sequence_number_factory.fetch_add(1, Ordering::Relaxed);
+                                            info!(
                                         "SubmitSharesStandard, forwarding it to upstream: valid share | channel_id: {}, sequence_number: {}, share_hash: {}  ✅",
                                         channel_id, upstream_message.sequence_number, share_hash
                                     );
-                                    messages.push(Mining::SubmitSharesExtended(upstream_message).into());
-                                }
-                                Ok(client::share_accounting::ShareValidationResult::BlockFound(share_hash)) => {
-                                    upstream_message.sequence_number = channel_manager_data.sequence_number_factory.fetch_add(1, Ordering::Relaxed);
-                                    info!("SubmitSharesStandard forwarding it to upstream: 💰 Block Found!!! 💰{share_hash}");
-                                    let push_solution = PushSolution {
-                                        extranonce: standard_channel.get_extranonce_prefix().to_vec().try_into().map_err(JDCError::shutdown)?,
-                                        ntime: upstream_message.ntime,
-                                        nonce: upstream_message.nonce,
-                                        version: upstream_message.version,
-                                        nbits: prev_hash.n_bits,
-                                        prev_hash: prev_hash.prev_hash.clone(),
-                                    };
-                                    messages.push(JobDeclaration::PushSolution(push_solution).into());
-                                    messages.push(Mining::SubmitSharesExtended(upstream_message).into());
-                                }
-                                Err(err) => {
-                                    let code = match err {
+                                        messages.push(Mining::SubmitSharesExtended(upstream_message).into());
+                                    }
+                                    Ok(client::share_accounting::ShareValidationResult::BlockFound(share_hash)) => {
+                                        upstream_message.sequence_number =
+                                            self.sequence_number_factory.fetch_add(1, Ordering::Relaxed);
+                                        info!("SubmitSharesStandard forwarding it to upstream: 💰 Block Found!!! 💰{share_hash}");
+                                        let push_solution = PushSolution {
+                                            extranonce: standard_channel
+                                                .get_extranonce_prefix()
+                                                .to_vec()
+                                                .try_into()
+                                                .map_err(JDCError::shutdown)?,
+                                            ntime: upstream_message.ntime,
+                                            nonce: upstream_message.nonce,
+                                            version: upstream_message.version,
+                                            nbits: prev_hash.n_bits,
+                                            prev_hash: prev_hash.prev_hash.clone(),
+                                        };
+                                        messages.push(JobDeclaration::PushSolution(push_solution).into());
+                                        messages.push(Mining::SubmitSharesExtended(upstream_message).into());
+                                    }
+                                    Err(err) => {
+                                        let code = match err {
                                         client::share_accounting::ShareValidationError::Invalid(code) => code,
                                         client::share_accounting::ShareValidationError::Stale(code) => code,
                                         client::share_accounting::ShareValidationError::InvalidJobId(code) => code,
@@ -1131,35 +1063,64 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                                         _ => unreachable!(),
                                     };
                                     debug!("❌ SubmitSharesError not forwarding it to upstream: ch={}, seq={}, error={code}", channel_id, upstream_message.sequence_number);
+                                    }
                                 }
                             }
-                        }
-                        None => {
-                            debug!(
-                                "SubmitSharesStandard: upstream job_id not yet known (still waiting for the SetCustomMiningJob.Success message), caching share (channel_id={}, downstream_job_id={})",
-                                channel_id, downstream_job_id
-                            );
-                            if let Some(template_id) = template_id {
-                                let hash = downstream_share_hash
-                                    .expect("downstream_share_hash must be set when downstream share is valid");
-                                let entry = SharesOrderedByDiff::new(upstream_message.into_static(), hash);
-                                let heap = channel_manager_data
-                                    .cached_shares
-                                    .entry(template_id)
-                                    .or_default();
-                                add_share_to_cache(heap, entry);
-                            } else {
-                                warn!(
+                            None => {
+                                debug!(
+                                    "SubmitSharesStandard: upstream job_id not yet known (still waiting for the SetCustomMiningJob.Success message), caching share (channel_id={}, downstream_job_id={})",
+                                    channel_id, downstream_job_id
+                                );
+                                if let Some(template_id) = template_id {
+                                    let hash = downstream_share_hash.expect(
+                                        "downstream_share_hash must be set when downstream share is valid",
+                                    );
+                                    let entry =
+                                        SharesOrderedByDiff::new(upstream_message.into_static(), hash);
+                                    self.cached_shares.with_mut_or_default(template_id, |heap| {
+                                        add_share_to_cache(heap, entry);
+                                    });
+                                } else {
+                                    warn!(
                                         "SubmitSharesStandard: could not cache share, no template_id found for key (downstream_id={}, channel_id={}, downstream_job_id={})",
                                         downstream_id, channel_id, downstream_job_id
                                     );
+                                }
                             }
                         }
-                    }
-                }
+
+                        Ok(())
+                    })
+                    .map_err(JDCError::shutdown)??;
 
                 Ok(messages)
-            })
+            });
+            match validation {
+                Some(validation) => {
+                    if self
+                        .vardiff
+                        .with_mut(&vardiff_key, |vardiff| {
+                            vardiff.increment_shares_since_last_update();
+                        })
+                        .is_none()
+                    {
+                        return Ok(vec![(
+                            downstream_id,
+                            Mining::CloseChannel(create_close_channel_msg(
+                                channel_id,
+                                "invalid-channel-id",
+                            )),
+                        )
+                            .into()]);
+                    }
+                    validation
+                }
+                None => Ok(vec![(
+                    downstream_id,
+                    build_error(ERROR_CODE_SUBMIT_SHARES_INVALID_CHANNEL_ID),
+                )
+                    .into()]),
+            }
         })?;
 
         for message in messages {
@@ -1202,39 +1163,32 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
             Mining::SubmitSharesError(SubmitSharesError {
                 channel_id,
                 sequence_number: msg.sequence_number,
-                error_code: code.to_string().try_into().expect("valid error code"),
+                error_code: code.try_into().expect("valid error code"),
             })
         };
 
-        let messages = self.channel_manager_data.super_safe_lock(|channel_manager_data| {
-            let Some(downstream) = channel_manager_data.downstream.get_mut(&downstream_id) else {
-                warn!("No downstream found for downstream_id={downstream_id}");
-                return Err(JDCError::disconnect(JDCErrorKind::DownstreamNotFound(downstream_id), downstream_id));
-            };
-            let Some(prev_hash) = channel_manager_data.last_new_prev_hash.as_ref() else {
-                warn!("No prev_hash available yet, ignoring share");
-                return Err(JDCError::disconnect(JDCErrorKind::LastNewPrevhashNotFound, downstream_id));
-            };
-            downstream.downstream_data.super_safe_lock(|data| {
-                let mut messages: Vec<RouteMessageTo> = vec![];
+        let Some(prev_hash) = self.last_new_prev_hash.get().map_err(JDCError::shutdown)? else {
+            warn!("No prev_hash available yet, ignoring share");
+            return Err(JDCError::disconnect(
+                JDCErrorKind::LastNewPrevhashNotFound,
+                downstream_id,
+            ));
+        };
 
-                let Some(extended_channel) = data.extended_channels.get_mut(&channel_id) else {
-                    error!(
-                        "SubmitSharesError: channel_id: {channel_id}, sequence_number: {}, error_code: {}",
-                        msg.sequence_number, ERROR_CODE_SUBMIT_SHARES_INVALID_CHANNEL_ID
-                    );
-                    return Ok(vec![(
-                        downstream_id,
-                        build_error(ERROR_CODE_SUBMIT_SHARES_INVALID_CHANNEL_ID),
-                    )
-                        .into()]);
-                };
+        let vardiff_key = (downstream_id, channel_id).into();
+        let messages = self.with_registered_downstream(downstream_id, |downstream| {
+            let validation = downstream.extended_channels.with_mut(&channel_id, |extended_channel| {
+                let mut messages: Vec<RouteMessageTo> = vec![];
                 // here we extract and set the user_identity from the TLV fields if the extension is negotiated
-                let user_identity = if negotiated_extensions.as_ref().is_ok_and(|exts| exts.contains(&EXTENSION_TYPE_WORKER_HASHRATE_TRACKING)) {
+                let _user_identity = if negotiated_extensions
+                    .as_ref()
+                    .is_ok_and(|exts| exts.contains(&EXTENSION_TYPE_WORKER_HASHRATE_TRACKING))
+                {
                     tlv_fields.and_then(|tlvs| {
                         tlvs.iter()
                             .find(|tlv| {
-                                tlv.r#type.extension_type == EXTENSION_TYPE_WORKER_HASHRATE_TRACKING
+                                tlv.r#type.extension_type
+                                    == EXTENSION_TYPE_WORKER_HASHRATE_TRACKING
                                     && tlv.r#type.field_type == TLV_FIELD_TYPE_USER_IDENTITY
                             })
                             .and_then(|tlv| UserIdentity::from_tlv(tlv).ok())
@@ -1242,14 +1196,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                 } else {
                     None
                 };
-                if let Some(_user_identity) = user_identity {
-                    // here we have the UserIdentity TLV, so we can use it to enhance monitoring of individual miners in the future
-                }
 
-                let Some(vardiff) = channel_manager_data.vardiff.get_mut(&(downstream_id, channel_id).into()) else {
-                    return Ok(vec![(downstream_id, Mining::CloseChannel(create_close_channel_msg(channel_id, "invalid-channel-id"))).into()]);
-                };
-                vardiff.increment_shares_since_last_update();
                 let res = extended_channel.validate_share(msg.clone());
                 let mut is_downstream_share_valid = false;
                 let mut downstream_share_hash: Option<sha256d::Hash> = None;
@@ -1286,7 +1233,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                                 header_nonce: msg.nonce,
                                 coinbase_tx: coinbase.try_into().map_err(JDCError::shutdown)?,
                             };
-                            messages.push(TemplateDistribution::SubmitSolution(solution.clone()).into());
+                            messages.push(TemplateDistribution::SubmitSolution(solution).into());
                         }
                         let share_accounting = extended_channel.get_share_accounting().clone();
                         let success = SubmitSharesSuccess {
@@ -1296,10 +1243,7 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                             new_shares_sum: share_accounting.get_last_batch_work_sum(),
                         };
                         is_downstream_share_valid = true;
-                        messages.push((
-                            downstream.downstream_id,
-                            Mining::SubmitSharesSuccess(success),
-                        ).into());
+                        messages.push((downstream.downstream_id, Mining::SubmitSharesSuccess(success)).into());
                     }
                     Err(err) => {
                         let code = match err {
@@ -1312,126 +1256,165 @@ impl HandleMiningMessagesFromClientAsync for ChannelManager {
                             ShareValidationError::VersionRollingNotAllowed(code) => code,
                             _ => unreachable!(),
                         };
-                        error!("❌ SubmitSharesError on downstream channel: ch={}, seq={}, error={code}", channel_id, msg.sequence_number);
+                        error!(
+                            "❌ SubmitSharesError on downstream channel: ch={}, seq={}, error={code}",
+                            channel_id, msg.sequence_number
+                        );
                         messages.push((downstream_id, build_error(code)).into());
                     }
                 }
 
-                if !is_downstream_share_valid{
+                if !is_downstream_share_valid {
                     return Ok(messages);
                 }
 
-                if let Some(upstream_channel) = channel_manager_data.upstream_channel.as_mut() {
-                    let key = (downstream_id, channel_id, downstream_job_id).into();
+                let mapping_key = (downstream_id, channel_id, downstream_job_id).into();
+                let template_id = self
+                    .downstream_channel_id_and_job_id_to_template_id
+                    .get_cloned(&mapping_key);
+                let upstream_job_id = template_id
+                    .and_then(|tid| self.template_id_to_upstream_job_id.get_cloned(&tid));
 
-                    let template_id = channel_manager_data
-                        .downstream_channel_id_and_job_id_to_template_id
-                        .get(&key)
-                        .copied();
+                self.upstream_channel
+                    .with(|maybe_upstream_channel| -> Result<(), Self::Error> {
+                        let Some(upstream_channel) = maybe_upstream_channel.as_mut() else {
+                            return Ok(());
+                        };
 
-                    let upstream_job_id = template_id
-                        .and_then(|tid| channel_manager_data.template_id_to_upstream_job_id.get(&tid))
-                        .copied();
+                        let extranonce_prefix = extended_channel.get_extranonce_prefix();
+                        let upstream_extranonce_prefix = upstream_channel.get_extranonce_prefix();
+                        let new_extranonce_prefix =
+                            &extranonce_prefix[upstream_extranonce_prefix.len()..];
 
-                    let extranonce_prefix = extended_channel.get_extranonce_prefix();
-                    let upstream_extranonce_prefix = upstream_channel.get_extranonce_prefix();
-                    let new_extranonce_prefix = &extranonce_prefix[upstream_extranonce_prefix.len()..];
+                        let mut upstream_message = msg.clone();
+                        upstream_message.channel_id = upstream_channel.get_channel_id();
+                        upstream_message.sequence_number = 0;
 
-                    let mut upstream_message = msg.clone();
-                    upstream_message.channel_id = upstream_channel.get_channel_id();
-                    // We assign sequence number later, when we validate the share
-                    // and send it to upstream.
-                    upstream_message.sequence_number = 0;
+                        let mut extranonce = vec![];
+                        extranonce.extend_from_slice(new_extranonce_prefix);
+                        extranonce.extend_from_slice(msg.extranonce.as_bytes());
+                        upstream_message.extranonce = extranonce
+                            .try_into()
+                            .map_err(|e| JDCError::disconnect(e, downstream_id))?;
 
-                    let mut extranonce = vec![];
-                    extranonce.extend_from_slice(new_extranonce_prefix);
-                    extranonce.extend_from_slice(&msg.extranonce.to_vec());
-                    upstream_message.extranonce = extranonce.try_into().map_err(|e| JDCError::disconnect(e, downstream_id))?;
-
-                    match upstream_job_id {
-                    // The presence of an `upstream_job_id` indicates that the upstream
-                    // has acknowledged the custom job (`SetCustomMiningJob.Success` was received by JDC) 
-                    // and is ready to accept shares for it.
-                    //
-                    // We use optimistic mining: downstream miners are instructed to start
-                    // mining before the upstream acknowledgement arrives. Once the custom job
-                    // is acknowledged, shares can be safely submitted.
-                    //
-                    // See the Job Declaration Modes section for details:
-                    // https://stratumprotocol.org/specification/06-job-declaration-protocol/#63-job-declaration-modes
-                        Some(upstream_job_id) => {
-                            upstream_message.job_id = upstream_job_id;
-                            match upstream_channel.validate_share(upstream_message.clone()) {
-                                Ok(client::share_accounting::ShareValidationResult::Valid(share_hash)) => {
-                                    upstream_message.sequence_number = channel_manager_data.sequence_number_factory.fetch_add(1, Ordering::Relaxed);
-                                    info!(
-                                        "SubmitSharesExtended forwarding it to upstream: valid share | channel_id: {}, sequence_number: {}, share_hash: {}  ✅",
-                                        channel_id, upstream_message.sequence_number, share_hash
-                                    );
-                                    messages.push(
-                                        Mining::SubmitSharesExtended(upstream_message.into_static()).into(),
-                                    );
+                        match upstream_job_id {
+                            // The presence of an `upstream_job_id` indicates that the upstream
+                            // has acknowledged the custom job (`SetCustomMiningJob.Success` was received by JDC) 
+                            // and is ready to accept shares for it.
+                            //
+                            // We use optimistic mining: downstream miners are instructed to start
+                            // mining before the upstream acknowledgement arrives. Once the custom job
+                            // is acknowledged, shares can be safely submitted.
+                            //
+                            // See the Job Declaration Modes section for details:
+                            // https://stratumprotocol.org/specification/06-job-declaration-protocol/#63-job-declaration-modes
+                            Some(upstream_job_id) => {
+                                upstream_message.job_id = upstream_job_id;
+                                match upstream_channel.validate_share(upstream_message.clone()) {
+                                    Ok(client::share_accounting::ShareValidationResult::Valid(share_hash)) => {
+                                        upstream_message.sequence_number =
+                                            self.sequence_number_factory.fetch_add(1, Ordering::Relaxed);
+                                        info!(
+                                            "SubmitSharesExtended forwarding it to upstream: valid share | channel_id: {}, sequence_number: {}, share_hash: {}  ✅",
+                                            channel_id, upstream_message.sequence_number, share_hash
+                                        );
+                                        messages.push(
+                                            Mining::SubmitSharesExtended(upstream_message.into_static()).into(),
+                                        );
+                                    }
+                                    Ok(client::share_accounting::ShareValidationResult::BlockFound(share_hash)) => {
+                                        upstream_message.sequence_number =
+                                            self.sequence_number_factory.fetch_add(1, Ordering::Relaxed);
+                                        info!("SubmitSharesExtended forwarding it to upstream: 💰 Block Found!!! 💰{share_hash}");
+                                        let mut channel_extranonce =
+                                            upstream_channel.get_extranonce_prefix().to_vec();
+                                        channel_extranonce
+                                            .extend_from_slice(upstream_message.extranonce.as_bytes());
+                                        let push_solution = PushSolution {
+                                            extranonce: channel_extranonce
+                                                .try_into()
+                                                .map_err(JDCError::shutdown)?,
+                                            ntime: upstream_message.ntime,
+                                            nonce: upstream_message.nonce,
+                                            version: upstream_message.version,
+                                            nbits: prev_hash.n_bits,
+                                            prev_hash: prev_hash.prev_hash.clone(),
+                                        };
+                                        messages.push(JobDeclaration::PushSolution(push_solution).into());
+                                        messages.push(
+                                            Mining::SubmitSharesExtended(upstream_message.into_static()).into(),
+                                        );
+                                    }
+                                    Err(err) => {
+                                        let code = match err {
+                                            client::share_accounting::ShareValidationError::Invalid(code) => code,
+                                            client::share_accounting::ShareValidationError::Stale(code) => code,
+                                            client::share_accounting::ShareValidationError::InvalidJobId(code) => code,
+                                            client::share_accounting::ShareValidationError::DoesNotMeetTarget(code) => code,
+                                            client::share_accounting::ShareValidationError::DuplicateShare(code) => code,
+                                            client::share_accounting::ShareValidationError::BadExtranonceSize(code) => code,
+                                            client::share_accounting::ShareValidationError::VersionRollingNotAllowed(code) => code,
+                                            _ => unreachable!(),
+                                        };
+                                        debug!(
+                                            "❌ SubmitSharesError not forwarding it to upstream: ch={}, seq={}, error={code}",
+                                            channel_id, upstream_message.sequence_number
+                                        );
+                                    }
                                 }
-                                Ok(client::share_accounting::ShareValidationResult::BlockFound(share_hash)) => {
-                                    upstream_message.sequence_number = channel_manager_data.sequence_number_factory.fetch_add(1, Ordering::Relaxed);
-                                    info!("SubmitSharesExtended forwarding it to upstream: 💰 Block Found!!! 💰{share_hash}");
-                                    let mut channel_extranonce = upstream_channel.get_extranonce_prefix().to_vec();
-                                    channel_extranonce.extend_from_slice(&upstream_message.extranonce.to_vec());
-                                    let push_solution = PushSolution {
-                                        extranonce: channel_extranonce.try_into().map_err(JDCError::shutdown)?,
-                                        ntime: upstream_message.ntime,
-                                        nonce: upstream_message.nonce,
-                                        version: upstream_message.version,
-                                        nbits: prev_hash.n_bits,
-                                        prev_hash: prev_hash.prev_hash.clone(),
-                                    };
-                                    messages.push(JobDeclaration::PushSolution(push_solution.clone()).into());
-                                    // TODO here we should add the user_identity TLV to the SubmitSharesExtended
-                                    // frame in case the extension n.2 has been negotiated between JDC and Pool.
-                                    messages.push(
-                                        Mining::SubmitSharesExtended(upstream_message.into_static()).into(),
+                            }
+                            None => {
+                                debug!("Upstream job_id not yet known (still waiting for the SetCustomMiningJob.Success message), caching share");
+                                if let Some(template_id) = template_id {
+                                    let hash = downstream_share_hash.expect(
+                                        "downstream_share_hash must be set when downstream share is valid",
                                     );
-                                }
-                                Err(err) => {
-                                    let code = match err {
-                                        client::share_accounting::ShareValidationError::Invalid(code)=>code,
-                                        client::share_accounting::ShareValidationError::Stale(code)=>code,
-                                        client::share_accounting::ShareValidationError::InvalidJobId(code)=>code,
-                                        client::share_accounting::ShareValidationError::DoesNotMeetTarget(code)=>code,
-                                        client::share_accounting::ShareValidationError::DuplicateShare(code)=>code,
-                                        client::share_accounting::ShareValidationError::BadExtranonceSize(code)=>code,
-                                        client::share_accounting::ShareValidationError::VersionRollingNotAllowed(code)=>code,
-                                    _ => unreachable!(),
-                                    };
-                                    debug!("❌ SubmitSharesError not forwarding it to upstream: ch={}, seq={}, error={code}", channel_id, upstream_message.sequence_number);
+                                    let entry =
+                                        SharesOrderedByDiff::new(upstream_message.into_static(), hash);
+                                    self.cached_shares.with_mut_or_default(template_id, |heap| {
+                                        add_share_to_cache(heap, entry);
+                                    });
+                                } else {
+                                    warn!(
+                                        "SubmitSharesExtended: could not cache share, no template_id found for key (downstream_id={}, channel_id={}, downstream_job_id={})",
+                                        downstream_id, channel_id, downstream_job_id
+                                    );
                                 }
                             }
                         }
-                        None =>{
-                            debug!("Upstream job_id not yet known (still waiting for the SetCustomMiningJob.Success message), caching share");
 
-                            if let Some(template_id) = template_id {
-                                let hash = downstream_share_hash
-                                    .expect("downstream_share_hash must be set when downstream share is valid");
-                                let entry = SharesOrderedByDiff::new(upstream_message.into_static(), hash);
-                                let heap = channel_manager_data
-                                    .cached_shares
-                                    .entry(template_id)
-                                    .or_default();
-                                add_share_to_cache(heap, entry);
-                            } else {
-                                warn!(
-                                  "SubmitSharesExtended: could not cache share, no template_id found for key (downstream_id={}, channel_id={}, downstream_job_id={})",
-                                  downstream_id, channel_id, downstream_job_id
-                              );
-                            }
-
-                        }
-                    }
-                }
+                        Ok(())
+                    })
+                    .map_err(JDCError::shutdown)??;
 
                 Ok(messages)
-            })
+            });
+            match validation {
+                Some(validation) => {
+                    if self
+                        .vardiff
+                        .with_mut(&vardiff_key, |vardiff| {
+                            vardiff.increment_shares_since_last_update();
+                        })
+                        .is_none()
+                    {
+                        return Ok(vec![(
+                            downstream_id,
+                            Mining::CloseChannel(create_close_channel_msg(
+                                channel_id,
+                                "invalid-channel-id",
+                            )),
+                        )
+                            .into()]);
+                    }
+                    validation
+                }
+                None => Ok(vec![(
+                    downstream_id,
+                    build_error(ERROR_CODE_SUBMIT_SHARES_INVALID_CHANNEL_ID),
+                )
+                    .into()]),
+            }
         })?;
 
         for message in messages {

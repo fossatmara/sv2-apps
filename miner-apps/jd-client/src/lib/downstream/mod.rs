@@ -1,31 +1,32 @@
 use std::{
-    collections::HashMap,
-    sync::{atomic::AtomicU32, Arc},
+    sync::{
+        atomic::{AtomicBool, AtomicU32},
+        Arc,
+    },
     time::Duration,
 };
 
+#[cfg(feature = "monitoring")]
+use std::net::IpAddr;
+
 use async_channel::{unbounded, Receiver, Sender};
 use stratum_apps::{
+    bitcoin_core_sv2::common::template_distribution_protocol::CancellationToken,
     channel_utils::ReceiverCleanup,
-    custom_mutex::Mutex,
     fallback_coordinator::FallbackCoordinator,
     network_helpers::noise_stream::NoiseTcpStream,
     stratum_core::{
         channels_sv2::server::{
-            extended::ExtendedChannel,
-            group::GroupChannel,
-            jobs::{extended::ExtendedJob, job_store::DefaultJobStore, standard::StandardJob},
-            standard::StandardChannel,
+            extended::ExtendedChannel, group::GroupChannel, standard::StandardChannel,
         },
         common_messages_sv2::MESSAGE_TYPE_SETUP_CONNECTION,
         handlers_sv2::{HandleCommonMessagesFromClientAsync, HandleExtensionsFromClientAsync},
         parsers_sv2::{parse_message_frame_with_tlvs, AnyMessage, Mining, Tlv},
     },
+    sync::{SharedLock, SharedMap},
     task_manager::TaskManager,
     utils::types::{DownstreamId, Message, Sv2Frame},
 };
-
-use bitcoin_core_sv2::template_distribution_protocol::CancellationToken;
 use tracing::{debug, error, warn};
 
 use crate::{
@@ -37,29 +38,6 @@ use stratum_apps::utils::types::ChannelId;
 
 mod common_message_handler;
 mod extensions_message_handler;
-
-/// Holds state related to a downstream connection's mining channels.
-///
-/// This includes:
-/// - Whether the downstream requires a standard job (`require_std_job`).
-/// - An optional [`GroupChannel`] if group channeling is used.
-/// - Active [`ExtendedChannel`]s keyed by channel ID.
-/// - Active [`StandardChannel`]s keyed by channel ID.
-pub struct DownstreamData {
-    pub require_std_job: bool,
-    pub group_channel: GroupChannel<'static, DefaultJobStore<ExtendedJob<'static>>>,
-    pub extended_channels:
-        HashMap<ChannelId, ExtendedChannel<'static, DefaultJobStore<ExtendedJob<'static>>>>,
-    pub standard_channels:
-        HashMap<ChannelId, StandardChannel<'static, DefaultJobStore<StandardJob<'static>>>>,
-    pub channel_id_factory: AtomicU32,
-    /// Extensions that have been successfully negotiated with this client
-    pub negotiated_extensions: Vec<u16>,
-    /// Extensions that the JDC supports
-    pub supported_extensions: Vec<u16>,
-    /// Extensions that the JDC requires
-    pub required_extensions: Vec<u16>,
-}
 
 /// Communication layer for a downstream connection.
 ///
@@ -88,7 +66,20 @@ impl DownstreamIo {
 /// Represents a downstream client connected to this node.
 #[derive(Clone)]
 pub struct Downstream {
-    pub downstream_data: Arc<Mutex<DownstreamData>>,
+    #[cfg(feature = "monitoring")]
+    pub connection_ip: IpAddr,
+    /// Whether the downstream requires standard jobs.
+    pub require_std_job: Arc<AtomicBool>,
+    pub group_channel: SharedLock<GroupChannel<'static>>,
+    pub extended_channels: SharedMap<ChannelId, ExtendedChannel<'static>>,
+    pub standard_channels: SharedMap<ChannelId, StandardChannel<'static>>,
+    pub channel_id_factory: Arc<AtomicU32>,
+    /// Extensions that have been successfully negotiated with this client.
+    pub negotiated_extensions: SharedLock<Vec<u16>>,
+    /// Extensions that the JDC supports.
+    pub supported_extensions: Vec<u16>,
+    /// Extensions that the JDC requires.
+    pub required_extensions: Vec<u16>,
     downstream_io: DownstreamIo,
     pub downstream_id: DownstreamId,
     /// Per-connection cancellation token (child of the global token).
@@ -168,7 +159,7 @@ impl Downstream {
     pub fn new(
         downstream_id: DownstreamId,
         channel_id_factory: AtomicU32,
-        group_channel: GroupChannel<'static, DefaultJobStore<ExtendedJob<'static>>>,
+        group_channel: GroupChannel<'static>,
         channel_manager_sender: Sender<(DownstreamId, Mining<'static>, Option<Vec<Tlv>>)>,
         channel_manager_receiver: Receiver<(Mining<'static>, Option<Vec<Tlv>>)>,
         noise_stream: NoiseTcpStream<Message>,
@@ -177,6 +168,7 @@ impl Downstream {
         task_manager: Arc<TaskManager>,
         supported_extensions: Vec<u16>,
         required_extensions: Vec<u16>,
+        #[cfg(feature = "monitoring")] connection_ip: IpAddr,
     ) -> Self {
         let (noise_stream_reader, noise_stream_writer) = noise_stream.into_split();
         let (inbound_tx, inbound_rx) = unbounded::<Sv2Frame>();
@@ -202,20 +194,18 @@ impl Downstream {
             downstream_receiver: inbound_rx,
         };
 
-        let downstream_data = Arc::new(Mutex::new(DownstreamData {
-            require_std_job: false,
-            extended_channels: HashMap::new(),
-            standard_channels: HashMap::new(),
-            group_channel,
-            channel_id_factory,
-            negotiated_extensions: vec![],
-            supported_extensions,
-            required_extensions,
-        }));
-
         Downstream {
             downstream_io,
-            downstream_data,
+            #[cfg(feature = "monitoring")]
+            connection_ip,
+            require_std_job: Arc::new(AtomicBool::new(false)),
+            group_channel: SharedLock::new(group_channel),
+            extended_channels: SharedMap::new(),
+            standard_channels: SharedMap::new(),
+            channel_id_factory: Arc::new(channel_id_factory),
+            negotiated_extensions: SharedLock::new(Vec::new()),
+            supported_extensions,
+            required_extensions,
             downstream_id,
             downstream_cancellation_token,
         }
@@ -378,8 +368,9 @@ impl Downstream {
             .expect("frame header must be present");
         let payload = sv2_frame.payload();
         let negotiated_extensions = self
-            .downstream_data
-            .super_safe_lock(|data| data.negotiated_extensions.clone());
+            .negotiated_extensions
+            .get()
+            .map_err(JDCError::shutdown)?;
         let (any_message, tlv_fields) =
             parse_message_frame_with_tlvs(header, payload, &negotiated_extensions)
                 .map_err(|error| JDCError::disconnect(error, self.downstream_id))?;

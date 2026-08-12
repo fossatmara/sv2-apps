@@ -50,7 +50,100 @@ pub struct PoolConfig {
     jds: Option<JDSPartialConfig>,
     #[serde(default)]
     monitoring_cache_refresh_secs: Option<u64>,
+    // Accept every SubmitShares message without validating it. FOR TESTING ONLY:
+    // lets simulated miners submit dummy shares to exercise vardiff without hashing.
+    #[serde(default)]
+    ignore_share_validation: bool,
+    // How often the vardiff loop re-evaluates every channel's difficulty.
+    #[serde(default = "default_vardiff_interval_secs")]
+    vardiff_interval_secs: u64,
+    // Which vardiff control algorithm to run, and its tuning.
+    #[serde(default)]
+    vardiff: VardiffConfig,
 }
+
+fn default_vardiff_interval_secs() -> u64 {
+    // The backstop only rescues silent channels (difficulty adjusts
+    // share-driven otherwise), and its statistical gates make premature
+    // ticks a no-op — the frequency is purely a notice-latency knob.
+    10
+}
+
+/// Vardiff algorithm selection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VardiffAlgorithm {
+    /// Threshold/deadband controller (the historical behavior).
+    #[default]
+    Classic,
+    /// Log-space PID controller.
+    Pid,
+    /// PID with Q-learning gain scheduling (shared table per pool).
+    #[serde(rename = "qpid")]
+    QPid,
+    /// Decline-safe adaptive EWMA algorithm (stratum-mining/stratum#2188).
+    Champion,
+}
+
+/// Vardiff algorithm configuration (`[vardiff]` section).
+///
+/// The gain fields only apply to the `pid` algorithm; see
+/// `channels_sv2::vardiff::pid` for what each one does.
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(default)]
+pub struct VardiffConfig {
+    pub algorithm: VardiffAlgorithm,
+    pub kp: f64,
+    pub ki: f64,
+    pub kd: f64,
+    /// Largest multiplicative difficulty change per update.
+    pub max_step: f64,
+    /// Integral pressure required to emit when no single window is
+    /// individually significant.
+    pub deadband: f64,
+    /// Single-window significance threshold in sigmas (statistical deadband).
+    pub significance_z: f64,
+    /// Significance threshold for downward corrections (capped at
+    /// `significance_z`); lower by design — see the pid module docs.
+    pub significance_z_down: f64,
+    /// Back-calculation anti-windup tracking time constant in seconds.
+    pub tracking_secs: f64,
+    /// Q-learning rate (qpid only).
+    pub alpha: f64,
+    /// Q-learning discount factor (qpid only).
+    pub gamma: f64,
+    /// Q-learning exploration rate (qpid only).
+    pub epsilon: f64,
+    /// Path to persist the qpid Q-learning table (qpid only). When set, the
+    /// pool loads a prior policy on startup and saves it on shutdown so
+    /// learning accrues across restarts instead of cold-starting every boot.
+    /// A missing, stale, or incompatible file is ignored (fresh table). No
+    /// effect for non-qpid algorithms.
+    #[serde(default, deserialize_with = "opt_path_from_toml")]
+    pub qtable_path: Option<PathBuf>,
+}
+
+impl Default for VardiffConfig {
+    fn default() -> Self {
+        use stratum_apps::stratum_core::channels_sv2::vardiff::{pid, qpid};
+        Self {
+            algorithm: VardiffAlgorithm::default(),
+            kp: pid::DEFAULT_KP,
+            ki: pid::DEFAULT_KI,
+            kd: pid::DEFAULT_KD,
+            max_step: pid::DEFAULT_MAX_STEP,
+            deadband: pid::DEFAULT_DEADBAND,
+            significance_z: pid::DEFAULT_SIGNIFICANCE_Z,
+            significance_z_down: pid::DEFAULT_SIGNIFICANCE_Z_DOWN,
+            tracking_secs: pid::DEFAULT_TRACKING_SECS,
+            alpha: qpid::DEFAULT_ALPHA,
+            gamma: qpid::DEFAULT_GAMMA,
+            epsilon: qpid::DEFAULT_EPSILON,
+            qtable_path: None,
+        }
+    }
+}
+
 
 impl PoolConfig {
     /// Creates a new instance of the [`PoolConfig`].
@@ -90,6 +183,9 @@ impl PoolConfig {
             monitoring_address,
             monitoring_cache_refresh_secs,
             jds,
+            ignore_share_validation: false,
+            vardiff_interval_secs: default_vardiff_interval_secs(),
+            vardiff: VardiffConfig::default(),
         }
     }
 
@@ -141,6 +237,36 @@ impl PoolConfig {
     /// Returns the shares per minute.
     pub fn shares_per_minute(&self) -> f32 {
         self.shares_per_minute
+    }
+
+    /// Returns whether share validation is ignored (testing only).
+    pub fn ignore_share_validation(&self) -> bool {
+        self.ignore_share_validation
+    }
+
+    /// Sets whether share validation is ignored (testing only).
+    pub fn set_ignore_share_validation(&mut self, ignore: bool) {
+        self.ignore_share_validation = ignore;
+    }
+
+    /// Returns the vardiff re-evaluation interval in seconds.
+    pub fn vardiff_interval_secs(&self) -> u64 {
+        self.vardiff_interval_secs
+    }
+
+    /// Sets the vardiff re-evaluation interval in seconds.
+    pub fn set_vardiff_interval_secs(&mut self, secs: u64) {
+        self.vardiff_interval_secs = secs;
+    }
+
+    /// Returns the vardiff algorithm configuration.
+    pub fn vardiff(&self) -> VardiffConfig {
+        self.vardiff.clone()
+    }
+
+    /// Sets the vardiff algorithm configuration.
+    pub fn set_vardiff(&mut self, vardiff: VardiffConfig) {
+        self.vardiff = vardiff;
     }
 
     /// Returns the supported extensions.

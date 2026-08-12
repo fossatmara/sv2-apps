@@ -21,9 +21,9 @@ impl HandleExtensionsFromServerAsync for ChannelManager {
         &self,
         _server_id: Option<usize>,
     ) -> Result<Vec<u16>, Self::Error> {
-        Ok(self
-            .channel_manager_data
-            .super_safe_lock(|data| data.negotiated_extensions.clone()))
+        self.negotiated_extensions
+            .with(|data| data.clone())
+            .map_err(JDCError::shutdown)
     }
 
     async fn handle_request_extensions_success(
@@ -38,8 +38,7 @@ impl HandleExtensionsFromServerAsync for ChannelManager {
 
         // Check if all of the proxy's required extensions are supported by the server
         let missing_required: Vec<u16> = self
-            .channel_manager_data
-            .super_safe_lock(|data| data.required_extensions.clone())
+            .required_extensions
             .iter()
             .filter(|ext| !supported.contains(ext))
             .copied()
@@ -56,9 +55,11 @@ impl HandleExtensionsFromServerAsync for ChannelManager {
         }
 
         // Store the negotiated extensions in the shared channel manager data
-        self.channel_manager_data.super_safe_lock(|data| {
-            data.negotiated_extensions = supported.clone();
-        });
+        self.negotiated_extensions
+            .with(|data| {
+                *data = supported.clone();
+            })
+            .map_err(JDCError::fallback)?;
 
         info!("Successfully negotiated extensions: {:?}", supported);
 
@@ -81,8 +82,7 @@ impl HandleExtensionsFromServerAsync for ChannelManager {
 
         // Check if any of our required extensions were not supported by the server
         let missing_required: Vec<u16> = self
-            .channel_manager_data
-            .super_safe_lock(|data| data.required_extensions.clone())
+            .required_extensions
             .iter()
             .filter(|ext| unsupported.contains(&**ext))
             .copied()
@@ -102,21 +102,17 @@ impl HandleExtensionsFromServerAsync for ChannelManager {
         // included
         if !required_by_server.is_empty() {
             // Check which of the server's required extensions we support
-            let (can_support, cannot_support) = self.channel_manager_data.super_safe_lock(|data| {
-                let can_support: Vec<u16> = required_by_server
-                    .iter()
-                    .filter(|ext| data.supported_extensions.contains(ext))
-                    .copied()
-                    .collect();
+            let can_support: Vec<u16> = required_by_server
+                .iter()
+                .filter(|ext| self.supported_extensions.contains(ext))
+                .copied()
+                .collect();
 
-                let cannot_support: Vec<u16> = required_by_server
-                    .iter()
-                    .filter(|ext| !data.supported_extensions.contains(ext))
-                    .copied()
-                    .collect();
-
-                (can_support, cannot_support)
-            });
+            let cannot_support: Vec<u16> = required_by_server
+                .iter()
+                .filter(|ext| !self.supported_extensions.contains(ext))
+                .copied()
+                .collect();
 
             if !cannot_support.is_empty() {
                 // Server requires extensions we don't support - must fail over

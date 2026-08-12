@@ -16,7 +16,7 @@
 //!   — validates a Mining Protocol `SetCustomMiningJob` message (for use when embedded in Pool).
 //!
 //! When used as a library (embedded in Pool), the caller is responsible for owning the
-//! [`CancellationToken`](bitcoin_core_sv2::job_declaration_protocol::CancellationToken) and
+//! [`CancellationToken`](stratum_apps::bitcoin_core_sv2::common::job_declaration_protocol::CancellationToken) and
 //! [`TaskManager`](stratum_apps::task_manager::TaskManager).
 //!
 //! [Job Declaration Protocol (JDP)]: https://github.com/stratum-mining/sv2-spec/blob/main/07-Job-Declaration-Protocol.md

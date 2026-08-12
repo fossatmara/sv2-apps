@@ -1,0 +1,67 @@
+# Thundering herd — a large fleet reconnecting all at once after an outage.
+#
+# Failure mode: a pool-side network blip or facility power-bump drops the whole
+# fleet, then every unit reconnects within a few seconds of each other at
+# t=180 (they all retry on the same backoff). Every channel cold-starts
+# simultaneously from the pool's initial difficulty estimate.
+#
+# Watch: cold-start overshoot across a synchronized fleet — the exact metric
+# the champion PR reports (p99 cold-start overshoot). All channels converge
+# from scratch at once with no stale history; a controller that overshoots on
+# a noisy cold estimate does it fleet-wide here. The wide hashrate spread
+# (10x between smallest and largest) means one initial difficulty fits none.
+name = "thundering-herd"
+duration_secs = 720
+
+# All five drop at ~t=120 and pile back on at ~t=180 (staggered by 2s, like a
+# real retry storm). Sizes span 10x so the shared cold-start target is wrong
+# for everyone in different directions.
+[[miners]]
+name = "herd-xs"
+hashrate = 30e12
+[[miners.events]]
+at = 120
+action = "disconnect"
+[[miners.events]]
+at = 180
+action = "reconnect"
+
+[[miners]]
+name = "herd-s"
+hashrate = 80e12
+[[miners.events]]
+at = 122
+action = "disconnect"
+[[miners.events]]
+at = 181
+action = "reconnect"
+
+[[miners]]
+name = "herd-m"
+hashrate = 150e12
+[[miners.events]]
+at = 121
+action = "disconnect"
+[[miners.events]]
+at = 182
+action = "reconnect"
+
+[[miners]]
+name = "herd-l"
+hashrate = 250e12
+[[miners.events]]
+at = 123
+action = "disconnect"
+[[miners.events]]
+at = 180
+action = "reconnect"
+
+[[miners]]
+name = "herd-xl"
+hashrate = 320e12
+[[miners.events]]
+at = 120
+action = "disconnect"
+[[miners.events]]
+at = 183
+action = "reconnect"

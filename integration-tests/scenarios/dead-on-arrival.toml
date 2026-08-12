@@ -1,0 +1,43 @@
+# Dead-on-arrival / near-silent channels — cold-start loosening from the floor.
+#
+# Failure mode: miners that connect and open a channel but produce ~no shares
+# from the very start (misconfigured, wrong pool difficulty, firmware bug that
+# hangs the hasher). Unlike cascading-failure (healthy units that degrade), these
+# NEVER had signal — the controller must loosen from the pool's cold-start
+# estimate purely on the idle backstop, with almost nothing to measure.
+#
+# reported_hashrate lies high so the pool opens the channel at a hard difficulty;
+# the tiny real hashrate then means the backstop is the only thing that can
+# rescue the channel. A dead-of-arrival unit joins late to test cold loosening
+# mid-run, and one recovers to confirm the channel isn't permanently stranded.
+name = "dead-on-arrival"
+duration_secs = 900
+
+# Opens at a hard difficulty (reports 500 TH/s) but hashes almost nothing.
+[[miners]]
+name = "doa-1"
+hashrate = 2e12
+reported_hashrate = 500e12
+
+# Same, joins mid-run: cold loosening must work at any start time.
+[[miners]]
+name = "doa-late"
+hashrate = 3e12
+reported_hashrate = 400e12
+start_at = 300
+
+# Starts dead, then the hasher "unsticks" and comes alive to full rate: the
+# controller must have loosened it down, then re-tighten when signal appears.
+[[miners]]
+name = "doa-recovers"
+hashrate = 1e12
+reported_hashrate = 300e12
+[[miners.events]]
+at = 450
+action = "set_hashrate"
+hashrate = 300e12
+
+# Healthy control opened at an honest difficulty.
+[[miners]]
+name = "healthy"
+hashrate = 100e12

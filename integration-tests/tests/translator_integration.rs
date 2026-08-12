@@ -96,7 +96,8 @@ async fn translate_sv1_to_sv2_successfully() {
     shutdown_all!(translator, pool);
 }
 
-/// Checks that tProxy mines when payout verification passes for address and donation identities.
+/// Checks that tProxy mines when payout verification passes for legacy address and donation
+/// identities.
 #[tokio::test]
 async fn translator_mines_when_payout_matches_address_or_donation_identity() {
     start_tracing();
@@ -111,12 +112,18 @@ async fn translator_mines_when_payout_matches_address_or_donation_identity() {
             .unwrap()
             .script_pubkey();
 
-    let mut solo_coinbase_tx_suffix = hex::decode("feffffff").unwrap();
-    solo_coinbase_tx_suffix.extend(serialize(&vec![TxOut {
-        value: Amount::from_sat(5_000_000_000),
-        script_pubkey: miner_script_pubkey.clone(),
-    }]));
-    solo_coinbase_tx_suffix.extend([0, 0, 0, 0]);
+    let mut legacy_solo_coinbase_tx_suffix = hex::decode("feffffff").unwrap();
+    legacy_solo_coinbase_tx_suffix.extend(serialize(&vec![
+        TxOut {
+            value: Amount::from_sat(4_955_000_000),
+            script_pubkey: miner_script_pubkey.clone(),
+        },
+        TxOut {
+            value: Amount::from_sat(45_000_000),
+            script_pubkey: pool_script_pubkey.clone(),
+        },
+    ]));
+    legacy_solo_coinbase_tx_suffix.extend([0, 0, 0, 0]);
 
     let mut partial_donation_coinbase_tx_suffix = hex::decode("feffffff").unwrap();
     partial_donation_coinbase_tx_suffix.extend(serialize(&vec![
@@ -135,7 +142,7 @@ async fn translator_mines_when_payout_matches_address_or_donation_identity() {
         (
             "payout-address",
             PAYOUT_VERIFICATION_MINER_ADDRESS.to_string(),
-            solo_coinbase_tx_suffix,
+            legacy_solo_coinbase_tx_suffix,
         ),
         (
             "payout-donation",
@@ -1390,7 +1397,7 @@ async fn non_aggregated_translator_handles_set_group_channel_message() {
     // send a SetGroupChannel message to set GROUP_CHANNEL_ID_B
     let set_group_channel =
         AnyMessage::Mining(parsers_sv2::Mining::SetGroupChannel(SetGroupChannel {
-            channel_ids: group_channel_b_ids.clone().into(),
+            channel_ids: group_channel_b_ids.clone().try_into().unwrap(),
             group_channel_id: GROUP_CHANNEL_ID_B,
         }));
     send_to_tproxy.send(set_group_channel).await.unwrap();
@@ -1630,7 +1637,7 @@ async fn non_aggregated_translator_correctly_deals_with_close_channel_message() 
     const CLOSED_CHANNEL_ID: u32 = 0;
     let close_channel = AnyMessage::Mining(parsers_sv2::Mining::CloseChannel(CloseChannel {
         channel_id: CLOSED_CHANNEL_ID,
-        reason_code: "".to_string().try_into().unwrap(),
+        reason_code: "".try_into().unwrap(),
     }));
     send_to_tproxy.send(close_channel).await.unwrap();
     sniffer
@@ -1690,7 +1697,7 @@ async fn non_aggregated_translator_correctly_deals_with_close_channel_message() 
     // now let's send a CloseChannel for the group channel
     let close_channel = AnyMessage::Mining(parsers_sv2::Mining::CloseChannel(CloseChannel {
         channel_id: GROUP_CHANNEL_ID,
-        reason_code: "".to_string().try_into().unwrap(),
+        reason_code: "".try_into().unwrap(),
     }));
     send_to_tproxy.send(close_channel).await.unwrap();
     sniffer
@@ -1864,7 +1871,7 @@ async fn aggregated_translator_triggers_fallback_on_close_channel_message() {
     // now, lets send a CloseChannel message for the channel
     let close_channel = AnyMessage::Mining(parsers_sv2::Mining::CloseChannel(CloseChannel {
         channel_id: 0,
-        reason_code: "".to_string().try_into().unwrap(),
+        reason_code: "".try_into().unwrap(),
     }));
     send_to_tproxy_a.send(close_channel).await.unwrap();
 
@@ -2565,7 +2572,7 @@ async fn tproxy_per_upstream_user_identity_switches_on_fallback() {
         .send(AnyMessage::Common(
             parsers_sv2::CommonMessages::SetupConnectionError(SetupConnectionError {
                 flags: 0,
-                error_code: "test-identity-fallback".to_string().try_into().unwrap(),
+                error_code: "test-identity-fallback".try_into().unwrap(),
             }),
         ))
         .await

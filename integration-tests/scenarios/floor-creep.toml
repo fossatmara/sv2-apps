@@ -1,0 +1,52 @@
+# Min-hashrate floor — behavior at the difficulty clamp boundary.
+#
+# Failure mode: a miner whose true hashrate creeps down far enough that vardiff
+# wants to set a difficulty below the pool's min_allowed_hashrate floor, which
+# clamps it. Nothing else drives a channel into the clamp. Questions this
+# isolates: does the controller sit cleanly pinned at the floor, or oscillate
+# against it (repeatedly trying to go lower, getting clamped, firing again)?
+# And when the miner recovers off the floor, does it climb back promptly or stay
+# stuck pinned?
+#
+# The floor is the pool default (min_allowed_hashrate ~= 1 H/s in-algorithm, but
+# the practical clamp shows as difficulty bottoming out). Drive one miner to a
+# tiny fraction of its start and hold, then recover it.
+name = "floor-creep"
+duration_secs = 900
+
+# Monotonic collapse to ~1% over several steps, hold at the bottom, then recover.
+[[miners]]
+name = "sinker"
+hashrate = 400e12
+[[miners.events]]
+at = 120
+action = "set_hashrate"
+hashrate = 120e12
+[[miners.events]]
+at = 240
+action = "set_hashrate"
+hashrate = 30e12
+[[miners.events]]
+at = 360
+action = "set_hashrate"
+hashrate = 6e12
+[[miners.events]]
+at = 480
+action = "set_hashrate"
+hashrate = 1e12
+# Hold at the bottom through t=480..660 (does it oscillate against the clamp?),
+# then recover in one jump.
+[[miners.events]]
+at = 660
+action = "set_hashrate"
+hashrate = 200e12
+
+# A genuinely tiny miner that lives near the floor the whole run.
+[[miners]]
+name = "always-tiny"
+hashrate = 0.5e12
+
+# Healthy control well above the floor.
+[[miners]]
+name = "healthy"
+hashrate = 150e12

@@ -12,6 +12,7 @@ use std::{
     time::Duration,
 };
 use stratum_apps::{
+    bitcoin_core_sv2::common::BitcoinCoreVersion,
     config_helpers::CoinbaseRewardScript,
     key_utils::{Secp256k1PublicKey, Secp256k1SecretKey},
     tp_type::TemplateProviderType,
@@ -33,6 +34,7 @@ pub mod sv1_sniffer;
 pub mod template_provider;
 pub mod types;
 pub mod utils;
+pub mod vardiff_sim;
 
 /// Concurrently shuts down multiple services.
 ///
@@ -61,7 +63,7 @@ pub fn sv2_tp_config(address: SocketAddr) -> TemplateProviderType {
     }
 }
 
-/// Helper to create BitcoinCoreIpc config with default thresholds.
+/// Helper to create BitcoinCoreIpc config with default thresholds and latest IPC version.
 pub fn ipc_config(
     data_dir: std::path::PathBuf,
     is_signet: bool,
@@ -74,8 +76,10 @@ pub fn ipc_config(
     } else {
         BitcoinNetwork::Regtest
     };
+    let version = BITCOIN_CORE_LATEST;
 
     TemplateProviderType::BitcoinCoreIpc {
+        version,
         network,
         data_dir: Some(data_dir),
         fee_threshold: 0,
@@ -189,9 +193,16 @@ pub fn start_template_provider(
     (template_provider, address)
 }
 
-pub fn start_bitcoin_core(difficulty_level: DifficultyLevel) -> BitcoinCore {
+pub fn start_bitcoin_core_latest(difficulty_level: DifficultyLevel) -> BitcoinCore {
+    start_bitcoin_core(difficulty_level, BITCOIN_CORE_LATEST)
+}
+
+pub fn start_bitcoin_core(
+    difficulty_level: DifficultyLevel,
+    node_version: BitcoinCoreVersion,
+) -> BitcoinCore {
     let address = get_available_address();
-    let bitcoin_core = BitcoinCore::start(address.port(), difficulty_level.clone());
+    let bitcoin_core = BitcoinCore::start(address.port(), difficulty_level.clone(), node_version);
     if difficulty_level == DifficultyLevel::Low {
         // template_provider.generate_blocks(1);
         // generate 16 blocks as a workaround for https://github.com/bitcoin/bitcoin/issues/35126

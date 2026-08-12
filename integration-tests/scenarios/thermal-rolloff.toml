@@ -1,0 +1,51 @@
+# Correlated thermal throttling — a fleet in a hot facility.
+#
+# Failure mode: ambient temperature rises through the run, so every unit
+# slowly throttles together (correlated sine drift, same phase and period),
+# with staggered severity. Unlike noisy-fleet (zero-mean noise), this is a
+# sustained, gradual, CORRELATED decline-then-recovery over ~10 minutes — the
+# regime EWMA-style estimators are tuned for and threshold ladders lag on.
+#
+# Watch: does difficulty gently follow the thermal envelope down and back up,
+# or does it either lag badly (stranding hashrate) or chase the sine's slope
+# and churn? The shared phase means errors are correlated across the fleet,
+# not averaged away.
+name = "thermal-rolloff"
+duration_secs = 900
+
+[[miners]]
+name = "hot-rack-1"
+hashrate = 180e12
+[miners.drift]
+mode = "sine"
+amplitude = 0.35
+period_secs = 600
+step_secs = 5
+
+[[miners]]
+name = "hot-rack-2"
+hashrate = 180e12
+[miners.drift]
+mode = "sine"
+amplitude = 0.45
+period_secs = 600
+step_secs = 5
+
+[[miners]]
+name = "hot-rack-3"
+hashrate = 90e12
+[miners.drift]
+mode = "sine"
+amplitude = 0.30
+period_secs = 600
+step_secs = 5
+
+# Better-cooled unit: mild throttle, same thermal cycle.
+[[miners]]
+name = "cool-rack"
+hashrate = 250e12
+[miners.drift]
+mode = "sine"
+amplitude = 0.12
+period_secs = 600
+step_secs = 5

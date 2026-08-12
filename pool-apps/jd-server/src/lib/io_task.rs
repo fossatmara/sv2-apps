@@ -7,8 +7,8 @@
 use std::sync::Arc;
 
 use async_channel::{Receiver, Sender};
-use bitcoin_core_sv2::job_declaration_protocol::CancellationToken;
 use stratum_apps::{
+    bitcoin_core_sv2::common::job_declaration_protocol::CancellationToken,
     network_helpers::noise_stream::{NoiseTcpReadHalf, NoiseTcpWriteHalf},
     stratum_core::framing_sv2::framing::Frame,
     task_manager::TaskManager,

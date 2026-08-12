@@ -1,6 +1,6 @@
 use stratum_apps::{
     stratum_core::{
-        binary_sv2::{Seq064K, Sv2DataType, B016M},
+        binary_sv2::{Seq064K, B016M},
         bitcoin::{
             self, absolute::LockTime, transaction::Version, OutPoint, ScriptBuf, Sequence,
             Transaction, TxIn, TxOut, Witness,
@@ -32,9 +32,9 @@ impl HandleJobDeclarationMessagesFromServerAsync for ChannelManager {
         &self,
         _server_id: Option<usize>,
     ) -> Result<Vec<u16>, Self::Error> {
-        Ok(self
-            .channel_manager_data
-            .super_safe_lock(|data| data.negotiated_extensions.clone()))
+        self.negotiated_extensions
+            .with(|data| data.clone())
+            .map_err(JDCError::shutdown)
     }
 
     // Handles a successful `AllocateMiningJobToken` response from the JDS.
@@ -54,17 +54,23 @@ impl HandleJobDeclarationMessagesFromServerAsync for ChannelManager {
     ) -> Result<(), Self::Error> {
         info!("Received: {}", msg);
 
-        let coinbase_changed = self.channel_manager_data.super_safe_lock(|data| {
-            let changed = data.coinbase_outputs != msg.coinbase_outputs.to_vec();
-            data.coinbase_outputs = msg.coinbase_outputs.to_vec();
-            data.allocate_tokens.push_back(msg.clone().into_static());
-            changed
-        });
+        let new_coinbase_outputs = msg.coinbase_outputs.to_owned_bytes();
+        let coinbase_changed = self
+            .coinbase_outputs
+            .with(|coinbase_outputs| {
+                let changed = *coinbase_outputs != new_coinbase_outputs;
+                *coinbase_outputs = new_coinbase_outputs.clone();
+                changed
+            })
+            .map_err(JDCError::shutdown)?;
+        self.allocate_tokens
+            .with(|tokens| tokens.push_back(msg.clone().into_static()))
+            .map_err(JDCError::shutdown)?;
 
         if coinbase_changed {
             info!("Coinbase outputs from JDS changed, recalculating constraints");
             let deserialized_jds_coinbase_outputs: Vec<TxOut> =
-                bitcoin::consensus::deserialize(&msg.coinbase_outputs.to_vec())
+                bitcoin::consensus::deserialize(msg.coinbase_outputs.as_bytes())
                     .map_err(JDCError::shutdown)?;
 
             let max_additional_size: usize = deserialized_jds_coinbase_outputs
@@ -169,10 +175,7 @@ impl HandleJobDeclarationMessagesFromServerAsync for ChannelManager {
     ) -> Result<(), Self::Error> {
         info!("Received: {}", msg);
 
-        let Some(last_declare_job) = self
-            .channel_manager_data
-            .super_safe_lock(|data| data.last_declare_job_store.get(&msg.request_id).cloned())
-        else {
+        let Some(last_declare_job) = self.last_declare_job_store.get_cloned(&msg.request_id) else {
             error!(
                 "No last_declare_job found for request_id={}",
                 msg.request_id
@@ -196,14 +199,25 @@ impl HandleJobDeclarationMessagesFromServerAsync for ChannelManager {
             }
         };
 
+        let upstream_channel_info = self
+            .upstream_channel
+            .with(|upstream_channel| {
+                upstream_channel
+                    .as_ref()
+                    .map(|channel| (channel.get_channel_id(), channel.get_full_extranonce_size()))
+            })
+            .map_err(JDCError::shutdown)?;
+
+        let Some((upstream_channel_id, full_extranonce_size)) = upstream_channel_info else {
+            return Err(JDCError::log(JDCErrorKind::FailedToCreateCustomJob));
+        };
+
         let Some(custom_job) = self
-            .channel_manager_data
-            .super_safe_lock(|channel_manager_data| {
-                let job_factory = channel_manager_data.job_factory.as_mut()?;
-                let upstream_channel = channel_manager_data.upstream_channel.as_ref()?;
-                let full_extranonce_size = upstream_channel.get_full_extranonce_size();
+            .job_factory
+            .with(|job_factory| {
+                let job_factory = job_factory.as_mut()?;
                 let custom_job = job_factory.new_custom_job(
-                    upstream_channel.get_channel_id(),
+                    upstream_channel_id,
                     msg.request_id,
                     msg.new_mining_job_token,
                     prevhash.into(),
@@ -213,6 +227,7 @@ impl HandleJobDeclarationMessagesFromServerAsync for ChannelManager {
                 );
                 Some(custom_job)
             })
+            .map_err(JDCError::shutdown)?
         else {
             return Err(JDCError::log(JDCErrorKind::FailedToCreateCustomJob));
         };
@@ -220,11 +235,16 @@ impl HandleJobDeclarationMessagesFromServerAsync for ChannelManager {
         let custom_job =
             custom_job.map_err(|_e| JDCError::log(JDCErrorKind::FailedToCreateCustomJob))?;
 
-        self.channel_manager_data.super_safe_lock(|data| {
-            if let Some(value) = data.last_declare_job_store.get_mut(&msg.request_id) {
+        let updated = self
+            .last_declare_job_store
+            .with_mut(&msg.request_id, |value| {
                 value.set_custom_mining_job = Some(custom_job.clone().into_static());
-            }
-        });
+            });
+        if updated.is_none() {
+            return Err(JDCError::log(JDCErrorKind::LastDeclareJobNotFound(
+                msg.request_id,
+            )));
+        }
 
         let channel_id = custom_job.channel_id;
 
@@ -261,9 +281,7 @@ impl HandleJobDeclarationMessagesFromServerAsync for ChannelManager {
 
         info!("Received: {}", msg);
 
-        let tx_store_entry = self
-            .channel_manager_data
-            .super_safe_lock(|data| data.last_declare_job_store.get(&request_id).cloned());
+        let tx_store_entry = self.last_declare_job_store.get_cloned(&request_id);
 
         let Some(entry) = tx_store_entry else {
             warn!(
@@ -275,11 +293,12 @@ impl HandleJobDeclarationMessagesFromServerAsync for ChannelManager {
             )));
         };
 
-        let full_tx_list: Vec<B016M> = entry
+        let full_tx_list: Vec<B016M<'static>> = entry
             .tx_list
             .iter()
-            .map(|raw| B016M::from_vec_unchecked(raw.clone()))
-            .collect();
+            .cloned()
+            .map(|raw| raw.try_into().map_err(JDCError::shutdown))
+            .collect::<Result<_, _>>()?;
 
         let unknown_positions: Vec<u16> = msg.unknown_tx_position_list.into_inner();
         debug!(
@@ -288,7 +307,7 @@ impl HandleJobDeclarationMessagesFromServerAsync for ChannelManager {
             "Resolving missing transactions"
         );
 
-        let missing_txns: Vec<B016M> = unknown_positions
+        let missing_txns: Vec<B016M<'static>> = unknown_positions
             .iter()
             .filter_map(|&pos| full_tx_list.get(pos as usize).cloned())
             .collect();

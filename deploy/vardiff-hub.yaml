@@ -1,0 +1,119 @@
+# vardiff-sim session hub — dev EKS (cluster: dev, us-east-2), marapool ns.
+#
+# One replica by design: browser sessions are child processes inside the pod,
+# so there is no meaningful horizontal scaling without sticky sessions.
+#
+# Deploy:
+#   aws ecr create-repository --repository-name vardiff-hub   # once
+#   docker build -f docker/Dockerfile.vardiff-hub -t <ecr>/vardiff-hub:latest .
+#   docker push <ecr>/vardiff-hub:latest
+#   kubectl apply -f deploy/vardiff-hub.yaml
+#
+# Note: marapool is ArgoCD-managed; fold this file into the ArgoCD source
+# repo for persistent deployments rather than applying by hand.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vardiff-hub
+  namespace: marapool
+  labels:
+    app: marapool
+    component: vardiff-hub
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate   # sessions live in-pod; no rolling overlap
+  selector:
+    matchLabels:
+      app: marapool
+      marapool-svc: vardiff-hub
+  template:
+    metadata:
+      labels:
+        app: marapool
+        marapool-svc: vardiff-hub
+    spec:
+      # The hub SIGTERMs its session children, waits ~8s for their graceful
+      # pool/bitcoind teardown, then SIGKILLs stragglers. Give the pod enough
+      # grace to cover that (plus margin) so it isn't force-killed mid-cleanup
+      # and left stuck Terminating.
+      terminationGracePeriodSeconds: 45
+      containers:
+        - name: vardiff-hub
+          image: 047385673162.dkr.ecr.us-east-2.amazonaws.com/vardiff-hub:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            # Open dashboard (no HTTP_TOKEN): anyone with the URL gets their
+            # own sandboxed session. Sim settings forwarded to children:
+            - name: EXTRA_ARGS
+              value: "--algorithm qpid --session-ttl-secs 600"
+          resources:
+            # Each browser session spawns bitcoind + sv2-tp + a pool
+            # (~300-500 MiB, ~0.5 CPU); size for a handful of concurrent
+            # sessions.
+            requests:
+              cpu: "1"
+              memory: 2Gi
+            limits:
+              cpu: "4"
+              memory: 8Gi
+          volumeMounts:
+            - name: session-data
+              mountPath: /tmp   # session bitcoind datadirs
+          readinessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 15
+      volumes:
+        - name: session-data
+          emptyDir:
+            sizeLimit: 20Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vardiff-hub
+  namespace: marapool
+  labels:
+    app: marapool
+    component: vardiff-hub
+spec:
+  selector:
+    app: marapool
+    marapool-svc: vardiff-hub
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vardiff-hub-lb
+  namespace: marapool
+  labels:
+    app: marapool
+    component: vardiff-hub
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: external
+    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+    service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+spec:
+  type: LoadBalancer
+  selector:
+    app: marapool
+    marapool-svc: vardiff-hub
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080

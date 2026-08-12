@@ -1,0 +1,61 @@
+# Frequently disconnecting miners: exercises vardiff state teardown,
+# cold starts, and the idle backstop rescuing silent channels.
+name = "flaky"
+duration_secs = 900
+
+[[miners]]
+name = "flapper-fast"
+hashrate = 100e12
+
+[[miners.events]]
+at = 60
+action = "disconnect"
+[[miners.events]]
+at = 90
+action = "reconnect"
+[[miners.events]]
+at = 150
+action = "disconnect"
+[[miners.events]]
+at = 180
+action = "reconnect"
+[[miners.events]]
+at = 240
+action = "disconnect"
+[[miners.events]]
+at = 270
+action = "reconnect"
+[[miners.events]]
+at = 330
+action = "disconnect"
+[[miners.events]]
+at = 360
+action = "reconnect"
+[[miners.events]]
+at = 420
+action = "disconnect"
+[[miners.events]]
+at = 450
+action = "reconnect"
+
+[[miners]]
+name = "flapper-slow"
+hashrate = 300e12
+
+[[miners.events]]
+at = 120
+action = "disconnect"
+[[miners.events]]
+at = 300
+action = "reconnect"
+[[miners.events]]
+at = 500
+action = "disconnect"
+[[miners.events]]
+at = 700
+action = "reconnect"
+
+# Control that never disconnects.
+[[miners]]
+name = "steady"
+hashrate = 100e12

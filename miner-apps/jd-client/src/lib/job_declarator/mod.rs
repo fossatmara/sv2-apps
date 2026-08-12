@@ -1,8 +1,8 @@
 use std::{net::SocketAddr, sync::Arc};
 
 use async_channel::{unbounded, Receiver, Sender};
-use bitcoin_core_sv2::template_distribution_protocol::CancellationToken;
 use stratum_apps::{
+    bitcoin_core_sv2::common::template_distribution_protocol::CancellationToken,
     channel_utils::ReceiverCleanup,
     fallback_coordinator::FallbackCoordinator,
     network_helpers::{connect_with_noise, resolve_host, TCP_CONNECT_TIMEOUT},

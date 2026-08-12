@@ -552,11 +552,11 @@ impl Upstream {
         address: &SocketAddr,
         is_work_selection_enabled: bool,
     ) -> Result<SetupConnection<'static>, TproxyErrorKind> {
-        let endpoint_host = address.ip().to_string().into_bytes().try_into()?;
-        let vendor = "SRI".to_string().try_into()?;
-        let hardware_version = "Translator Proxy".to_string().try_into()?;
-        let firmware = String::new().try_into()?;
-        let device_id = String::new().try_into()?;
+        let endpoint_host = address.ip().to_string().try_into()?;
+        let vendor = "SRI".try_into()?;
+        let hardware_version = "Translator Proxy".try_into()?;
+        let firmware = "".try_into()?;
+        let device_id = "".try_into()?;
         let flags = if is_work_selection_enabled {
             0b110
         } else {

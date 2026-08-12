@@ -25,7 +25,6 @@ jobs:
         run: |
           cargo build --manifest-path=stratum-apps/Cargo.toml --all-features --locked
           cargo build --manifest-path=pool-apps/Cargo.toml --locked
-          cargo build --manifest-path=pool-apps/jd-server/Cargo.toml --locked
           cargo build --manifest-path=miner-apps/Cargo.toml --locked
           cargo build --manifest-path=integration-tests/Cargo.toml --locked
 

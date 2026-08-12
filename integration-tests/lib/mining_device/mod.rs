@@ -179,10 +179,10 @@ impl SetupConnectionHandler {
         address: SocketAddr,
         device_id: Option<String>,
     ) -> SetupConnection<'static> {
-        let endpoint_host = address.ip().to_string().into_bytes().try_into().unwrap();
-        let vendor = String::new().try_into().unwrap();
-        let hardware_version = String::new().try_into().unwrap();
-        let firmware = String::new().try_into().unwrap();
+        let endpoint_host = address.ip().to_string().try_into().unwrap();
+        let vendor = "".try_into().unwrap();
+        let hardware_version = "".try_into().unwrap();
+        let firmware = "".try_into().unwrap();
         let device_id = device_id.unwrap_or_default();
         info!(
             "Creating SetupConnection message with device id: {:?}",
@@ -319,7 +319,7 @@ fn open_channel(
     info!("MINING DEVICE: send open channel with request id {}", id);
 
     OpenStandardMiningChannel {
-        request_id: id.into(),
+        request_id: id,
         user_identity,
         nominal_hash_rate,
         max_target: vec![0xFF_u8; 32].try_into().unwrap(),
@@ -492,7 +492,7 @@ impl Device {
             m.group_channel_id, m.channel_id, req_id
         );
         self.miner
-            .safe_lock(|miner| miner.new_target(m.target.to_vec()))
+            .safe_lock(|miner| miner.new_target(m.target.to_owned_bytes()))
             .unwrap();
         self.notify_changes_to_mining_thread.should_send = true;
     }
@@ -579,7 +579,7 @@ impl Device {
         info!("Received SetTarget for channel id: {}", m.channel_id);
         debug!("SetTarget: {}", m);
         self.miner
-            .safe_lock(|miner| miner.new_target(m.maximum_target.to_vec()))
+            .safe_lock(|miner| miner.new_target(m.maximum_target.to_owned_bytes()))
             .unwrap();
         self.notify_changes_to_mining_thread.should_send = true;
     }
@@ -626,9 +626,9 @@ impl Miner {
     fn new_header(&mut self, set_new_prev_hash: &SetNewPrevHash, new_job: &NewMiningJob) {
         self.job_id = Some(new_job.job_id);
         self.version = Some(new_job.version);
-        let prev_hash: [u8; 32] = set_new_prev_hash.prev_hash.to_vec().try_into().unwrap();
+        let prev_hash = set_new_prev_hash.prev_hash.to_array();
         let prev_hash = Hash::from_byte_array(prev_hash);
-        let merkle_root: [u8; 32] = new_job.merkle_root.to_vec().try_into().unwrap();
+        let merkle_root = new_job.merkle_root.to_array();
         let merkle_root = Hash::from_byte_array(merkle_root);
         // fields need to be added as BE and the are converted to LE in the background before
         // hashing
@@ -874,9 +874,9 @@ fn measure_hashrate(duration_secs: u64, handicap: u32) -> f64 {
 
     // Prepare a random header template to hash
     let mut rng = thread_rng();
-    let prev_hash: [u8; 32] = generate_random_32_byte_array().to_vec().try_into().unwrap();
+    let prev_hash = generate_random_32_byte_array();
     let prev_hash = Hash::from_byte_array(prev_hash);
-    let merkle_root: [u8; 32] = generate_random_32_byte_array().to_vec().try_into().unwrap();
+    let merkle_root = generate_random_32_byte_array();
     let merkle_root = Hash::from_byte_array(merkle_root);
     let header_template = Header {
         version: Version::from_consensus(rng.gen()),

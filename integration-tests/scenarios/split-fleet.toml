@@ -1,0 +1,72 @@
+# Split fleet under a coordinated attack — divergent bidirectional stress.
+#
+# Failure mode: one cohort ramps UP hard (a hashrate-inflation attempt, or a
+# proxy fanning many rigs onto one account) while another cohort simultaneously
+# withholds/slows (block-withholding-style, or curtailed), all against a shared
+# pool setpoint. The two cohorts pull the controller in opposite directions at
+# the same time.
+#
+# Watch: directional independence and the tightening/loosening asymmetry under
+# simultaneous opposite pressure. The up-cohort needs fast tightening (the
+# dangerous direction — where an under-difficultied fast miner floods the pool);
+# the down-cohort needs loosening. A controller with asymmetric decline-safety
+# will handle the down-cohort promptly but leave the up-cohort stranded high —
+# and this scenario isolates that because both happen at once on a stable fleet.
+name = "split-fleet"
+duration_secs = 900
+
+# --- Up-cohort: ramps to 8x over three steps, then holds (sustained, not a
+# transient spike — so a reluctant-to-tighten controller can't wait it out). ---
+[[miners]]
+name = "riser-1"
+hashrate = 60e12
+[[miners.events]]
+at = 150
+action = "set_hashrate"
+hashrate = 180e12
+[[miners.events]]
+at = 300
+action = "set_hashrate"
+hashrate = 480e12
+
+[[miners]]
+name = "riser-2"
+hashrate = 40e12
+[[miners.events]]
+at = 150
+action = "set_hashrate"
+hashrate = 160e12
+[[miners.events]]
+at = 300
+action = "set_hashrate"
+hashrate = 320e12
+
+# --- Down-cohort: collapses at the same moments the risers climb. ---
+[[miners]]
+name = "faller-1"
+hashrate = 400e12
+[[miners.events]]
+at = 150
+action = "set_hashrate"
+hashrate = 120e12
+[[miners.events]]
+at = 300
+action = "set_hashrate"
+hashrate = 20e12
+
+[[miners]]
+name = "faller-2"
+hashrate = 300e12
+[[miners.events]]
+at = 150
+action = "set_hashrate"
+hashrate = 60e12
+[[miners.events]]
+at = 300
+action = "set_hashrate"
+hashrate = 15e12
+
+# Neutral control amid the tug-of-war.
+[[miners]]
+name = "neutral"
+hashrate = 100e12

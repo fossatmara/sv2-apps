@@ -15,7 +15,6 @@ use crate::{
     },
 };
 use async_channel::{unbounded, Receiver, Sender};
-use bitcoin_core_sv2::job_declaration_protocol::CancellationToken;
 use dashmap::DashMap;
 use std::{
     net::SocketAddr,
@@ -25,6 +24,7 @@ use std::{
     },
 };
 use stratum_apps::{
+    bitcoin_core_sv2::common::job_declaration_protocol::CancellationToken,
     config_helpers::CoinbaseRewardScript,
     key_utils::{Secp256k1PublicKey, Secp256k1SecretKey},
     network_helpers::accept_noise_connection,
@@ -413,7 +413,7 @@ impl JobDeclarator {
         let request_id = set_custom_mining_job.request_id;
         let channel_id = set_custom_mining_job.channel_id;
 
-        let active_token: JdToken = match set_custom_mining_job.token.inner_as_ref().try_into() {
+        let active_token: JdToken = match set_custom_mining_job.token.try_as_array::<8>() {
             Ok(token_bytes) => {
                 let token = u64::from_le_bytes(token_bytes);
                 debug!(

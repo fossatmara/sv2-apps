@@ -1,0 +1,43 @@
+# Fleet-wide misreporting — cold-start estimate error at scale, both directions.
+#
+# Failure mode: a fleet where many units open their channels with a wrong
+# reported_hashrate — some sandbagging low (report far less than they have, so
+# the pool must TIGHTEN hard from a soft start) and some over-reporting high
+# (the pool opens them too hard and must LOOSEN). Unlike convergence (a single
+# liar), this stresses the cold-start estimator across a whole fleet lying in
+# both directions at once.
+#
+# Watch: convergence time and overshoot per channel from a badly-wrong initial
+# difficulty. The low-reporters are the tightening-direction stress (where the
+# champion is deliberately slow); the high-reporters are the loosening side.
+name = "fleet-sandbag"
+duration_secs = 900
+
+# --- Sandbaggers: report far below true hashrate -> pool opens soft, must tighten. ---
+[[miners]]
+name = "sandbag-10x"
+hashrate = 200e12
+reported_hashrate = 20e12
+[[miners]]
+name = "sandbag-50x"
+hashrate = 250e12
+reported_hashrate = 5e12
+[[miners]]
+name = "sandbag-100x"
+hashrate = 300e12
+reported_hashrate = 3e12
+
+# --- Over-reporters: report above true hashrate -> pool opens hard, must loosen. ---
+[[miners]]
+name = "overreport-10x"
+hashrate = 30e12
+reported_hashrate = 300e12
+[[miners]]
+name = "overreport-25x"
+hashrate = 20e12
+reported_hashrate = 500e12
+
+# Honest control: reports exactly what it has.
+[[miners]]
+name = "honest"
+hashrate = 100e12

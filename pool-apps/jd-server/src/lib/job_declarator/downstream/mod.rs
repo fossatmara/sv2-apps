@@ -14,13 +14,13 @@ use crate::{
     io_task::spawn_io_tasks,
 };
 use async_channel::{unbounded, Receiver, Sender};
-use bitcoin_core_sv2::job_declaration_protocol::CancellationToken;
 use dashmap::DashMap;
 use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
 use stratum_apps::{
+    bitcoin_core_sv2::common::job_declaration_protocol::CancellationToken,
     custom_mutex::Mutex,
     network_helpers::noise_stream::NoiseTcpStream,
     stratum_core::{

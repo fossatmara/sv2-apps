@@ -115,8 +115,8 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
                 }
             }
 
-            let upstream_prefix_bytes = m.extranonce_prefix.clone().into_static().to_vec();
-            let target = Target::from_le_bytes(m.target.clone().inner_as_ref().try_into().unwrap());
+            let upstream_prefix_bytes = m.extranonce_prefix.to_owned_bytes();
+            let target = Target::from_le_bytes(m.target.to_array());
             let version_rolling = true; // we assume this is always true on extended channels
 
             if self.mode.is_aggregated() {
@@ -549,7 +549,7 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
         info!("Received: {}", m);
         if let Some(expected_payout_distribution) = self.expected_payout_distribution() {
             expected_payout_distribution
-                .validate_coinbase_tx_suffix(m.coinbase_tx_suffix.inner_as_ref())
+                .validate_coinbase_tx_suffix(m.coinbase_tx_suffix.as_bytes())
                 .map_err(|e| {
                     error!("NewExtendedMiningJob failed payout verification: {e}");
                     TproxyError::fallback(TproxyErrorKind::PayoutVerificationFailed(e.to_string()))
@@ -939,12 +939,7 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
                 if aggregated_channel_id == m.channel_id || group_channel_id == m.channel_id {
                     // Update target for all extended channels (including AGGREGATED_CHANNEL_ID)
                     self.extended_channels.iter_mut().for_each(|mut channel| {
-                        channel.set_target(Target::from_le_bytes(
-                            m.maximum_target
-                                .inner_as_ref()
-                                .try_into()
-                                .expect("target deserialization should never fail"),
-                        ));
+                        channel.set_target(Target::from_le_bytes(m.maximum_target.to_array()));
                     });
 
                     let mut message = m_static.clone();
@@ -969,12 +964,7 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
                         .get_mut(channel_id)
                         .ok_or(TproxyError::fallback(TproxyErrorKind::ChannelNotFound))?;
 
-                    channel.set_target(Target::from_le_bytes(
-                        m.maximum_target
-                            .inner_as_ref()
-                            .try_into()
-                            .expect("target deserialization should never fail"),
-                    ));
+                    channel.set_target(Target::from_le_bytes(m.maximum_target.to_array()));
 
                     let mut message = m_static.clone();
                     message.channel_id = *channel_id;
@@ -993,12 +983,7 @@ impl HandleMiningMessagesFromServerAsync for ChannelManager {
                     return Err(TproxyError::log(TproxyErrorKind::ChannelNotFound));
                 };
 
-                channel.set_target(Target::from_le_bytes(
-                    m.maximum_target
-                        .inner_as_ref()
-                        .try_into()
-                        .expect("target deserialization should never fail"),
-                ));
+                channel.set_target(Target::from_le_bytes(m.maximum_target.to_array()));
 
                 set_target_messages.push(m_static.clone());
             }

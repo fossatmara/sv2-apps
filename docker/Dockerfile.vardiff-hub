@@ -1,0 +1,61 @@
+###
+# vardiff-sim session hub
+#
+# Serves the multi-session vardiff dashboard: every browser session gets its
+# own fully isolated child sim (pool + in-process mock template provider +
+# miners) inside the container, managed and proxied by the hub process.
+#
+# The sim runs the pool with ignore_share_validation, so it needs no chain: an
+# in-process mock template provider replays a captured template. bitcoind and
+# sv2-tp are therefore NOT bundled (no ~400 MB download, faster child startup).
+#
+# Build from the repo root:
+#   docker build -f docker/Dockerfile.vardiff-hub \
+#     -t 047385673162.dkr.ecr.us-east-2.amazonaws.com/vardiff-hub:latest .
+###
+
+###
+# ---- Builder Stage ----
+###
+FROM rust:1.88-slim-bookworm AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    capnproto libcapnp-dev curl cmake clang pkg-config ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY stratum-apps/ stratum-apps/
+COPY pool-apps/ pool-apps/
+COPY miner-apps/ miner-apps/
+COPY bitcoin-core-sv2/ bitcoin-core-sv2/
+COPY integration-tests/ integration-tests/
+
+RUN cargo build --release \
+    --manifest-path integration-tests/Cargo.toml \
+    --bin vardiff-sim \
+    --target-dir ./build
+
+###
+# ---- Runtime Stage ----
+# No bitcoind/sv2-tp: the vardiff sim uses an in-process mock template provider.
+###
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates && \
+    rm -rf /var/lib/apt/lists/* && \
+    useradd -m -u 1000 sim
+
+WORKDIR /app
+
+COPY --from=builder /app/build/release/vardiff-sim /usr/local/bin/vardiff-sim
+
+USER sim
+
+# HTTP_TOKEN  — optional dashboard token (omit for an open dashboard)
+# EXTRA_ARGS  — forwarded sim flags, e.g. "--algorithm qpid --speed 8"
+ENV HUB_ADDR=0.0.0.0:8080
+EXPOSE 8080
+
+ENTRYPOINT ["/bin/sh", "-c", "exec vardiff-sim --hub \"$HUB_ADDR\" ${HTTP_TOKEN:+--http-token \"$HTTP_TOKEN\"} $EXTRA_ARGS"]

@@ -1,0 +1,815 @@
+//! Fleet engine: spawns simulated miners, applies drift models and scenario
+//! events, and aggregates live per-miner statistics for the CLI/TUI.
+
+use std::{
+    collections::{HashMap, VecDeque},
+    io::Write,
+    net::SocketAddr,
+};
+
+use async_channel::{Receiver, Sender};
+use rand::Rng;
+use stratum_apps::key_utils::Secp256k1PublicKey;
+use tracing::info;
+
+use super::{
+    clock_speed, expected_shares_per_minute, miner::run_miner,
+    scenario::{Drift, DriftMode, DueAction, EventAction, Scenario, ScenarioDriver, ScenarioMiner},
+    set_clock_speed, set_setpoint_spm, target_le_to_difficulty, virtual_now_secs, MinerCommand,
+    MinerConfig, MinerEvent,
+};
+
+/// A scheduled scenario event, precomputed on load so a UI can plot markers
+/// showing what changes and when (elapsed virtual seconds since load).
+#[derive(Debug, Clone)]
+pub struct ScenarioEventPoint {
+    pub at: f64,
+    /// Miner the event targets (empty for global events like set_spm).
+    pub miner: String,
+    /// Short human label, e.g. "10x" / "disconnect" / "spm=12".
+    pub label: String,
+}
+
+/// Window over which the realized share rate is measured (virtual seconds).
+const REALIZED_RATE_WINDOW_SECS: f64 = 60.0;
+/// Cadence of rate-error samples (virtual seconds).
+const RATE_SAMPLE_SECS: f64 = 2.0;
+/// Cap on retained rate-error samples per miner. The HTTP snapshot only sends
+/// the visible window; this bounds memory over a long free-running session
+/// (at 2s sampling, 20k samples ≈ 11 hours of virtual time).
+const RATE_ERROR_HISTORY_CAP: usize = 20_000;
+
+pub struct EngineConfig {
+    pub pool_address: SocketAddr,
+    pub authority_pubkey: Option<Secp256k1PublicKey>,
+}
+
+struct MinerSlot {
+    config: MinerConfig,
+    commands: Sender<MinerCommand>,
+    drift: Option<DriftState>,
+}
+
+struct DriftState {
+    spec: Drift,
+    base_hashrate: f64,
+    /// Multiplier accumulated by the random walk.
+    walk: f64,
+    /// Virtual timestamp of the last drift step.
+    last_step: f64,
+}
+
+/// Live statistics for one miner, updated from its event stream.
+#[derive(Debug, Clone, Default)]
+pub struct MinerStats {
+    pub connected: bool,
+    pub hashrate: f64,
+    pub reported_hashrate: f64,
+    pub channel_id: Option<u32>,
+    pub difficulty: f64,
+    pub expected_spm: f64,
+    pub submitted: u64,
+    pub accepted: u64,
+    pub rejected: u64,
+    pub target_updates: u64,
+    pub disconnects: u64,
+    /// Cumulative on-wire SV2 bytes (header + payload) in each direction:
+    /// `bytes_down` = pool->miner, `bytes_up` = miner->pool.
+    pub bytes_down: u64,
+    pub bytes_up: u64,
+    pub last_error: Option<String>,
+    /// Virtual timestamps of recent share submissions.
+    share_times: VecDeque<f64>,
+    /// (elapsed_secs, difficulty) at every target change, for plotting.
+    pub difficulty_history: Vec<(f64, f64)>,
+    /// Every commanded hashrate change (manual or scenario step; drift
+    /// updates are deliberately excluded so they don't flood chart
+    /// annotations).
+    pub hashrate_changes: Vec<HashrateChange>,
+    /// Current controller gains (kp, ki, kd), when the embedded pool runs a
+    /// pid/qpid controller for this miner's channel. Read-only telemetry.
+    pub gains: Option<(f64, f64, f64)>,
+    /// (elapsed_secs, kp, ki, kd) at every gain change, for plotting how the
+    /// Q-learning schedules gains over time.
+    pub gain_changes: Vec<(f64, f64, f64, f64)>,
+    /// (elapsed_secs, ln(observed/setpoint)) sampled every
+    /// [`RATE_SAMPLE_SECS`]: the log share-rate error the controller acts
+    /// on, measured over the trailing rate window.
+    pub rate_error_history: Vec<(f64, f64)>,
+    /// Virtual timestamp of the last rate-error sample.
+    last_rate_sample: f64,
+}
+
+/// A commanded hashrate change, for chart annotations.
+#[derive(Debug, Clone, Copy)]
+pub struct HashrateChange {
+    /// Virtual seconds since engine start.
+    pub at: f64,
+    pub from: f64,
+    pub to: f64,
+}
+
+impl HashrateChange {
+    pub fn is_increase(&self) -> bool {
+        self.to >= self.from
+    }
+}
+
+impl MinerStats {
+    /// Shares per minute over the trailing window (virtual time).
+    pub fn realized_spm(&self) -> f64 {
+        let now = virtual_now_secs();
+        let in_window = self
+            .share_times
+            .iter()
+            .filter(|t| now - **t <= REALIZED_RATE_WINDOW_SECS)
+            .count();
+        in_window as f64 * 60.0 / REALIZED_RATE_WINDOW_SECS
+    }
+}
+
+pub struct SimEngine {
+    config: EngineConfig,
+    miners: HashMap<String, MinerSlot>,
+    pub stats: HashMap<String, MinerStats>,
+    events_tx: Sender<(String, MinerEvent)>,
+    events_rx: Receiver<(String, MinerEvent)>,
+    /// Virtual timestamp when the engine started (re-anchored on scenario load
+    /// so scenario event offsets are measured from the load instant).
+    started_virtual: f64,
+    /// Notified whenever observable state changes (events drained, miners
+    /// mutated, speed changed); lets push-based frontends skip polling.
+    changed: std::sync::Arc<tokio::sync::Notify>,
+    /// Active scenario driver, when a scenario is loaded (None = free-running
+    /// default fleet). The engine advances it each `drain_events`.
+    driver: Option<ScenarioDriver>,
+    /// Name of the loaded scenario, for display (None = no scenario).
+    scenario_name: Option<String>,
+    /// Precomputed event points of the loaded scenario, for plotting markers.
+    scenario_events: Vec<ScenarioEventPoint>,
+    /// Last elapsed time at which we notified frontends, so a tick that only
+    /// advanced the clock (no share events) still pushes a WS frame — the
+    /// chart's right edge and rate-error samples move every tick, so the live
+    /// view must refresh even between share arrivals. Bounded by the caller's
+    /// drain cadence (~100ms wall); double-drains in one iteration are deduped.
+    last_notified_elapsed: f64,
+}
+
+impl SimEngine {
+    pub fn new(config: EngineConfig) -> Self {
+        let (events_tx, events_rx) = async_channel::unbounded();
+        Self {
+            config,
+            miners: HashMap::new(),
+            stats: HashMap::new(),
+            events_tx,
+            events_rx,
+            started_virtual: virtual_now_secs(),
+            changed: std::sync::Arc::new(tokio::sync::Notify::new()),
+            driver: None,
+            scenario_name: None,
+            scenario_events: Vec::new(),
+            last_notified_elapsed: f64::NEG_INFINITY,
+        }
+    }
+
+    /// Handle that is notified on every observable state change.
+    pub fn change_notifier(&self) -> std::sync::Arc<tokio::sync::Notify> {
+        self.changed.clone()
+    }
+
+    /// Name of the loaded scenario, if any.
+    pub fn scenario_name(&self) -> Option<&str> {
+        self.scenario_name.as_deref()
+    }
+
+    /// Precomputed scenario event points (for plotting "what changes when").
+    pub fn scenario_events(&self) -> &[ScenarioEventPoint] {
+        &self.scenario_events
+    }
+
+    /// Whether a scenario is currently driving the fleet.
+    pub fn has_scenario(&self) -> bool {
+        self.driver.is_some()
+    }
+
+    /// Removes every miner and clears the stats table (used before loading a
+    /// scenario or returning to a fresh default fleet).
+    pub fn clear_fleet(&mut self) {
+        for slot in self.miners.values() {
+            let _ = slot.commands.try_send(MinerCommand::Disconnect);
+        }
+        self.miners.clear();
+        self.stats.clear();
+        self.changed.notify_waiters();
+    }
+
+    /// Loads a scenario, replacing the current fleet: clears all miners,
+    /// re-anchors virtual time to zero so event offsets are measured from now,
+    /// resets any live setpoint override the previous scenario may have set,
+    /// and precomputes the event points for plotting. Miners spawn as the
+    /// driver's start times come due in `drain_events`.
+    pub fn load_scenario(&mut self, scenario: Scenario) {
+        self.clear_fleet();
+        self.scenario_name = Some(scenario.name.clone());
+        self.scenario_events = Self::event_points(&scenario);
+        self.driver = Some(ScenarioDriver::new(scenario));
+        // Re-anchor: elapsed_secs() now reads ~0 at the load instant.
+        self.started_virtual = virtual_now_secs();
+        self.changed.notify_waiters();
+    }
+
+    /// Returns to a free-running fleet (no scenario), clearing everything.
+    pub fn clear_scenario(&mut self) {
+        self.clear_fleet();
+        self.driver = None;
+        self.scenario_name = None;
+        self.scenario_events.clear();
+        self.started_virtual = virtual_now_secs();
+        self.changed.notify_waiters();
+    }
+
+    /// True once the loaded scenario's duration has elapsed (always false when
+    /// no scenario, or the scenario has no duration).
+    pub fn scenario_finished(&self) -> bool {
+        self.driver
+            .as_ref()
+            .is_some_and(|d| d.finished(self.elapsed_secs()))
+    }
+
+    /// Precompute plottable event points from a scenario's miners/events.
+    fn event_points(scenario: &Scenario) -> Vec<ScenarioEventPoint> {
+        let mut pts = Vec::new();
+        for m in &scenario.miners {
+            if m.start_at > 0 {
+                pts.push(ScenarioEventPoint {
+                    at: m.start_at as f64,
+                    miner: m.name.clone(),
+                    label: "join".to_string(),
+                });
+            }
+            for ev in &m.events {
+                let label = match &ev.action {
+                    EventAction::SetHashrate { hashrate } => {
+                        // Express relative to the miner's base rate.
+                        let ratio = hashrate / m.hashrate;
+                        if ratio >= 1.0 {
+                            format!("{ratio:.0}x")
+                        } else {
+                            format!("/{:.0}", 1.0 / ratio)
+                        }
+                    }
+                    EventAction::Disconnect => "disconnect".to_string(),
+                    EventAction::Reconnect => "reconnect".to_string(),
+                    EventAction::SetBadShareFraction { fraction } => {
+                        format!("bad={:.0}%", fraction * 100.0)
+                    }
+                    EventAction::SetDuplicateShareFraction { fraction } => {
+                        format!("dup={:.0}%", fraction * 100.0)
+                    }
+                    EventAction::SetSpm { spm } => format!("spm={spm:.0}"),
+                };
+                pts.push(ScenarioEventPoint {
+                    at: ev.at as f64,
+                    miner: m.name.clone(),
+                    label,
+                });
+            }
+        }
+        pts.sort_by(|a, b| a.at.total_cmp(&b.at));
+        pts
+    }
+
+    /// Applies one due scenario action to the fleet.
+    fn apply_due(&mut self, action: DueAction) {
+        match action {
+            DueAction::Start(m) => {
+                let drift = m.drift.clone();
+                self.spawn_miner(scenario_miner_to_config(&m), drift);
+            }
+            DueAction::Apply { miner, action } => match action {
+                EventAction::SetHashrate { hashrate } => self.set_hashrate(&miner, hashrate),
+                EventAction::Disconnect => self.disconnect(&miner),
+                EventAction::Reconnect => self.reconnect(&miner),
+                EventAction::SetBadShareFraction { fraction } => {
+                    self.set_bad_share_fraction(&miner, fraction)
+                }
+                EventAction::SetDuplicateShareFraction { fraction } => {
+                    self.set_duplicate_share_fraction(&miner, fraction)
+                }
+                // Global override, not per-miner.
+                EventAction::SetSpm { spm } => set_setpoint_spm(spm),
+            },
+        }
+    }
+
+    /// Elapsed virtual seconds since the engine started.
+    pub fn elapsed_secs(&self) -> f64 {
+        virtual_now_secs() - self.started_virtual
+    }
+
+    /// Current sim clock speed factor (1.0 = real time).
+    pub fn speed(&self) -> f64 {
+        clock_speed()
+    }
+
+    /// Samples each miner's observed log share-rate error (the controller's
+    /// error signal) into its history at a fixed virtual cadence.
+    fn sample_rate_errors(&mut self, elapsed: f64) {
+        let setpoint = super::setpoint_spm();
+        if setpoint <= 0.0 {
+            return;
+        }
+        let now = virtual_now_secs();
+        for stats in self.stats.values_mut() {
+            if elapsed - stats.last_rate_sample < RATE_SAMPLE_SECS {
+                continue;
+            }
+            stats.last_rate_sample = elapsed;
+            let count = stats
+                .share_times
+                .iter()
+                .filter(|t| now - **t <= REALIZED_RATE_WINDOW_SECS)
+                .count();
+            // The controller's zero-share floor of half a share keeps the
+            // log finite; clamp mirrors its +/-3 error cap.
+            let observed = (count as f64).max(0.5) * 60.0 / REALIZED_RATE_WINDOW_SECS;
+            let err = (observed / setpoint).ln().clamp(-3.0, 3.0);
+            stats.rate_error_history.push((elapsed, err));
+            if stats.rate_error_history.len() > RATE_ERROR_HISTORY_CAP {
+                let excess = stats.rate_error_history.len() - RATE_ERROR_HISTORY_CAP;
+                stats.rate_error_history.drain(..excess);
+            }
+        }
+    }
+
+    /// Polls the embedded pool's gain telemetry and records changes per
+    /// miner. Cheap (one registry read per miner per UI tick).
+    fn poll_gain_telemetry(&mut self, elapsed: f64) {
+        for (name, stats) in self.stats.iter_mut() {
+            let Some(gains) = super::controller_gains(name) else {
+                // Controller no longer publishes (e.g. switched to classic):
+                // stop showing stale gains, but keep the change history.
+                stats.gains = None;
+                continue;
+            };
+            if stats.gains != Some(gains) {
+                stats.gains = Some(gains);
+                let (kp, ki, kd) = gains;
+                stats.gain_changes.push((elapsed, kp, ki, kd));
+            }
+        }
+    }
+
+    /// Current vardiff algorithm name.
+    pub fn algorithm(&self) -> &'static str {
+        super::algorithm()
+    }
+
+    /// Sets the live vardiff algorithm; returns false for unknown names.
+    pub fn set_algorithm(&mut self, name: &str) -> bool {
+        let ok = super::set_algorithm(name);
+        if ok {
+            self.changed.notify_waiters();
+        }
+        ok
+    }
+
+    /// Current manual pid gains (kp, ki, kd).
+    pub fn manual_gains(&self) -> (f64, f64, f64) {
+        super::manual_gains()
+    }
+
+    /// Sets the manual pid gains (plain pid only).
+    pub fn set_manual_gains(&mut self, kp: f64, ki: f64, kd: f64) {
+        super::set_manual_gains(kp, ki, kd);
+        self.changed.notify_waiters();
+    }
+
+    /// Current vardiff setpoint (shares per minute).
+    pub fn setpoint_spm(&self) -> f64 {
+        super::setpoint_spm()
+    }
+
+    /// Sets the vardiff setpoint (embedded pool only).
+    pub fn set_setpoint_spm(&mut self, spm: f64) {
+        super::set_setpoint_spm(spm);
+        self.changed.notify_waiters();
+    }
+
+    /// Current PID confidence shrinkage constant K.
+    pub fn confidence_k(&self) -> f64 {
+        super::confidence_k()
+    }
+
+    /// Sets the PID confidence shrinkage constant K (embedded pool only).
+    pub fn set_confidence_k(&mut self, k: f64) {
+        super::set_confidence_k(k);
+        self.changed.notify_waiters();
+    }
+
+    /// Current PID significance threshold Z.
+    pub fn significance_z(&self) -> f64 {
+        super::significance_z()
+    }
+
+    /// Sets the PID significance threshold Z (embedded pool only).
+    pub fn set_significance_z(&mut self, z: f64) {
+        super::set_significance_z(z);
+        self.changed.notify_waiters();
+    }
+
+    /// Current downward significance threshold.
+    pub fn significance_z_down(&self) -> f64 {
+        super::significance_z_down()
+    }
+
+    /// Sets the downward significance threshold (embedded pool only).
+    pub fn set_significance_z_down(&mut self, z: f64) {
+        super::set_significance_z_down(z);
+        self.changed.notify_waiters();
+    }
+
+    /// Changes the sim clock speed. Miners re-sample their share timers so
+    /// deadlines scheduled at the old speed don't linger.
+    pub fn set_speed(&mut self, speed: f64) {
+        set_clock_speed(speed.clamp(0.25, 64.0));
+        for slot in self.miners.values() {
+            let _ = slot.commands.try_send(MinerCommand::Resample);
+        }
+        self.changed.notify_waiters();
+    }
+
+    /// Share submission times for a miner as elapsed virtual seconds (the
+    /// difficulty-history timebase), newest window only.
+    pub fn share_times_since(&self, name: &str, from_elapsed: f64) -> Vec<f64> {
+        let Some(stats) = self.stats.get(name) else {
+            return Vec::new();
+        };
+        stats
+            .share_times
+            .iter()
+            .map(|t| t - self.started_virtual)
+            .filter(|t| *t >= from_elapsed)
+            .collect()
+    }
+
+    /// Names of all miners ever spawned, sorted for stable display.
+    pub fn miner_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.stats.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    /// Spawns a new simulated miner task.
+    pub fn spawn_miner(&mut self, config: MinerConfig, drift: Option<Drift>) {
+        let (cmd_tx, cmd_rx) = async_channel::unbounded();
+        let stats = self.stats.entry(config.name.clone()).or_default();
+        stats.hashrate = config.hashrate;
+        stats.reported_hashrate = config.nominal_hashrate() as f64;
+        stats.connected = true;
+
+        let drift_state = drift.map(|spec| DriftState {
+            base_hashrate: config.hashrate,
+            walk: 1.0,
+            last_step: virtual_now_secs(),
+            spec,
+        });
+        let slot = MinerSlot {
+            config: config.clone(),
+            commands: cmd_tx,
+            drift: drift_state,
+        };
+        info!(
+            "spawning simulated miner {} at {:.3e} H/s (reported {:.3e})",
+            config.name,
+            config.hashrate,
+            config.nominal_hashrate()
+        );
+        self.miners.insert(config.name.clone(), slot);
+        tokio::spawn(run_miner(
+            config,
+            self.config.pool_address,
+            self.config.authority_pubkey,
+            cmd_rx,
+            self.events_tx.clone(),
+        ));
+        self.changed.notify_waiters();
+    }
+
+    pub fn set_hashrate(&mut self, name: &str, hashrate: f64) {
+        let elapsed = self.elapsed_secs();
+        if let Some(slot) = self.miners.get_mut(name) {
+            let previous = slot.config.hashrate;
+            // No-op sets happen when a UI races its own snapshot (e.g. the
+            // half-rate button clicked twice before the update arrives);
+            // recording them would annotate a phantom "increase" (from ==
+            // to) on the chart.
+            if hashrate == previous {
+                return;
+            }
+            slot.config.hashrate = hashrate;
+            if let Some(drift) = slot.drift.as_mut() {
+                drift.base_hashrate = hashrate;
+                drift.walk = 1.0;
+            }
+            let _ = slot.commands.try_send(MinerCommand::SetHashrate(hashrate));
+            if let Some(stats) = self.stats.get_mut(name) {
+                stats.hashrate_changes.push(HashrateChange {
+                    at: elapsed,
+                    from: previous,
+                    to: hashrate,
+                });
+            }
+            self.changed.notify_waiters();
+        }
+    }
+
+    /// Sets the fraction of invalid/stale shares the miner submits.
+    pub fn set_bad_share_fraction(&mut self, name: &str, fraction: f64) {
+        if let Some(slot) = self.miners.get_mut(name) {
+            slot.config.bad_share_fraction = fraction.clamp(0.0, 1.0);
+            let _ = slot
+                .commands
+                .try_send(MinerCommand::SetBadShareFraction(fraction));
+            self.changed.notify_waiters();
+        }
+    }
+
+    /// Sets the fraction of duplicate/replayed shares the miner submits.
+    pub fn set_duplicate_share_fraction(&mut self, name: &str, fraction: f64) {
+        if let Some(slot) = self.miners.get_mut(name) {
+            slot.config.duplicate_share_fraction = fraction.clamp(0.0, 1.0);
+            let _ = slot
+                .commands
+                .try_send(MinerCommand::SetDuplicateShareFraction(fraction));
+            self.changed.notify_waiters();
+        }
+    }
+
+    /// Multiplies the miner's base hashrate (used by TUI +/- keys).
+    pub fn scale_hashrate(&mut self, name: &str, factor: f64) {
+        let current = self.miners.get(name).map(|s| s.config.hashrate);
+        if let Some(h) = current {
+            self.set_hashrate(name, h * factor);
+        }
+    }
+
+    pub fn disconnect(&mut self, name: &str) {
+        if let Some(slot) = self.miners.get(name) {
+            let _ = slot.commands.try_send(MinerCommand::Disconnect);
+        }
+    }
+
+    /// Disconnects a miner and drops it from the fleet and the stats table.
+    pub fn remove_miner(&mut self, name: &str) {
+        if let Some(slot) = self.miners.remove(name) {
+            let _ = slot.commands.try_send(MinerCommand::Disconnect);
+        }
+        self.stats.remove(name);
+        self.changed.notify_waiters();
+    }
+
+    /// Reconnects a disconnected miner, preserving its config and drift.
+    pub fn reconnect(&mut self, name: &str) {
+        let Some(slot) = self.miners.get(name) else {
+            return;
+        };
+        if self.stats.get(name).map(|s| s.connected).unwrap_or(false) {
+            return;
+        }
+        let config = slot.config.clone();
+        let drift = slot.drift.as_ref().map(|d| d.spec.clone());
+        self.spawn_miner(config, drift);
+    }
+
+    pub fn is_connected(&self, name: &str) -> bool {
+        self.stats.get(name).map(|s| s.connected).unwrap_or(false)
+    }
+
+    /// Drains pending miner events into the stats tables. Call every tick.
+    pub fn drain_events(&mut self) {
+        let elapsed = self.elapsed_secs();
+        // Advance a loaded scenario: apply any actions now due. Done here so
+        // every run mode (TUI, HTTP dashboard, hub child) drives scenarios
+        // through the one path they all call each tick.
+        if self.driver.is_some() {
+            let due = self
+                .driver
+                .as_mut()
+                .map(|d| d.due_actions(elapsed))
+                .unwrap_or_default();
+            for action in due {
+                self.apply_due(action);
+            }
+        }
+        self.poll_gain_telemetry(elapsed);
+        self.sample_rate_errors(elapsed);
+        let mut any = false;
+        while let Ok((name, event)) = self.events_rx.try_recv() {
+            any = true;
+            // Only update known miners: a removed miner's task still emits a
+            // final Disconnected event, and entry().or_default() would
+            // resurrect it as a ghost row.
+            let Some(stats) = self.stats.get_mut(&name) else {
+                continue;
+            };
+            match event {
+                MinerEvent::Connected => {
+                    stats.connected = true;
+                    stats.last_error = None;
+                }
+                MinerEvent::ChannelOpened { channel_id, target_le } => {
+                    stats.channel_id = Some(channel_id);
+                    stats.difficulty = target_le_to_difficulty(&target_le);
+                    stats.expected_spm = expected_shares_per_minute(stats.hashrate, &target_le);
+                    stats.difficulty_history.push((elapsed, stats.difficulty));
+                }
+                MinerEvent::TargetUpdated { target_le } => {
+                    stats.difficulty = target_le_to_difficulty(&target_le);
+                    stats.expected_spm = expected_shares_per_minute(stats.hashrate, &target_le);
+                    stats.target_updates += 1;
+                    stats.difficulty_history.push((elapsed, stats.difficulty));
+                }
+                MinerEvent::NewJob { .. } => {}
+                MinerEvent::ShareSubmitted { .. } => {
+                    stats.submitted += 1;
+                    stats.share_times.push_back(virtual_now_secs());
+                    while stats.share_times.len() > 10_000 {
+                        stats.share_times.pop_front();
+                    }
+                }
+                MinerEvent::SharesAccepted { count } => {
+                    stats.accepted += count as u64;
+                }
+                MinerEvent::ShareRejected { code } => {
+                    stats.rejected += 1;
+                    stats.last_error = Some(code);
+                }
+                MinerEvent::HashrateChanged { hashrate } => {
+                    stats.hashrate = hashrate;
+                }
+                MinerEvent::Bytes { down, up } => {
+                    stats.bytes_down += down;
+                    stats.bytes_up += up;
+                }
+                MinerEvent::Disconnected { reason } => {
+                    stats.connected = false;
+                    stats.channel_id = None;
+                    stats.disconnects += 1;
+                    stats.last_error = Some(reason);
+                }
+            }
+        }
+        // Notify frontends when share events landed, OR when the clock has
+        // advanced since the last notify (so the streaming chart tracks the
+        // moving right edge / rate-error samples between share arrivals rather
+        // than stalling to the WS heartbeat). The elapsed guard keeps this to
+        // one notify per drain tick even though drain_events is called twice
+        // per loop iteration.
+        if any || elapsed > self.last_notified_elapsed {
+            self.last_notified_elapsed = elapsed;
+            self.changed.notify_waiters();
+        }
+    }
+
+    /// Applies drift models; call every tick. Drift timing runs on the
+    /// virtual clock, so accelerated runs drift proportionally faster.
+    pub fn apply_drift(&mut self) {
+        let elapsed = self.elapsed_secs();
+        let now_virtual = virtual_now_secs();
+        let mut updates: Vec<(String, f64)> = Vec::new();
+        for (name, slot) in self.miners.iter_mut() {
+            let Some(drift) = slot.drift.as_mut() else {
+                continue;
+            };
+            if now_virtual - drift.last_step < drift.spec.step_secs {
+                continue;
+            }
+            drift.last_step = now_virtual;
+            let hashrate = match drift.spec.mode {
+                DriftMode::Sine => {
+                    let phase = elapsed * std::f64::consts::TAU / drift.spec.period_secs;
+                    drift.base_hashrate * (1.0 + drift.spec.amplitude * phase.sin())
+                }
+                DriftMode::RandomWalk => {
+                    let step: f64 = rand::thread_rng()
+                        .gen_range(-drift.spec.amplitude..drift.spec.amplitude)
+                        * 0.1;
+                    drift.walk = (drift.walk * (1.0 + step))
+                        .clamp(1.0 - drift.spec.amplitude, 1.0 + drift.spec.amplitude);
+                    drift.base_hashrate * drift.walk
+                }
+            };
+            updates.push((name.clone(), hashrate));
+        }
+        for (name, hashrate) in updates {
+            if let Some(slot) = self.miners.get(&name) {
+                let _ = slot.commands.try_send(MinerCommand::SetHashrate(hashrate));
+            }
+        }
+    }
+
+    /// One-line status summary per miner (headless mode).
+    pub fn summary_lines(&self) -> Vec<String> {
+        self.miner_names()
+            .iter()
+            .map(|name| {
+                let s = &self.stats[name];
+                format!(
+                    "{:<12} {} hashrate={:>10} diff={:>12.4} expected={:>6.2}/min realized={:>6.2}/min submitted={} accepted={} rejected={} target_updates={}",
+                    name,
+                    if s.connected { "up  " } else { "DOWN" },
+                    format_hashrate(s.hashrate),
+                    s.difficulty,
+                    s.expected_spm,
+                    s.realized_spm(),
+                    s.submitted,
+                    s.accepted,
+                    s.rejected,
+                    s.target_updates,
+                ) + &s
+                    .last_error
+                    .as_ref()
+                    .map(|e| format!(" last_error={e}"))
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+}
+
+/// Maps a scenario miner definition to the engine's miner config.
+fn scenario_miner_to_config(m: &ScenarioMiner) -> MinerConfig {
+    MinerConfig {
+        name: m.name.clone(),
+        hashrate: m.hashrate,
+        reported_hashrate: m.reported_hashrate,
+        bad_share_fraction: m.bad_share_fraction,
+        duplicate_share_fraction: m.duplicate_share_fraction,
+        latency_ms: m.latency_ms,
+        latency_jitter_ms: m.latency_jitter_ms,
+    }
+}
+
+/// Appends one row per miner per tick; plot difficulty/rates over time to
+/// compare vardiff algorithms.
+pub struct CsvWriter {
+    file: std::fs::File,
+}
+
+impl CsvWriter {
+    pub fn create(path: &std::path::Path) -> std::io::Result<Self> {
+        let mut file = std::fs::File::create(path)?;
+        writeln!(
+            file,
+            "t_secs,miner,connected,hashrate,difficulty,expected_spm,realized_spm,submitted,accepted,rejected,target_updates,bytes_down,bytes_up"
+        )?;
+        Ok(Self { file })
+    }
+
+    pub fn write_tick(&mut self, engine: &SimEngine) -> std::io::Result<()> {
+        self.write_tick_at(engine, engine.elapsed_secs())
+    }
+
+    /// Writes a row per miner stamped with an explicit `t_secs`. Lets the run
+    /// loop emit one row per whole virtual second even when the (faster, or at
+    /// high --speed slower-than-virtual) wall drain skips integer seconds — a
+    /// catch-up loop calls this for each skipped second with the current stats.
+    pub fn write_tick_at(&mut self, engine: &SimEngine, t: f64) -> std::io::Result<()> {
+        for name in engine.miner_names() {
+            let s = &engine.stats[&name];
+            writeln!(
+                self.file,
+                "{t:.1},{name},{},{},{},{},{},{},{},{},{},{},{}",
+                s.connected as u8,
+                s.hashrate,
+                s.difficulty,
+                s.expected_spm,
+                s.realized_spm(),
+                s.submitted,
+                s.accepted,
+                s.rejected,
+                s.target_updates,
+                s.bytes_down,
+                s.bytes_up,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+pub fn format_hashrate(h: f64) -> String {
+    const UNITS: [(f64, &str); 5] = [
+        (1e15, "PH/s"),
+        (1e12, "TH/s"),
+        (1e9, "GH/s"),
+        (1e6, "MH/s"),
+        (1e3, "kH/s"),
+    ];
+    for (scale, unit) in UNITS {
+        if h >= scale {
+            return format!("{:.2} {unit}", h / scale);
+        }
+    }
+    format!("{h:.0} H/s")
+}

@@ -22,9 +22,7 @@ impl HandleExtensionsFromClientAsync for Downstream {
         &self,
         _client_id: Option<usize>,
     ) -> Result<Vec<u16>, Self::Error> {
-        Ok(self
-            .downstream_data
-            .super_safe_lock(|data| data.negotiated_extensions.clone()))
+        self.negotiated_extensions.get().map_err(JDCError::shutdown)
     }
 
     async fn handle_request_extensions(
@@ -45,10 +43,7 @@ impl HandleExtensionsFromClientAsync for Downstream {
         let mut unsupported: Vec<u16> = Vec::new();
 
         for ext in &requested {
-            if self
-                .downstream_data
-                .super_safe_lock(|data| data.supported_extensions.contains(ext))
-            {
+            if self.supported_extensions.contains(ext) {
                 supported.push(*ext);
             } else {
                 unsupported.push(*ext);
@@ -57,8 +52,7 @@ impl HandleExtensionsFromClientAsync for Downstream {
 
         // Check which required extensions the client didn't request
         let missing_required: Vec<u16> = self
-            .downstream_data
-            .super_safe_lock(|data| data.required_extensions.clone())
+            .required_extensions
             .iter()
             .filter(|ext| !requested.contains(ext))
             .copied()
@@ -116,9 +110,9 @@ impl HandleExtensionsFromClientAsync for Downstream {
             );
 
             // Store the negotiated extensions
-            self.downstream_data.super_safe_lock(|data| {
-                data.negotiated_extensions = supported.clone();
-            });
+            self.negotiated_extensions
+                .set(supported.clone())
+                .map_err(JDCError::shutdown)?;
 
             let success = RequestExtensionsSuccess {
                 request_id: msg.request_id,

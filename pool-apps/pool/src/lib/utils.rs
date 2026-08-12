@@ -22,11 +22,11 @@ pub fn get_setup_connection_message(
     max_version: u16,
     address: &SocketAddr,
 ) -> Result<SetupConnection<'static>, PoolErrorKind> {
-    let endpoint_host = address.ip().to_string().into_bytes().try_into()?;
-    let vendor = String::new().try_into()?;
-    let hardware_version = String::new().try_into()?;
-    let firmware = String::new().try_into()?;
-    let device_id = String::new().try_into()?;
+    let endpoint_host = address.ip().to_string().try_into()?;
+    let vendor = "".try_into()?;
+    let hardware_version = "".try_into()?;
+    let firmware = "".try_into()?;
+    let device_id = "".try_into()?;
     let flags = 0b0000_0000_0000_0000_0000_0000_0000_0110;
     Ok(SetupConnection {
         protocol: Protocol::MiningProtocol,
@@ -47,11 +47,11 @@ pub fn get_setup_connection_message(
 pub fn get_setup_connection_message_tp(
     address: SocketAddr,
 ) -> Result<SetupConnection<'static>, PoolErrorKind> {
-    let endpoint_host = address.ip().to_string().into_bytes().try_into()?;
-    let vendor = String::new().try_into()?;
-    let hardware_version = String::new().try_into()?;
-    let firmware = String::new().try_into()?;
-    let device_id = String::new().try_into()?;
+    let endpoint_host = address.ip().to_string().try_into()?;
+    let vendor = "".try_into()?;
+    let hardware_version = "".try_into()?;
+    let firmware = "".try_into()?;
+    let device_id = "".try_into()?;
     Ok(SetupConnection {
         protocol: Protocol::TemplateDistributionProtocol,
         min_version: 2,
@@ -73,6 +73,6 @@ pub fn get_setup_connection_message_tp(
 pub(crate) fn create_close_channel_msg(channel_id: ChannelId, msg: &str) -> CloseChannel<'_> {
     CloseChannel {
         channel_id,
-        reason_code: Str0255::try_from(msg.to_string()).expect("Could not convert message."),
+        reason_code: Str0255::try_from(msg).expect("Could not convert message."),
     }
 }

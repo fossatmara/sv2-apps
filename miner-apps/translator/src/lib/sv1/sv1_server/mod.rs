@@ -21,6 +21,8 @@ use std::{
     },
     time::{Duration, Instant},
 };
+#[cfg(feature = "monitoring")]
+use stratum_apps::monitoring::MinerTelemetry;
 use stratum_apps::{
     channel_utils::ReceiverCleanup,
     custom_mutex::Mutex,
@@ -41,7 +43,10 @@ use stratum_apps::{
                 build_sv2_open_extended_mining_channel,
                 build_sv2_submit_shares_extended_from_sv1_submit,
             },
-            sv2_to_sv1::{build_sv1_notify_from_sv2, build_sv1_set_difficulty_from_sv2_target},
+            sv2_to_sv1::{
+                build_sv1_notify_from_sv2,
+                build_sv1_set_difficulty_from_sv2_target_with_integer_power_of_two_rounding,
+            },
         },
         sv1_api::{json_rpc, server_to_client, utils::HexU32Be, IsServer},
     },
@@ -51,6 +56,8 @@ use stratum_apps::{
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
+
+const SV1_MIN_DIFFICULTY_FOR_INTEGER_POWER_OF_TWO_ROUNDING: f64 = 1.0;
 
 #[derive(Clone)]
 struct Sv1ServerIo {
@@ -115,6 +122,8 @@ pub struct Sv1Server {
     pub(crate) downstream_id_factory: Arc<AtomicUsize>,
     pub(crate) request_id_factory: Arc<AtomicU32>,
     pub(crate) downstreams: Arc<DashMap<DownstreamId, Downstream>>,
+    #[cfg(feature = "monitoring")]
+    pub(crate) miner_telemetry: Arc<DashMap<DownstreamId, MinerTelemetry>>,
     pub(crate) request_id_to_downstream_id: Arc<DashMap<RequestId, DownstreamId>>,
     pub(crate) channel_id_to_downstream_id: Arc<Mutex<HashMap<ChannelId, DownstreamId>>>,
     pub(crate) vardiff: Arc<DashMap<DownstreamId, Arc<Mutex<VardiffState>>>>,
@@ -248,6 +257,8 @@ impl Sv1Server {
             self.vardiff.clear();
         }
         self.downstreams.clear();
+        #[cfg(feature = "monitoring")]
+        self.miner_telemetry.clear();
         self.channel_id_to_downstream_id
             .super_safe_lock(|map| map.clear());
         self.request_id_to_downstream_id.clear();
@@ -287,6 +298,8 @@ impl Sv1Server {
             downstream_id_factory: Arc::new(AtomicUsize::new(1)),
             request_id_factory: Arc::new(AtomicU32::new(1)),
             downstreams: Arc::new(DashMap::new()),
+            #[cfg(feature = "monitoring")]
+            miner_telemetry: Arc::new(DashMap::new()),
             request_id_to_downstream_id: Arc::new(DashMap::new()),
             channel_id_to_downstream_id: Arc::new(Mutex::new(HashMap::new())),
             vardiff: Arc::new(DashMap::new()),
@@ -413,6 +426,8 @@ impl Sv1Server {
                                     sv1_server_receiver,
                                     first_target,
                                     Some(self.config.downstream_difficulty_config.min_individual_miner_hashrate),
+                                    #[cfg(feature = "monitoring")]
+                                    addr.ip(),
                                     connection_token,
                                 );
                                 // vardiff initialization (only if enabled)
@@ -743,11 +758,10 @@ impl Sv1Server {
                     )));
                 };
                 if let Some(downstream) = self.downstreams.get(&downstream_id) {
-                    let initial_target =
-                        Target::from_le_bytes(m.target.inner_as_ref().try_into().unwrap());
+                    let initial_target = Target::from_le_bytes(m.target.to_array());
                     let extranonce1 = m
                         .extranonce_prefix
-                        .to_vec()
+                        .to_owned_bytes()
                         .try_into()
                         .map_err(TproxyError::fallback)?;
                     downstream
@@ -824,12 +838,12 @@ impl Sv1Server {
                         }
                     }
 
-                    let set_difficulty = build_sv1_set_difficulty_from_sv2_target(first_target)
-                        .map_err(|_| {
-                            TproxyError::shutdown(TproxyErrorKind::General(
-                                "Failed to generate set_difficulty".into(),
-                            ))
-                        })?;
+                    let set_difficulty =
+                        build_sv1_set_difficulty_from_sv2_target_with_integer_power_of_two_rounding(
+                            first_target,
+                            SV1_MIN_DIFFICULTY_FOR_INTEGER_POWER_OF_TWO_ROUNDING,
+                        )
+                        .map_err(TproxyError::shutdown)?;
                     // send the set_difficulty message to the downstream
                     if let Some(sender) = self
                         .sv1_server_io
@@ -966,7 +980,7 @@ impl Sv1Server {
         let user_identity = if user_identity.starts_with("sri/") {
             user_identity.clone()
         } else {
-            format!("{}.miner{}", user_identity, miner_id)
+            format!("{user_identity}.miner{miner_id}")
         };
 
         downstream
@@ -1009,6 +1023,8 @@ impl Sv1Server {
             // Only remove from vardiff map if vardiff is enabled
             self.vardiff.remove(&downstream_id);
         }
+        #[cfg(feature = "monitoring")]
+        self.miner_telemetry.remove(&downstream_id);
         self.sv1_server_io
             .sv1_server_to_downstream_sender
             .super_safe_lock(|map| map.remove(&downstream_id));
@@ -1064,8 +1080,7 @@ impl Sv1Server {
         &self,
         set_target: SetTarget<'_>,
     ) -> TproxyResult<(), error::Sv1Server> {
-        let new_target =
-            Target::from_le_bytes(set_target.maximum_target.inner_as_ref().try_into().unwrap());
+        let new_target = Target::from_le_bytes(set_target.maximum_target.to_array());
         debug!(
             "Forwarding SetTarget to downstreams: channel_id={}, target={}",
             set_target.channel_id, new_target
@@ -1145,16 +1160,20 @@ impl Sv1Server {
             .collect();
 
         for (downstream_id, sender) in tasks {
-            let set_difficulty_msg = match build_sv1_set_difficulty_from_sv2_target(target) {
-                Ok(msg) => msg,
-                Err(e) => {
-                    error!(
-                        "Failed to build SetDifficulty for downstream {}: {:?}",
-                        downstream_id, e
-                    );
-                    return Err(TproxyError::shutdown(e));
-                }
-            };
+            let set_difficulty_msg =
+                match build_sv1_set_difficulty_from_sv2_target_with_integer_power_of_two_rounding(
+                    target,
+                    SV1_MIN_DIFFICULTY_FOR_INTEGER_POWER_OF_TWO_ROUNDING,
+                ) {
+                    Ok(msg) => msg,
+                    Err(e) => {
+                        error!(
+                            "Failed to build SetDifficulty for downstream {}: {:?}",
+                            downstream_id, e
+                        );
+                        return Err(TproxyError::shutdown(e));
+                    }
+                };
             if let Err(e) = sender.send(set_difficulty_msg).await {
                 error!(
                     "Failed to send SetDifficulty to downstream {}: {:?}",
@@ -1218,16 +1237,20 @@ impl Sv1Server {
             }
         });
 
-        let set_difficulty_msg = match build_sv1_set_difficulty_from_sv2_target(target) {
-            Ok(msg) => msg,
-            Err(e) => {
-                error!(
-                    "Failed to build SetDifficulty for downstream {}: {:?}",
-                    downstream_id, e
-                );
-                return Err(TproxyError::shutdown(e));
-            }
-        };
+        let set_difficulty_msg =
+            match build_sv1_set_difficulty_from_sv2_target_with_integer_power_of_two_rounding(
+                target,
+                SV1_MIN_DIFFICULTY_FOR_INTEGER_POWER_OF_TWO_ROUNDING,
+            ) {
+                Ok(msg) => msg,
+                Err(e) => {
+                    error!(
+                        "Failed to build SetDifficulty for downstream {}: {:?}",
+                        downstream_id, e
+                    );
+                    return Err(TproxyError::shutdown(e));
+                }
+            };
 
         let sender = self
             .sv1_server_io
@@ -1391,7 +1414,7 @@ impl Sv1Server {
         let counter = self
             .keepalive_job_id_counter
             .fetch_add(1, Ordering::Relaxed);
-        format!("{}#{}", original_job_id, counter)
+        format!("{original_job_id}#{counter}")
     }
 
     /// Extracts the original upstream job ID from a keepalive job ID.
