@@ -25,3 +25,19 @@ authority_secret = "mkDLTBBRxdBv998612qipDYoTK3YUrqLe8uWw7LfzDJmwMcjdYj"
 
 # Certificate validity for downstream Noise handshakes (seconds)
 # cert_validity_secs = 86400
+
+# Mining-protocol SetupConnection.flags declared to the pool (SV2 §5.3.1):
+#   bit 0 = REQUIRES_STANDARD_JOBS
+#   bit 1 = REQUIRES_WORK_SELECTION
+#   bit 2 = REQUIRES_VERSION_ROLLING
+#
+# The proxy terminates SV2 and re-originates its own handshake, so a downstream
+# miner's flags never reach the pool by themselves — this is what the pool
+# believes its client requires. The default (0b100 = 4, REQUIRES_VERSION_ROLLING)
+# matches what every SRI mining client declares. Setting this to 0 tells the pool
+# "I require nothing", which lets a spec-compliant pool serve jobs with
+# version_rolling_allowed: false and break a version-rolling downstream.
+#
+# If a downstream declares a requirement not set here, the proxy logs a warning
+# naming the missing flag.
+# upstream_setup_flags = 4

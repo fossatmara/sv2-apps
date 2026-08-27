@@ -39,6 +39,23 @@ See [`config.example.toml`](config.example.toml) for all options. Key settings:
 | `downstream_listen` | Address miners connect to |
 | `api_listen` | HTTP API bind address |
 | `min_downstream_difficulty` | Difficulty floor (0 = disabled) |
+| `upstream_setup_flags` | `SetupConnection.flags` declared to the pool (default `4` = `REQUIRES_VERSION_ROLLING`) |
+
+### Handshake flags
+
+The proxy is not transparent: it terminates SV2 and re-originates its own
+`SetupConnection` to the pool, once at startup, before any miner has connected.
+A downstream's flags therefore cannot be forwarded verbatim, and
+`upstream_setup_flags` is what the pool believes its client requires.
+
+This matters because pools may legitimately derive per-job behaviour from those
+flags. A pool that reads `REQUIRES_VERSION_ROLLING` to decide
+`NewExtendedMiningJob.version_rolling_allowed` will serve `false` to a client
+that declared nothing — and a version-rolling downstream then has every share
+rejected. The default is `REQUIRES_VERSION_ROLLING`, matching every SRI mining
+client (tProxy `0b100`, or `0b110` with work selection; jd-client `0b110`). If a
+downstream declares a requirement that isn't in `upstream_setup_flags`, the proxy
+warns and names it.
 
 ## HTTP API
 

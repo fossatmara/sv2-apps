@@ -16,7 +16,7 @@ use stratum_apps::{
 use tokio::{net::TcpStream, sync::mpsc};
 use tracing::{error, info, warn};
 
-use crate::config::Config;
+use crate::config::{describe_setup_flags, Config};
 
 pub type Message = AnyMessage<'static>;
 pub type Reader = NoiseTcpReadHalf<Message>;
@@ -34,7 +34,7 @@ pub enum UpstreamEvent {
 
 pub async fn connect_and_setup(config: &Config) -> Result<(Reader, Writer), String> {
     let (mut reader, mut writer) = connect_upstream(config).await?;
-    setup_connection(&mut reader, &mut writer).await?;
+    setup_connection(&mut reader, &mut writer, config.upstream_setup_flags).await?;
     Ok((reader, writer))
 }
 
@@ -102,12 +102,16 @@ pub async fn connect_upstream(config: &Config) -> Result<(Reader, Writer), Strin
     Ok(noise_stream.into_split())
 }
 
-pub async fn setup_connection(reader: &mut Reader, writer: &mut Writer) -> Result<(), String> {
+pub async fn setup_connection(
+    reader: &mut Reader,
+    writer: &mut Writer,
+    flags: u32,
+) -> Result<(), String> {
     let setup = SetupConnection {
         protocol: Protocol::MiningProtocol,
         min_version: 2,
         max_version: 2,
-        flags: 0,
+        flags,
         endpoint_host: "shape-proxy".to_string().try_into().unwrap(),
         endpoint_port: 0,
         vendor: "shape-proxy".to_string().try_into().unwrap(),
@@ -123,7 +127,10 @@ pub async fn setup_connection(reader: &mut Reader, writer: &mut Writer) -> Resul
         .write_frame(frame.into())
         .await
         .map_err(|e| format!("Write error: {e:?}"))?;
-    info!("Sent SetupConnection to upstream");
+    info!(
+        "Sent SetupConnection to upstream: flags={flags:#b} ({})",
+        describe_setup_flags(flags)
+    );
 
     let response = reader
         .read_frame()

@@ -30,7 +30,7 @@ fn arrival_clock() -> Instant {
 use crate::{
     api::{self, ApiCommand, ChannelStatus, ProfileInfo, ProxyStatus},
     config::Config,
-    downstream::{accept_downstream, DownstreamEvent, DownstreamId},
+    downstream::{accept_downstream, AcceptSettings, DownstreamEvent, DownstreamId},
     metrics::{HeadroomStatus, RollingWindow},
     profile::RateProfile,
     share_gate::ShareGate,
@@ -141,15 +141,15 @@ impl ProxyCore {
                         Ok((stream, peer_addr)) => {
                             let id = self.next_downstream_id;
                             self.next_downstream_id += 1;
-                            let pub_key = self.pub_key;
-                            let secret_key = self.secret_key;
-                            let cert_validity = self.config.cert_validity_secs;
+                            let settings = AcceptSettings {
+                                pub_key: self.pub_key,
+                                secret_key: self.secret_key,
+                                cert_validity: self.config.cert_validity_secs,
+                                declared_upstream_flags: self.config.upstream_setup_flags,
+                            };
                             let tx = ds_event_tx.clone();
                             tokio::spawn(async move {
-                                accept_downstream(
-                                    stream, peer_addr, id,
-                                    pub_key, secret_key, cert_validity, tx,
-                                ).await;
+                                accept_downstream(stream, peer_addr, id, settings, tx).await;
                             });
                         }
                         Err(e) => {

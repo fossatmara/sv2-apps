@@ -12,7 +12,10 @@ use stratum_apps::{
 use tokio::{net::TcpStream, sync::mpsc};
 use tracing::{debug, error, info, warn};
 
-use crate::upstream::{Message, Reader, Writer};
+use crate::{
+    config::describe_setup_flags,
+    upstream::{Message, Reader, Writer},
+};
 
 pub type DownstreamId = u64;
 
@@ -44,22 +47,33 @@ impl std::fmt::Debug for DownstreamEvent {
     }
 }
 
+/// Per-accept settings, all derived from config and identical for every
+/// downstream. Grouped so the accept path takes one parameter instead of four.
+#[derive(Clone, Copy)]
+pub struct AcceptSettings {
+    pub pub_key: Secp256k1PublicKey,
+    pub secret_key: Secp256k1SecretKey,
+    pub cert_validity: u64,
+    /// `SetupConnection.flags` the proxy declared to the pool. Held here only
+    /// so the downstream handshake can warn when a miner requires something the
+    /// pool was never told about.
+    pub declared_upstream_flags: u32,
+}
+
 pub async fn accept_downstream(
     stream: TcpStream,
     peer_addr: SocketAddr,
     id: DownstreamId,
-    pub_key: Secp256k1PublicKey,
-    secret_key: Secp256k1SecretKey,
-    cert_validity: u64,
+    settings: AcceptSettings,
     event_tx: mpsc::UnboundedSender<DownstreamEvent>,
 ) {
     info!(downstream_id = id, %peer_addr, "Accepting downstream connection");
 
     let noise_stream = match accept_noise_connection::<Message>(
         stream,
-        pub_key,
-        secret_key,
-        cert_validity,
+        settings.pub_key,
+        settings.secret_key,
+        settings.cert_validity,
     )
     .await
     {
@@ -72,7 +86,14 @@ pub async fn accept_downstream(
 
     let (mut reader, mut writer) = noise_stream.into_split();
 
-    if let Err(e) = handle_setup_connection(&mut reader, &mut writer, id).await {
+    if let Err(e) = handle_setup_connection(
+        &mut reader,
+        &mut writer,
+        id,
+        settings.declared_upstream_flags,
+    )
+    .await
+    {
         error!(downstream_id = id, "SetupConnection handshake failed: {e}");
         return;
     }
@@ -93,6 +114,7 @@ async fn handle_setup_connection(
     reader: &mut Reader,
     writer: &mut Writer,
     id: DownstreamId,
+    declared_upstream_flags: u32,
 ) -> Result<(), String> {
     let response = reader
         .read_frame()
@@ -117,11 +139,34 @@ async fn handle_setup_connection(
             }
             info!(
                 downstream_id = id,
-                "Downstream SetupConnection: vendor={}, version={}-{}",
+                "Downstream SetupConnection: vendor={}, version={}-{}, flags={:#b} ({})",
                 setup.vendor.as_utf8_or_hex(),
                 setup.min_version,
                 setup.max_version,
+                setup.flags,
+                describe_setup_flags(setup.flags),
             );
+
+            // The proxy re-originates its own SetupConnection upstream, and it
+            // does so once at startup — before any downstream exists — so a
+            // downstream's flags cannot be forwarded verbatim. Whatever the
+            // pool was told is `upstream_setup_flags`. Any requirement bit set
+            // here that we did not declare is a requirement the pool never
+            // heard about, and the pool is then entitled to serve work that
+            // violates it. That silence is what made a correct pool look
+            // non-compliant once already, so it is a warning, not a debug line.
+            let undeclared = setup.flags & !declared_upstream_flags;
+            if undeclared != 0 {
+                warn!(
+                    downstream_id = id,
+                    "Downstream requires {} but the upstream handshake declared {} — \
+                     the pool was never told, and may serve work that violates it. \
+                     Set `upstream_setup_flags = {:#b}` in the config to relay it.",
+                    describe_setup_flags(undeclared),
+                    describe_setup_flags(declared_upstream_flags),
+                    setup.flags | declared_upstream_flags,
+                );
+            }
         }
         _ => {
             return Err(format!(
