@@ -3,9 +3,10 @@
 //! This module provides connection management, encrypted streams, and protocol handling
 //! for Stratum V2 applications. It includes support for:
 //!
-//! - Noise-encrypted connections ([`noise_connection`], [`noise_stream`])
-//! - SV1 protocol connections ([`sv1_connection`]) - when `sv1` feature is enabled
-//! - Hostname resolution ([`resolve_hostname`])
+//! - Noise-encrypted connections ([`crate::network_helpers::noise_connection`],
+//!   [`crate::network_helpers::noise_stream`])
+//! - SV1 protocol connections (`sv1_connection`) - when `sv1` feature is enabled
+//! - Hostname resolution ([`crate::network_helpers::resolve_hostname`])
 //!
 //! Originally from the `network_helpers_sv2` crate.
 
@@ -16,7 +17,7 @@ pub mod resolve_hostname;
 #[cfg(feature = "sv1")]
 pub mod sv1_connection;
 
-pub use resolve_hostname::{resolve_host, resolve_host_port, ResolveError};
+pub use resolve_hostname::{ResolveError, resolve_host, resolve_host_port};
 
 use async_channel::{RecvError, SendError};
 use std::{fmt, time::Duration};
@@ -60,7 +61,7 @@ impl fmt::Display for Error {
                 write!(f, "Invalid handshake message received from remote peer")
             }
 
-            Error::CodecError(e) => write!(f, "{}", e),
+            Error::CodecError(e) => write!(f, "{e}"),
 
             Error::RecvError => write!(f, "Error receiving from async channel"),
 
@@ -111,7 +112,7 @@ pub const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Connects to an upstream server as a Noise initiator, returning the split read/write halves.
 ///
-/// The handshake timeout is opinionated and fixed at [`NOISE_HANDSHAKE_TIMEOUT`]. If you need a
+/// The handshake timeout is opinionated and fixed at `NOISE_HANDSHAKE_TIMEOUT`. If you need a
 /// custom timeout, use [`noise_stream::NoiseTcpStream::new`] directly.
 ///
 /// Pass `Some(key)` to verify the server's authority public key, or `None` to skip
@@ -121,7 +122,7 @@ pub async fn connect_with_noise<Message>(
     authority_pub_key: Option<Secp256k1PublicKey>,
 ) -> Result<NoiseTcpStream<Message>, Error>
 where
-    Message: Serialize + Deserialize<'static> + GetSize + Send + 'static,
+    Message: Serialize + for<'decoder> Deserialize<'decoder> + GetSize + Send + 'static,
 {
     let initiator = match authority_pub_key {
         Some(key) => Initiator::from_raw_k(key.into_bytes()).map_err(|_| Error::InvalidKey)?,
@@ -138,7 +139,7 @@ where
 
 /// Accepts a downstream connection as a Noise responder, returning the split read/write halves.
 ///
-/// The handshake timeout is opinionated and fixed at [`NOISE_HANDSHAKE_TIMEOUT`]. If you need a
+/// The handshake timeout is opinionated and fixed at `NOISE_HANDSHAKE_TIMEOUT`. If you need a
 /// custom timeout, use [`noise_stream::NoiseTcpStream::new`] directly.
 ///
 /// `cert_validity` controls how long the generated Noise certificate is valid,
@@ -150,7 +151,7 @@ pub async fn accept_noise_connection<Message>(
     cert_validity: u64,
 ) -> Result<NoiseTcpStream<Message>, Error>
 where
-    Message: Serialize + Deserialize<'static> + GetSize + Send + 'static,
+    Message: Serialize + for<'decoder> Deserialize<'decoder> + GetSize + Send + 'static,
 {
     let responder = Responder::from_authority_kp(
         &pub_key.into_bytes(),

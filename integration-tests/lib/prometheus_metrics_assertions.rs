@@ -33,7 +33,7 @@ const DEFAULT_RETRIES: usize = 5;
 /// Builder for [`MonitoringApi`]. Created via [`MonitoringApi::builder`].
 ///
 /// Unset knobs fall back to the module-level defaults
-/// ([`DEFAULT_RETRIES`], [`DEFAULT_REQUEST_TIMEOUT`]).
+/// (`DEFAULT_RETRIES`, `DEFAULT_REQUEST_TIMEOUT`).
 #[derive(Debug, Clone, Copy)]
 pub struct MonitoringApiBuilder {
     addr: SocketAddr,
@@ -74,7 +74,7 @@ impl MonitoringApiBuilder {
 
 impl MonitoringApi {
     /// Start a builder for a client at `addr`. Knobs default to
-    /// [`DEFAULT_RETRIES`] retries and [`DEFAULT_REQUEST_TIMEOUT`] per request;
+    /// `DEFAULT_RETRIES` retries and `DEFAULT_REQUEST_TIMEOUT` per request;
     /// see [`MonitoringApiBuilder`] for overrides.
     pub fn builder(addr: SocketAddr) -> MonitoringApiBuilder {
         MonitoringApiBuilder::new(addr)
@@ -109,9 +109,8 @@ impl MonitoringApi {
         let (status, bytes) = self.http_get_with_status(routes::METRICS).await;
         assert!(
             (200..300).contains(&status),
-            "GET {} returned non-2xx status {}",
-            routes::METRICS,
-            status
+            "GET {} returned non-2xx status {status}",
+            routes::METRICS
         );
         String::from_utf8(bytes).expect("metrics response should be valid UTF-8")
     }
@@ -122,9 +121,7 @@ impl MonitoringApi {
         let (status, bytes) = self.http_get_with_status(path).await;
         assert!(
             (200..300).contains(&status),
-            "GET {} returned non-2xx status {}",
-            path,
-            status
+            "GET {path} returned non-2xx status {status}"
         );
         String::from_utf8(bytes).expect("api response should be valid UTF-8")
     }
@@ -169,13 +166,16 @@ impl MonitoringApi {
 
     /// Poll `path` until the response deserialises into `T` and `predicate` returns true.
     ///
-    /// Retries every 500 ms until `timeout`. Non-2xx responses and
+    /// Retries every [`crate::utils::POLL_INTERVAL`] until `timeout`. Non-2xx responses and
     /// deserialisation failures are tolerated (the endpoint may not be ready
     /// yet — for example a `/api/v1/clients/{id}` route returns 404 until the
     /// snapshot cache first populates). On timeout, the panic message includes
     /// the path, target type, last status, and last body so CI failures are
     /// debuggable without re-running with extra logging.
-    pub async fn poll_until<T, F>(&self, path: &'static str, timeout: Duration, predicate: F) -> T
+    ///
+    /// `path` is a plain `&str` so callers can poll dynamic routes such as
+    /// `/api/v1/clients/{id}/channels`, whose state settles after the client itself appears.
+    pub async fn poll_until<T, F>(&self, path: &str, timeout: Duration, predicate: F) -> T
     where
         T: serde::de::DeserializeOwned,
         F: Fn(&T) -> bool,
@@ -208,7 +208,7 @@ impl MonitoringApi {
                     last_body,
                 );
             }
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            tokio::time::sleep(crate::utils::POLL_INTERVAL).await;
         }
     }
 
@@ -235,8 +235,7 @@ impl MonitoringApi {
             }
             if tokio::time::Instant::now() >= deadline {
                 panic!(
-                    "Metric '{}' never reached >= {} within {:?}. Last /metrics response:\n{}",
-                    metric, min, timeout, metrics
+                    "Metric '{metric}' never reached >= {min} within {timeout:?}. Last /metrics response:\n{metrics}"
                 );
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -328,7 +327,7 @@ impl fmt::Display for Metric<'_> {
                 if i > 0 {
                     f.write_str(",")?;
                 }
-                write!(f, "{}=\"{}\"", k, v)?;
+                write!(f, "{k}=\"{v}\"")?;
             }
             f.write_str("}")?;
         }
@@ -389,17 +388,11 @@ pub(crate) fn assert_metric<'a, M, F>(
         Some(v) => {
             assert!(
                 predicate(v),
-                "Metric '{}' has value {} but expected: {}",
-                metric,
-                v,
-                description
+                "Metric '{metric}' has value {v} but expected: {description}"
             );
         }
         None => {
-            panic!(
-                "Metric '{}' not found in metrics output. Expected: {}",
-                metric, description
-            );
+            panic!("Metric '{metric}' not found in metrics output. Expected: {description}");
         }
     }
 }
@@ -410,7 +403,7 @@ pub fn assert_metric_eq<'a, M: Into<Metric<'a>>>(metrics_text: &str, metric: M, 
         metrics_text,
         metric,
         |v| (v - expected).abs() < f64::EPSILON,
-        &format!("== {}", expected),
+        &format!("== {expected}"),
     );
 }
 
@@ -427,8 +420,7 @@ pub fn assert_metric_not_present<'a, M: Into<Metric<'a>>>(metrics_text: &str, me
         }
         if metric.match_line(line).is_some() {
             panic!(
-                "Metric '{}' was found in metrics output but was expected to be absent. Line: {}",
-                metric, line
+                "Metric '{metric}' was found in metrics output but was expected to be absent. Line: {line}"
             );
         }
     }
@@ -445,10 +437,7 @@ pub fn assert_metric_present<'a, M: Into<Metric<'a>>>(metrics_text: &str, metric
             return;
         }
     }
-    panic!(
-        "Metric '{}' was expected to be present but was not found in metrics output",
-        metric
-    );
+    panic!("Metric '{metric}' was expected to be present but was not found in metrics output");
 }
 
 #[cfg(test)]

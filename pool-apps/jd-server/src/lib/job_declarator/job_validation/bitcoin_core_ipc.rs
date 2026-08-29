@@ -3,40 +3,41 @@
 use crate::{
     error::JDSErrorKind,
     job_declarator::{
-        job_validation::{DeclareMiningJobResult, JobValidationEngine, SetCustomMiningJobResult},
         ALLOCATED_TOKEN_TIMEOUT_SECS, JANITOR_INTERVAL_SECS,
+        job_validation::{DeclareMiningJobResult, JobValidationEngine, SetCustomMiningJobResult},
     },
 };
-use bitcoin_core_sv2::job_declaration_protocol::{
-    io::{JdRequest, JdResponse, ValidationContext},
-    BitcoinCoreSv2JDP, CancellationToken,
-};
-use dashmap::DashMap;
 use std::{
+    collections::HashMap,
     path::PathBuf,
-    sync::{Arc, Mutex},
     thread::JoinHandle,
     time::{Duration, Instant},
 };
 use stratum_apps::{
+    bitcoin_core_sv2::runtime_api::{
+        BitcoinCoreVersion,
+        job_declaration_protocol::{
+            self, CancellationToken,
+            io::{JdRequest, JdResponse, ValidationContext},
+        },
+    },
     stratum_core::{
         bitcoin::{
-            self,
+            self, BlockHash, CompactTarget, Transaction, TxMerkleNode, Txid, Wtxid,
             block::Version,
             consensus::{Decodable, Encodable},
             hashes::Hash,
-            BlockHash, CompactTarget, Transaction, TxMerkleNode, Txid, Wtxid,
         },
         job_declaration_sv2::{
-            DeclareMiningJob, ProvideMissingTransactionsSuccess, PushSolution,
-            ERROR_CODE_DECLARE_MINING_JOB_INTERNAL_ERROR,
+            DeclareMiningJobOwned, ERROR_CODE_DECLARE_MINING_JOB_INTERNAL_ERROR,
             ERROR_CODE_DECLARE_MINING_JOB_INVALID_COINBASE_TX,
             ERROR_CODE_DECLARE_MINING_JOB_INVALID_COINBASE_TX_INPUT,
             ERROR_CODE_DECLARE_MINING_JOB_INVALID_MINING_JOB_TOKEN,
-            ERROR_CODE_DECLARE_MINING_JOB_STALE_CHAIN_TIP,
+            ERROR_CODE_DECLARE_MINING_JOB_STALE_CHAIN_TIP, ProvideMissingTransactionsSuccessOwned,
+            PushSolutionOwned,
         },
         mining_sv2::{
-            SetCustomMiningJob, ERROR_CODE_SET_CUSTOM_MINING_JOB_INVALID_COINBASE_PREFIX,
+            ERROR_CODE_SET_CUSTOM_MINING_JOB_INVALID_COINBASE_PREFIX,
             ERROR_CODE_SET_CUSTOM_MINING_JOB_INVALID_COINBASE_TX,
             ERROR_CODE_SET_CUSTOM_MINING_JOB_INVALID_COINBASE_TX_INPUT_N_SEQUENCE,
             ERROR_CODE_SET_CUSTOM_MINING_JOB_INVALID_COINBASE_TX_LOCKTIME,
@@ -47,11 +48,12 @@ use stratum_apps::{
             ERROR_CODE_SET_CUSTOM_MINING_JOB_INVALID_NBITS,
             ERROR_CODE_SET_CUSTOM_MINING_JOB_INVALID_VERSION,
             ERROR_CODE_SET_CUSTOM_MINING_JOB_JOB_NOT_YET_VALIDATED,
-            ERROR_CODE_SET_CUSTOM_MINING_JOB_STALE_CHAIN_TIP,
+            ERROR_CODE_SET_CUSTOM_MINING_JOB_STALE_CHAIN_TIP, SetCustomMiningJobOwned,
         },
     },
+    sync::{SharedLock, SharedMap},
     tp_type::BitcoinNetwork,
-    utils::types::{JdToken, RequestId},
+    utils::types::{DownstreamId, JdToken, RequestId},
 };
 
 /// Snapshot of a previously declared mining job, stored after a `DeclareMiningJob` is
@@ -61,7 +63,7 @@ use stratum_apps::{
 /// subsequent `SetCustomMiningJob` matches the original declaration.
 #[derive(Clone)]
 struct DeclaredCustomJob {
-    declare_mining_job: DeclareMiningJob<'static>,
+    declare_mining_job: DeclareMiningJobOwned,
     validation_context: ValidationContext, // committed at the time we receive DeclareMiningJob
     txid_list: Option<Vec<Txid>>,          // populated only on JdResponse::Success
     validated: bool,
@@ -71,6 +73,73 @@ struct DeclaredCustomJob {
 struct AllocatedTokenEntry {
     request_id: RequestId,
     inserted_at: Instant,
+}
+
+/// Per-downstream client state for declared custom jobs and their token entries.
+#[derive(Default)]
+struct DownstreamState {
+    declared_custom_jobs: HashMap<RequestId, DeclaredCustomJob>,
+    allocated_token_entries: HashMap<JdToken, AllocatedTokenEntry>,
+}
+
+impl DownstreamState {
+    /// Stores a DeclaredCustomJob and its corresponding allocated token.
+    fn insert_declared_custom_job(
+        &mut self,
+        request_id: RequestId,
+        allocated_token: JdToken,
+        declared_custom_job: DeclaredCustomJob,
+    ) {
+        self.declared_custom_jobs
+            .insert(request_id, declared_custom_job);
+        self.allocated_token_entries.insert(
+            allocated_token,
+            AllocatedTokenEntry {
+                request_id,
+                inserted_at: Instant::now(),
+            },
+        );
+    }
+
+    /// Removes both the DeclaredCustomJob and its corresponding allocated token.
+    fn remove_declared_custom_job(&mut self, request_id: RequestId, allocated_token: JdToken) {
+        self.declared_custom_jobs.remove(&request_id);
+        self.allocated_token_entries.remove(&allocated_token);
+    }
+
+    /// Atomically removes and returns a declared custom job by its token.
+    fn take_declared_custom_job(&mut self, allocated_token: JdToken) -> Option<DeclaredCustomJob> {
+        let entry = self.allocated_token_entries.remove(&allocated_token)?;
+        let job = self.declared_custom_jobs.remove(&entry.request_id)?;
+        Some(job)
+    }
+
+    /// Removes expired allocated tokens and their corresponding DeclaredCustomJob.
+    /// Returns a list of expired `(token, request_id)` pairs for logging.
+    fn prune_expired_allocations(
+        &mut self,
+        now: Instant,
+        token_timeout: Duration,
+    ) -> Vec<(JdToken, RequestId)> {
+        let mut expired = Vec::new();
+        self.allocated_token_entries.retain(|token, entry| {
+            let keep = now.saturating_duration_since(entry.inserted_at) <= token_timeout;
+            if !keep {
+                self.declared_custom_jobs.remove(&entry.request_id);
+                expired.push((*token, entry.request_id));
+            }
+            keep
+        });
+
+        expired
+    }
+
+    /// Looks up the ValidationContext for a given RequestId.
+    fn validation_context_for_request(&self, request_id: RequestId) -> Option<ValidationContext> {
+        self.declared_custom_jobs
+            .get(&request_id)
+            .map(|job| job.validation_context)
+    }
 }
 
 #[cfg_attr(not(test), hotpath::measure_all)]
@@ -99,9 +168,9 @@ impl DeclaredCustomJob {
     /// "invalid-coinbase-tx"
     fn get_coinbase_tx(&self) -> Result<Transaction, ()> {
         let declared_coinbase_tx_prefix: Vec<u8> =
-            self.declare_mining_job.coinbase_tx_prefix.to_vec();
+            self.declare_mining_job.coinbase_tx_prefix.to_owned_bytes();
         let declared_coinbase_tx_suffix: Vec<u8> =
-            self.declare_mining_job.coinbase_tx_suffix.to_vec();
+            self.declare_mining_job.coinbase_tx_suffix.to_owned_bytes();
 
         // Parse scriptSig size from coinbase prefix
         // Coinbase structure: version(4) + marker+flag(2) + input_count(1) + outpoint(32) +
@@ -210,10 +279,9 @@ impl DeclaredCustomJob {
 #[derive(Clone)]
 pub struct BitcoinCoreIPCEngine {
     request_sender: async_channel::Sender<JdRequest>,
-    allocated_token_entries: Arc<DashMap<JdToken, AllocatedTokenEntry>>,
-    declared_custom_jobs: Arc<DashMap<RequestId, DeclaredCustomJob>>,
+    downstream_states: SharedMap<DownstreamId, DownstreamState>,
     cancellation_token: CancellationToken,
-    jdp_thread_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    jdp_thread_handle: SharedLock<Option<JoinHandle<()>>>,
 }
 
 #[cfg_attr(not(test), hotpath::measure_all)]
@@ -223,8 +291,11 @@ impl BitcoinCoreIPCEngine {
     /// Spawns a dedicated thread running BitcoinCoreSv2JDP in a LocalSet for handling
     /// the !Send Cap'n Proto client.
     ///
+    /// `version` selects the Bitcoin Core IPC schema family (v30.x or v31.x).
+    ///
     /// Blocks until the mempool mirror is bootstrapped and ready to process requests.
     pub async fn new(
+        version: BitcoinCoreVersion,
         network: BitcoinNetwork,
         data_dir: Option<PathBuf>,
         cancellation_token: CancellationToken,
@@ -236,7 +307,7 @@ impl BitcoinCoreIPCEngine {
                 None => {
                     // Use OS default Bitcoin data directory
                     let home = std::env::var("HOME").map_err(|e| {
-                        JDSErrorKind::BitcoinCoreIPC(format!("Cannot get HOME directory: {}", e))
+                        JDSErrorKind::BitcoinCoreIPC(format!("Cannot get HOME directory: {e}"))
                     })?;
 
                     #[cfg(target_os = "macos")]
@@ -281,7 +352,8 @@ impl BitcoinCoreIPCEngine {
 
                 local_set
                     .run_until(async {
-                        let bitcoin_core_sv2_jdp = match BitcoinCoreSv2JDP::new(
+                        let bitcoin_core_sv2_jdp = match job_declaration_protocol::new(
+                            version,
                             unix_socket_path,
                             request_receiver,
                             cancellation_token_clone.clone(),
@@ -342,14 +414,11 @@ impl BitcoinCoreIPCEngine {
             }
         }
 
-        let allocated_token_to_request_id =
-            Arc::new(DashMap::<JdToken, AllocatedTokenEntry>::new());
-        let declared_custom_jobs = Arc::new(DashMap::<RequestId, DeclaredCustomJob>::new());
+        let downstream_states = SharedMap::<DownstreamId, DownstreamState>::new();
 
         // Spawn janitor task to clean up stale declared jobs that were never
         // consumed by SetCustomMiningJob.
-        let janitor_allocated_token_to_request_id = Arc::clone(&allocated_token_to_request_id);
-        let janitor_declared_custom_jobs = Arc::clone(&declared_custom_jobs);
+        let janitor_downstream_states = downstream_states.clone();
         let janitor_cancellation = cancellation_token.clone();
         tokio::spawn(async move {
             let janitor_interval = Duration::from_secs(JANITOR_INTERVAL_SECS);
@@ -359,23 +428,17 @@ impl BitcoinCoreIPCEngine {
                     _ = janitor_cancellation.cancelled() => break,
                     _ = tokio::time::sleep(janitor_interval) => {
                         let now = Instant::now();
-                        let expired_tokens: Vec<JdToken> = janitor_allocated_token_to_request_id
-                            .iter()
-                            .filter_map(|entry| {
-                                let inserted_at = entry.value().inserted_at;
-                                if now.saturating_duration_since(inserted_at) > token_timeout {
-                                    Some(*entry.key())
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect();
-
-                        for token in expired_tokens {
-                            if let Some((_, entry)) = janitor_allocated_token_to_request_id.remove(&token) {
-                                janitor_declared_custom_jobs.remove(&entry.request_id);
+                        janitor_downstream_states.for_each_mut(|downstream_id, state| {
+                            let expired = state.prune_expired_allocations(now, token_timeout);
+                            for (token, request_id) in expired {
+                                tracing::debug!(
+                                    downstream_id,
+                                    token,
+                                    request_id,
+                                    "Removed expired declared custom job state"
+                                );
                             }
-                        }
+                        });
                     }
                 }
             }
@@ -383,10 +446,9 @@ impl BitcoinCoreIPCEngine {
 
         Ok(Self {
             request_sender,
-            allocated_token_entries: allocated_token_to_request_id,
-            declared_custom_jobs,
+            downstream_states,
             cancellation_token,
-            jdp_thread_handle: Arc::new(Mutex::new(Some(jdp_thread_handle))),
+            jdp_thread_handle: SharedLock::new(Some(jdp_thread_handle)),
         })
     }
 }
@@ -405,13 +467,23 @@ fn validation_context_drifted(
 impl JobValidationEngine for BitcoinCoreIPCEngine {
     fn shutdown(&self) {
         self.cancellation_token.cancel();
-        if let Ok(mut handle_guard) = self.jdp_thread_handle.lock() {
-            if let Some(handle) = handle_guard.take() {
-                if let Err(e) = handle.join() {
-                    tracing::warn!("BitcoinCoreSv2JDP thread join failed during shutdown: {e:?}");
+        self.jdp_thread_handle
+            .with(|handle| {
+                if let Some(handle) = handle.take() {
+                    if let Err(e) = handle.join() {
+                        tracing::warn!(
+                            "BitcoinCoreSv2JDP thread join failed during shutdown: {e:?}"
+                        );
+                    }
                 }
-            }
-        }
+            })
+            .unwrap_or_else(|_| {
+                tracing::warn!("BitcoinCoreSv2JDP thread handle lock poisoned during shutdown");
+            });
+    }
+
+    fn cleanup_downstream(&self, downstream_id: DownstreamId) {
+        self.downstream_states.remove(&downstream_id);
     }
 
     /// Validates a `DeclareMiningJob` by forwarding it to Bitcoin Core over IPC.
@@ -424,25 +496,23 @@ impl JobValidationEngine for BitcoinCoreIPCEngine {
     ///    `DeclaredCustomJob` for later `SetCustomMiningJob` validation.
     async fn handle_declare_mining_job(
         &self,
-        declare_mining_job: DeclareMiningJob<'_>,
-        provide_missing_transactions_success: Option<ProvideMissingTransactionsSuccess<'_>>,
+        downstream_id: DownstreamId,
+        declare_mining_job: DeclareMiningJobOwned,
+        provide_missing_transactions_success: Option<ProvideMissingTransactionsSuccessOwned>,
     ) -> DeclareMiningJobResult {
         // Extract allocated token from the message
-        let allocated_token: JdToken = match declare_mining_job
-            .mining_job_token
-            .inner_as_ref()
-            .try_into()
+        let allocated_token: JdToken = match declare_mining_job.mining_job_token.try_as_array::<8>()
         {
             Ok(token_bytes) => u64::from_le_bytes(token_bytes),
             Err(_) => {
                 return DeclareMiningJobResult::Error(
                     ERROR_CODE_DECLARE_MINING_JOB_INVALID_MINING_JOB_TOKEN,
-                )
+                );
             }
         };
 
         // Create temporary DeclaredCustomJob for extracting coinbase (without prev_hash/nbits yet)
-        let declare_mining_job_static = declare_mining_job.clone().into_static();
+        let declare_mining_job_static = declare_mining_job.clone();
 
         // Extract and validate coinbase transaction
         let declared_coinbase_tx = {
@@ -466,7 +536,7 @@ impl JobValidationEngine for BitcoinCoreIPCEngine {
                 Err(_) => {
                     return DeclareMiningJobResult::Error(
                         ERROR_CODE_DECLARE_MINING_JOB_INVALID_COINBASE_TX,
-                    )
+                    );
                 }
             }
         };
@@ -483,20 +553,15 @@ impl JobValidationEngine for BitcoinCoreIPCEngine {
         // Extract wtxid_list from DeclareMiningJob message
         let wtxid_list: Vec<Wtxid> = declare_mining_job
             .wtxid_list
-            .inner_as_ref()
             .iter()
-            .map(|u256_bytes| {
-                let bytes: [u8; 32] = (*u256_bytes).try_into().expect("U256 is 32 bytes");
-                Wtxid::from_byte_array(bytes)
-            })
+            .map(|u256| Wtxid::from_byte_array(u256.to_array()))
             .collect();
 
         // Parse missing transactions from ProvideMissingTransactionsSuccess
         let missing_txs: Vec<Transaction> =
             if let Some(ref pmts) = provide_missing_transactions_success {
                 pmts.transaction_list
-                    .inner_as_ref()
-                    .iter()
+                    .iter_bytes()
                     .filter_map(|tx_bytes| {
                         match bitcoin::consensus::Decodable::consensus_decode(&mut &tx_bytes[..]) {
                             Ok(tx) => Some(tx),
@@ -513,10 +578,18 @@ impl JobValidationEngine for BitcoinCoreIPCEngine {
 
         let previous_pending_validation_context =
             provide_missing_transactions_success.as_ref().and_then(|_| {
-                self.declared_custom_jobs
-                    .get(&declare_mining_job.request_id)
-                    .map(|job| job.validation_context)
+                self.downstream_states
+                    .with(&downstream_id, |state| {
+                        state.validation_context_for_request(declare_mining_job.request_id)
+                    })
+                    .flatten()
             });
+
+        // Ensure downstream state exists before awaiting IPC response.
+        // Later writes must use `with_mut` only, so a disconnect cleanup that removes this
+        // state cannot be undone by recreating it after the response arrives.
+        self.downstream_states
+            .with_mut_or_default(downstream_id, |_| {});
 
         // Create oneshot channel for response
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
@@ -564,24 +637,29 @@ impl JobValidationEngine for BitcoinCoreIPCEngine {
                     txid_list: Some(txid_list),
                     validated: true,
                 };
-                self.declared_custom_jobs
-                    .insert(declare_mining_job.request_id, declared_custom_job);
-                self.allocated_token_entries.insert(
-                    allocated_token,
-                    AllocatedTokenEntry {
-                        request_id: declare_mining_job.request_id,
-                        inserted_at: Instant::now(),
-                    },
-                );
+                let updated = self.downstream_states.with_mut(&downstream_id, |state| {
+                    state.insert_declared_custom_job(
+                        declare_mining_job.request_id,
+                        allocated_token,
+                        declared_custom_job,
+                    );
+                });
+                if updated.is_none() {
+                    tracing::error!(downstream_id, "downstream state missing after IPC response");
+                    return DeclareMiningJobResult::Error(
+                        ERROR_CODE_DECLARE_MINING_JOB_INTERNAL_ERROR,
+                    );
+                }
                 DeclareMiningJobResult::Success
             }
             JdResponse::Error {
                 error_code,
                 validation_context,
             } => {
-                self.declared_custom_jobs
-                    .remove(&declare_mining_job.request_id);
-                self.allocated_token_entries.remove(&allocated_token);
+                self.downstream_states.with_mut(&downstream_id, |state| {
+                    state
+                        .remove_declared_custom_job(declare_mining_job.request_id, allocated_token);
+                });
 
                 let tip_drifted = previous_pending_validation_context
                     .map(|previous_ctx| {
@@ -608,9 +686,12 @@ impl JobValidationEngine for BitcoinCoreIPCEngine {
                 // If this is a retry after ProvideMissingTransactionsSuccess and context drifted,
                 // classify as stale-chain-tip instead of asking for yet another missing-txs round.
                 if provide_missing_transactions_success.is_some() && tip_drifted {
-                    self.declared_custom_jobs
-                        .remove(&declare_mining_job.request_id);
-                    self.allocated_token_entries.remove(&allocated_token);
+                    self.downstream_states.with_mut(&downstream_id, |state| {
+                        state.remove_declared_custom_job(
+                            declare_mining_job.request_id,
+                            allocated_token,
+                        );
+                    });
 
                     DeclareMiningJobResult::Error(ERROR_CODE_DECLARE_MINING_JOB_STALE_CHAIN_TIP)
                 } else {
@@ -620,15 +701,22 @@ impl JobValidationEngine for BitcoinCoreIPCEngine {
                         txid_list: None,
                         validated: false, // this is only set to true on JdResponse::Success
                     };
-                    self.declared_custom_jobs
-                        .insert(declare_mining_job.request_id, declared_custom_job);
-                    self.allocated_token_entries.insert(
-                        allocated_token,
-                        AllocatedTokenEntry {
-                            request_id: declare_mining_job.request_id,
-                            inserted_at: Instant::now(),
-                        },
-                    );
+                    let updated = self.downstream_states.with_mut(&downstream_id, |state| {
+                        state.insert_declared_custom_job(
+                            declare_mining_job.request_id,
+                            allocated_token,
+                            declared_custom_job,
+                        );
+                    });
+                    if updated.is_none() {
+                        tracing::error!(
+                            downstream_id,
+                            "downstream state missing after IPC response"
+                        );
+                        return DeclareMiningJobResult::Error(
+                            ERROR_CODE_DECLARE_MINING_JOB_INTERNAL_ERROR,
+                        );
+                    }
 
                     DeclareMiningJobResult::MissingTransactions(missing_wtxids)
                 }
@@ -636,9 +724,13 @@ impl JobValidationEngine for BitcoinCoreIPCEngine {
         }
     }
 
-    async fn handle_push_solution(&self, push_solution: PushSolution<'_>) {
+    async fn handle_push_solution(
+        &self,
+        downstream_id: DownstreamId,
+        push_solution: PushSolutionOwned,
+    ) {
         // Convert to static lifetime for channel transfer
-        let push_solution_static = push_solution.into_static();
+        let push_solution_static = push_solution;
 
         // Send request to BitcoinCoreSv2JDP (fire-and-forget)
         let request = JdRequest::PushSolution {
@@ -646,9 +738,9 @@ impl JobValidationEngine for BitcoinCoreIPCEngine {
         };
 
         if let Err(e) = self.request_sender.send(request).await {
-            tracing::error!("Failed to send PushSolution request: {}", e);
+            tracing::error!(downstream_id, "Failed to send PushSolution request: {}", e);
         } else {
-            tracing::debug!("PushSolution request sent successfully");
+            tracing::debug!(downstream_id, "PushSolution request sent successfully");
         }
     }
 
@@ -663,35 +755,27 @@ impl JobValidationEngine for BitcoinCoreIPCEngine {
     // DeclareMiningJob token.
     async fn handle_set_custom_mining_job(
         &self,
-        set_custom_mining_job: SetCustomMiningJob<'_>,
+        downstream_id: DownstreamId,
+        set_custom_mining_job: SetCustomMiningJobOwned,
         allocated_token: JdToken, // Note: This is the corresponding DeclareMiningJob token
     ) -> SetCustomMiningJobResult {
-        // Look up request_id using the allocated token
-        let request_id = match self.allocated_token_entries.get(&allocated_token) {
-            Some(entry) => entry.request_id,
+        let declared_custom_job = match self
+            .downstream_states
+            .with_mut(&downstream_id, |state| {
+                state.take_declared_custom_job(allocated_token)
+            })
+            .flatten()
+        {
+            Some(declared_custom_job) => declared_custom_job,
             None => {
                 tracing::debug!(
-                    "Provided token {} is not associated with any DeclareMiningJob request",
-                    allocated_token
+                    downstream_id,
+                    allocated_token,
+                    "Provided token is not associated with any DeclareMiningJob request"
                 );
                 return SetCustomMiningJobResult::Error(
                     ERROR_CODE_SET_CUSTOM_MINING_JOB_INVALID_MINING_JOB_TOKEN,
                 );
-            }
-        };
-
-        // Clean up immediately - the job is being consumed regardless of validation result
-        self.allocated_token_entries.remove(&allocated_token);
-
-        let declared_custom_job = {
-            match self.declared_custom_jobs.remove(&request_id) {
-                Some((_request_id, declared_custom_job)) => declared_custom_job,
-                None => {
-                    tracing::debug!("DeclaredCustomJob associated with allocated token {} and request id {} not found", allocated_token, request_id);
-                    return SetCustomMiningJobResult::Error(
-                        ERROR_CODE_SET_CUSTOM_MINING_JOB_INVALID_MINING_JOB_TOKEN,
-                    );
-                }
             }
         };
 
@@ -710,11 +794,7 @@ impl JobValidationEngine for BitcoinCoreIPCEngine {
 
         // Extract values from SetCustomMiningJob message
         let custom_job_prev_hash = {
-            let bytes: [u8; 32] = set_custom_mining_job
-                .prev_hash
-                .to_vec()
-                .try_into()
-                .expect("U256 is 32 bytes");
+            let bytes = set_custom_mining_job.prev_hash.to_array();
             BlockHash::from_byte_array(bytes)
         };
         let custom_job_nbits: u32 = set_custom_mining_job.nbits;
@@ -769,7 +849,7 @@ impl JobValidationEngine for BitcoinCoreIPCEngine {
                 Err(_) => {
                     return SetCustomMiningJobResult::Error(
                         ERROR_CODE_SET_CUSTOM_MINING_JOB_INVALID_COINBASE_TX,
-                    )
+                    );
                 }
             };
 
@@ -785,8 +865,8 @@ impl JobValidationEngine for BitcoinCoreIPCEngine {
             }
 
             let script_sig = declared_coinbase_tx.input[0].script_sig.as_bytes();
-            let coinbase_prefix = set_custom_mining_job.coinbase_prefix.to_vec();
-            if !script_sig.starts_with(&coinbase_prefix) {
+            let coinbase_prefix = set_custom_mining_job.coinbase_prefix.as_bytes();
+            if !script_sig.starts_with(coinbase_prefix) {
                 tracing::debug!("coinbase prefix mismatch");
                 return SetCustomMiningJobResult::Error(
                     ERROR_CODE_SET_CUSTOM_MINING_JOB_INVALID_COINBASE_PREFIX,
@@ -808,7 +888,7 @@ impl JobValidationEngine for BitcoinCoreIPCEngine {
 
             let declared_outputs_bytes =
                 bitcoin::consensus::serialize(&declared_coinbase_tx.output);
-            if declared_outputs_bytes != set_custom_mining_job.coinbase_tx_outputs.to_vec() {
+            if declared_outputs_bytes != set_custom_mining_job.coinbase_tx_outputs.as_bytes() {
                 tracing::debug!("coinbase outputs mismatch");
                 return SetCustomMiningJobResult::Error(
                     ERROR_CODE_SET_CUSTOM_MINING_JOB_INVALID_COINBASE_TX_OUTPUTS,
@@ -836,18 +916,14 @@ impl JobValidationEngine for BitcoinCoreIPCEngine {
                 Err(_) => {
                     return SetCustomMiningJobResult::Error(
                         ERROR_CODE_SET_CUSTOM_MINING_JOB_JOB_NOT_YET_VALIDATED,
-                    )
+                    );
                 }
             };
 
             let custom_merkle_path: Vec<TxMerkleNode> = set_custom_mining_job
                 .merkle_path
-                .inner_as_ref()
                 .iter()
-                .map(|u256_bytes| {
-                    let bytes: [u8; 32] = (*u256_bytes).try_into().expect("U256 is 32 bytes");
-                    TxMerkleNode::from_byte_array(bytes)
-                })
+                .map(|u256| TxMerkleNode::from_byte_array(u256.to_array()))
                 .collect();
 
             if declared_merkle_path != custom_merkle_path {

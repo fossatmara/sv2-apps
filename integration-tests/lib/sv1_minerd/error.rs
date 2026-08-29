@@ -19,6 +19,8 @@ pub enum MinerdError {
     InvalidConfiguration(String),
     /// Failed to parse hashrate from minerd benchmark output
     HashrateParseError,
+    /// Timed out before minerd produced a benchmark hashrate
+    HashrateMeasurementTimeout(std::time::Duration),
     /// Mutex was poisoned
     MutexPoisoned,
     /// OS or Architecture not supported
@@ -28,19 +30,25 @@ pub enum MinerdError {
 impl fmt::Display for MinerdError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            MinerdError::Io(e) => write!(f, "IO error: {}", e),
-            MinerdError::ProcessSpawn(e) => write!(f, "Failed to spawn minerd process: {}", e),
+            MinerdError::Io(e) => write!(f, "IO error: {e}"),
+            MinerdError::ProcessSpawn(e) => write!(f, "Failed to spawn minerd process: {e}"),
             MinerdError::ProcessAlreadyRunning => write!(f, "Minerd process is already running"),
             MinerdError::ProcessNotRunning => write!(f, "Minerd process is not running"),
-            MinerdError::NetworkConnection(e) => write!(f, "Network connection failed: {}", e),
-            MinerdError::ProxySetup(e) => write!(f, "Proxy setup failed: {}", e),
-            MinerdError::InvalidConfiguration(msg) => write!(f, "Invalid configuration: {}", msg),
+            MinerdError::NetworkConnection(e) => write!(f, "Network connection failed: {e}"),
+            MinerdError::ProxySetup(e) => write!(f, "Proxy setup failed: {e}"),
+            MinerdError::InvalidConfiguration(msg) => write!(f, "Invalid configuration: {msg}"),
             MinerdError::HashrateParseError => {
                 write!(f, "Failed to parse hashrate from minerd benchmark output")
             }
+            MinerdError::HashrateMeasurementTimeout(timeout) => {
+                write!(
+                    f,
+                    "Timed out after {timeout:?} waiting for minerd benchmark output"
+                )
+            }
             MinerdError::MutexPoisoned => write!(f, "Mutex was poisoned"),
             MinerdError::OsArchNotSupported(msg) => {
-                write!(f, "OS or architecture not supported: {}", msg)
+                write!(f, "OS or architecture not supported: {msg}")
             }
         }
     }
@@ -57,6 +65,7 @@ impl std::error::Error for MinerdError {
             | MinerdError::ProcessNotRunning
             | MinerdError::InvalidConfiguration(_)
             | MinerdError::HashrateParseError
+            | MinerdError::HashrateMeasurementTimeout(_)
             | MinerdError::MutexPoisoned => None,
             MinerdError::OsArchNotSupported(_) => None,
         }

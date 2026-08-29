@@ -7,14 +7,14 @@
 use std::sync::Arc;
 
 use async_channel::{Receiver, Sender};
-use bitcoin_core_sv2::job_declaration_protocol::CancellationToken;
 use stratum_apps::{
+    bitcoin_core_sv2::CancellationToken,
     network_helpers::noise_stream::{NoiseTcpReadHalf, NoiseTcpWriteHalf},
     stratum_core::framing_sv2::framing::Frame,
     task_manager::TaskManager,
     utils::types::{Message, Sv2Frame},
 };
-use tracing::{error, trace, warn, Instrument as _};
+use tracing::{Instrument as _, error, trace, warn};
 
 /// Spawns a reader task and a writer task for framed Noise I/O.
 ///

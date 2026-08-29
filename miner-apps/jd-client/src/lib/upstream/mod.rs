@@ -10,20 +10,27 @@
 //! - Handle common messages from upstream
 
 use std::{net::SocketAddr, sync::Arc};
+use stratum_apps::stratum_core::{
+    binary_sv2::Seq064KOwned, extensions_sv2::RequestExtensionsOwned,
+};
 
-use async_channel::{unbounded, Receiver, Sender};
-use bitcoin_core_sv2::template_distribution_protocol::CancellationToken;
+use async_channel::{Receiver, Sender, unbounded};
 use stratum_apps::{
+    bitcoin_core_sv2::CancellationToken,
     channel_utils::ReceiverCleanup,
     fallback_coordinator::FallbackCoordinator,
-    network_helpers::{connect_with_noise, resolve_host, TCP_CONNECT_TIMEOUT},
+    network_helpers::{TCP_CONNECT_TIMEOUT, connect_with_noise, resolve_host},
     stratum_core::{
-        binary_sv2::Seq064K, extensions_sv2::RequestExtensions, framing_sv2,
-        handlers_sv2::HandleCommonMessagesFromServerAsync, parsers_sv2::AnyMessage,
+        common_messages_sv2::{
+            MESSAGE_TYPE_SETUP_CONNECTION_ERROR, MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS,
+        },
+        framing_sv2,
+        handlers_sv2::HandleCommonMessagesFromServerOwnedAsync,
+        parsers_sv2::AnyMessageOwned,
     },
     task_manager::TaskManager,
     utils::{
-        protocol_message_type::{protocol_message_type, MessageType},
+        protocol_message_type::{MessageType, protocol_message_type},
         types::{Message, Sv2Frame},
     },
 };
@@ -33,7 +40,7 @@ use tracing::{debug, error, info, warn};
 use crate::{
     error::{self, Action, JDCError, JDCErrorKind, JDCResult, LoopControl},
     io_task::spawn_io_tasks,
-    utils::{get_setup_connection_message, UpstreamEntry},
+    utils::{UpstreamEntry, get_setup_connection_message},
 };
 
 mod message_handler;
@@ -248,6 +255,19 @@ impl Upstream {
         })?;
 
         info!(ext_type = ?header.ext_type(), msg_type = ?header.msg_type(), "Dispatching inbound handshake message");
+
+        if header.ext_type() != 0
+            || !matches!(
+                header.msg_type(),
+                MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS | MESSAGE_TYPE_SETUP_CONNECTION_ERROR
+            )
+        {
+            return Err(JDCError::fallback(JDCErrorKind::UnexpectedMessage(
+                header.ext_type(),
+                header.msg_type(),
+            )));
+        }
+
         self.handle_common_message_frame_from_server(None, header, incoming.payload())
             .await?;
 
@@ -272,9 +292,9 @@ impl Upstream {
         }
 
         let requested_extensions =
-            Seq064K::new(self.required_extensions.clone()).map_err(JDCError::shutdown)?;
+            Seq064KOwned::new(self.required_extensions.clone()).map_err(JDCError::shutdown)?;
 
-        let request_extensions = RequestExtensions {
+        let request_extensions = RequestExtensionsOwned {
             request_id: 0,
             requested_extensions,
         };
@@ -284,7 +304,7 @@ impl Upstream {
             self.required_extensions
         );
 
-        let sv2_frame: Sv2Frame = AnyMessage::Extensions(request_extensions.into_static().into())
+        let sv2_frame: Sv2Frame = AnyMessageOwned::Extensions(request_extensions.into())
             .try_into()
             .map_err(JDCError::shutdown)?;
 
@@ -458,5 +478,47 @@ impl Upstream {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stratum_apps::stratum_core::{
+        common_messages_sv2::ChannelEndpointChangedOwned, parsers_sv2::CommonMessagesOwned,
+    };
+
+    #[tokio::test]
+    async fn setup_connection_rejects_non_setup_response() {
+        let (channel_manager_sender, _cm_rx) = unbounded();
+        let (_cm_tx, channel_manager_receiver) = unbounded();
+        let (upstream_sender, _upstream_outbound_receiver) = unbounded();
+        let (upstream_inbound_sender, upstream_receiver) = unbounded();
+
+        let mut upstream = Upstream {
+            upstream_io: UpstreamIo {
+                channel_manager_sender,
+                channel_manager_receiver,
+                upstream_sender,
+                upstream_receiver,
+            },
+            required_extensions: vec![],
+            address: "127.0.0.1:1234".parse().expect("valid socket address"),
+        };
+
+        let response: Sv2Frame = Message::Common(CommonMessagesOwned::ChannelEndpointChanged(
+            ChannelEndpointChangedOwned { channel_id: 0 },
+        ))
+        .try_into()
+        .expect("Failed to serialize ChannelEndpointChanged frame");
+        upstream_inbound_sender
+            .send(response)
+            .await
+            .expect("Failed to inject ChannelEndpointChanged response");
+
+        assert!(
+            upstream.setup_connection(2, 2).await.is_err(),
+            "a non-SetupConnection response must not establish the upstream session"
+        );
     }
 }

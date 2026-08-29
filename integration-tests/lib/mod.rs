@@ -3,23 +3,23 @@ use crate::{
     sv1_minerd::MinerdProcess, template_provider::*,
 };
 use interceptor::InterceptAction;
-use jd_client_sv2::{config::ConfigJDCMode, JobDeclaratorClient};
+use jd_client_sv2::{JobDeclaratorClient, config::ConfigJDCMode};
 use once_cell::sync::OnceCell;
 use pool_sv2::PoolSv2;
 use std::{
     convert::TryFrom,
     net::{Ipv4Addr, SocketAddr},
-    time::Duration,
 };
 use stratum_apps::{
+    bitcoin_core_sv2::runtime_api::BitcoinCoreVersion,
     config_helpers::CoinbaseRewardScript,
     key_utils::{Secp256k1PublicKey, Secp256k1SecretKey},
     tp_type::TemplateProviderType,
 };
 use tracing::Level;
-use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 use translator_sv2::TranslatorSv2;
-use utils::get_available_address;
+use utils::{ROLE_STARTUP_DELAY, get_available_address};
 
 pub mod interceptor;
 pub mod message_aggregator;
@@ -61,7 +61,7 @@ pub fn sv2_tp_config(address: SocketAddr) -> TemplateProviderType {
     }
 }
 
-/// Helper to create BitcoinCoreIpc config with default thresholds.
+/// Helper to create BitcoinCoreIpc config with default thresholds and latest IPC version.
 pub fn ipc_config(
     data_dir: std::path::PathBuf,
     is_signet: bool,
@@ -74,8 +74,10 @@ pub fn ipc_config(
     } else {
         BitcoinNetwork::Regtest
     };
+    let version = BITCOIN_CORE_LATEST;
 
     TemplateProviderType::BitcoinCoreIpc {
+        version,
         network,
         data_dir: Some(data_dir),
         fee_threshold: 0,
@@ -169,7 +171,7 @@ pub async fn start_pool(
     tokio::spawn(async move {
         _ = pool_clone.start().await;
     });
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    tokio::time::sleep(ROLE_STARTUP_DELAY).await;
     (pool, listening_address, monitoring_address)
 }
 
@@ -189,9 +191,16 @@ pub fn start_template_provider(
     (template_provider, address)
 }
 
-pub fn start_bitcoin_core(difficulty_level: DifficultyLevel) -> BitcoinCore {
+pub fn start_bitcoin_core_latest(difficulty_level: DifficultyLevel) -> BitcoinCore {
+    start_bitcoin_core(difficulty_level, BITCOIN_CORE_LATEST)
+}
+
+pub fn start_bitcoin_core(
+    difficulty_level: DifficultyLevel,
+    node_version: BitcoinCoreVersion,
+) -> BitcoinCore {
     let address = get_available_address();
-    let bitcoin_core = BitcoinCore::start(address.port(), difficulty_level.clone());
+    let bitcoin_core = BitcoinCore::start(address.port(), difficulty_level.clone(), node_version);
     if difficulty_level == DifficultyLevel::Low {
         // template_provider.generate_blocks(1);
         // generate 16 blocks as a workaround for https://github.com/bitcoin/bitcoin/issues/35126
@@ -350,7 +359,7 @@ pub async fn start_pool_with_jds(
     tokio::spawn(async move {
         _ = pool_clone.start().await;
     });
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    tokio::time::sleep(ROLE_STARTUP_DELAY).await;
     (pool, pool_address, jds_address, monitoring_address)
 }
 
@@ -442,7 +451,7 @@ pub async fn start_sv2_translator_with_user_identities(
     let translator_v2 = translator_sv2::TranslatorSv2::new(config);
     let clone_translator_v2 = translator_v2.clone();
     tokio::spawn(async move {
-        clone_translator_v2.start().await;
+        let _ = clone_translator_v2.start().await;
     });
     (translator_v2, listening_address, monitoring_address)
 }
@@ -519,7 +528,7 @@ pub async fn start_sv2_translator_with_user_identity(
     let translator_v2 = translator_sv2::TranslatorSv2::new(config);
     let clone_translator_v2 = translator_v2.clone();
     tokio::spawn(async move {
-        clone_translator_v2.start().await;
+        let _ = clone_translator_v2.start().await;
     });
     (translator_v2, listening_address, monitoring_address)
 }
@@ -546,6 +555,9 @@ pub fn start_mining_device_sv2(
     nominal_hashrate_multiplier: Option<f32>,
     single_submit: bool,
 ) {
+    // Pin to one thread so concurrent test processes do not oversubscribe the CI runner's CPUs
+    // and make share-rate assertions flaky.
+    crate::mining_device::set_cores(1);
     tokio::spawn(async move {
         crate::mining_device::connect(
             upstream.to_string(),

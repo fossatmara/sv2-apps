@@ -14,28 +14,28 @@ use crate::{
         token_management::TokenManager,
     },
 };
-use async_channel::{unbounded, Receiver, Sender};
-use bitcoin_core_sv2::job_declaration_protocol::CancellationToken;
-use dashmap::DashMap;
+use async_channel::{Receiver, Sender, unbounded};
 use std::{
     net::SocketAddr,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     },
 };
 use stratum_apps::{
+    bitcoin_core_sv2::CancellationToken,
     config_helpers::CoinbaseRewardScript,
     key_utils::{Secp256k1PublicKey, Secp256k1SecretKey},
     network_helpers::accept_noise_connection,
     stratum_core::{
-        handlers_sv2::HandleJobDeclarationMessagesFromClientAsync,
+        handlers_sv2::HandleJobDeclarationMessagesFromClientOwnedAsync,
         mining_sv2::{
-            SetCustomMiningJob, SetCustomMiningJobError, SetCustomMiningJobSuccess,
             ERROR_CODE_SET_CUSTOM_MINING_JOB_INVALID_MINING_JOB_TOKEN,
+            SetCustomMiningJobErrorOwned, SetCustomMiningJobOwned, SetCustomMiningJobSuccess,
         },
-        parsers_sv2::{JobDeclaration, Tlv},
+        parsers_sv2::{JobDeclarationOwned, Tlv},
     },
+    sync::SharedMap,
     task_manager::TaskManager,
     utils::types::{DownstreamId, JdToken},
 };
@@ -61,25 +61,25 @@ pub mod job_validation;
 pub mod token_management;
 
 /// Shared JDP payload exchanged between Job Declarator and downstreams.
-type JobDeclarationMessage = (JobDeclaration<'static>, Option<Vec<Tlv>>);
+type JobDeclarationMessage = (JobDeclarationOwned, Option<Vec<Tlv>>);
 
 /// Shared JDP payload sent from downstreams to Job Declarator, tagged with downstream id.
-type DownstreamJobDeclarationMessage = (DownstreamId, JobDeclaration<'static>, Option<Vec<Tlv>>);
+type DownstreamJobDeclarationMessage = (DownstreamId, JobDeclarationOwned, Option<Vec<Tlv>>);
 
 /// The response produced by [`JobDeclarator::handle_set_custom_mining_job`].
 ///
 /// This is a Mining Protocol (MP) message, not a JDP message — it is returned to the
 /// caller (typically the Pool) rather than sent over the JDP TCP socket.
 #[derive(Debug)]
-pub enum SetCustomMiningJobResponse<'a> {
+pub enum SetCustomMiningJobResponse {
     Ok(SetCustomMiningJobSuccess),
-    Error(SetCustomMiningJobError<'a>),
+    Error(SetCustomMiningJobErrorOwned),
 }
 
 #[cfg_attr(not(test), hotpath::measure_all)]
-impl SetCustomMiningJobResponse<'_> {
+impl SetCustomMiningJobResponse {
     fn error(request_id: u32, channel_id: u32, error_code: &str) -> Self {
-        SetCustomMiningJobResponse::Error(SetCustomMiningJobError {
+        SetCustomMiningJobResponse::Error(SetCustomMiningJobErrorOwned {
             request_id,
             channel_id,
             error_code: error_code
@@ -98,7 +98,7 @@ impl SetCustomMiningJobResponse<'_> {
 /// - `disconnect_sender/receiver`: channel through which downstreams signal disconnection.
 #[derive(Clone)]
 pub struct JobDeclaratorIo {
-    downstream_client_senders: DashMap<DownstreamId, Sender<JobDeclarationMessage>>,
+    downstream_client_senders: SharedMap<DownstreamId, Sender<JobDeclarationMessage>>,
     job_declarator_sender: Sender<DownstreamJobDeclarationMessage>,
     job_declarator_receiver: Receiver<DownstreamJobDeclarationMessage>,
 }
@@ -113,7 +113,7 @@ pub struct JobDeclarator {
     job_validator: Arc<dyn JobValidationEngine>,
     job_declarator_io: Arc<JobDeclaratorIo>,
     coinbase_reward_script: CoinbaseRewardScript,
-    downstream_clients: Arc<DashMap<DownstreamId, Downstream>>,
+    downstream_clients: SharedMap<DownstreamId, Downstream>,
     downstream_id_factory: Arc<AtomicUsize>,
 }
 
@@ -131,7 +131,7 @@ impl JobDeclarator {
         let job_declarator_io = Arc::new(JobDeclaratorIo {
             job_declarator_sender,
             job_declarator_receiver,
-            downstream_client_senders: DashMap::new(),
+            downstream_client_senders: SharedMap::new(),
         });
 
         let token_manager =
@@ -142,7 +142,7 @@ impl JobDeclarator {
             job_validator: engine,
             job_declarator_io,
             coinbase_reward_script,
-            downstream_clients: Arc::new(DashMap::new()),
+            downstream_clients: SharedMap::new(),
             downstream_id_factory: Arc::new(AtomicUsize::new(0)),
         })
     }
@@ -361,6 +361,7 @@ impl JobDeclarator {
             .remove(&downstream_id)
             .is_some();
 
+        self.job_validator.cleanup_downstream(downstream_id);
         self.token_manager.remove_downstream(downstream_id);
 
         debug!(
@@ -407,13 +408,13 @@ impl JobDeclarator {
     /// It is the caller's responsibility to set it.
     pub async fn handle_set_custom_mining_job(
         &mut self,
-        set_custom_mining_job: SetCustomMiningJob<'static>,
+        set_custom_mining_job: SetCustomMiningJobOwned,
         _tlv_fields: Option<&[Tlv]>,
-    ) -> JDSResult<SetCustomMiningJobResponse<'_>, error::JobDeclarator> {
+    ) -> JDSResult<SetCustomMiningJobResponse, error::JobDeclarator> {
         let request_id = set_custom_mining_job.request_id;
         let channel_id = set_custom_mining_job.channel_id;
 
-        let active_token: JdToken = match set_custom_mining_job.token.inner_as_ref().try_into() {
+        let active_token: JdToken = match set_custom_mining_job.token.try_as_array::<8>() {
             Ok(token_bytes) => {
                 let token = u64::from_le_bytes(token_bytes);
                 debug!(
@@ -438,38 +439,40 @@ impl JobDeclarator {
         };
 
         // this allows JobValidationEngine to lookup the corresponding DeclareMiningJob
-        let allocated_token = match self.token_manager.allocated_from_active(active_token) {
-            Some(token) => {
-                debug!(
-                    request_id,
-                    channel_id,
-                    active_token,
-                    allocated_token = token,
-                    "SetCustomMiningJob: active token mapped to allocated token"
-                );
-                token
-            }
-            None => {
-                debug!(
-                    request_id,
-                    channel_id,
-                    active_token,
-                    "SetCustomMiningJob: active token not found in TokenManager"
-                );
-                return Ok(SetCustomMiningJobResponse::error(
-                    request_id,
-                    channel_id,
-                    ERROR_CODE_SET_CUSTOM_MINING_JOB_INVALID_MINING_JOB_TOKEN,
-                ));
-            }
-        };
+        let (allocated_token, downstream_id) =
+            match self.token_manager.allocated_from_active(active_token) {
+                Some((token, downstream_id)) => {
+                    debug!(
+                        request_id,
+                        channel_id,
+                        active_token,
+                        allocated_token = token,
+                        downstream_id,
+                        "SetCustomMiningJob: active token mapped to allocated token"
+                    );
+                    (token, downstream_id)
+                }
+                None => {
+                    debug!(
+                        request_id,
+                        channel_id,
+                        active_token,
+                        "SetCustomMiningJob: active token not found in TokenManager"
+                    );
+                    return Ok(SetCustomMiningJobResponse::error(
+                        request_id,
+                        channel_id,
+                        ERROR_CODE_SET_CUSTOM_MINING_JOB_INVALID_MINING_JOB_TOKEN,
+                    ));
+                }
+            };
 
         // Clean up TokenManager
         self.token_manager.deactivate(active_token);
 
         match self
             .job_validator
-            .handle_set_custom_mining_job(set_custom_mining_job, allocated_token)
+            .handle_set_custom_mining_job(downstream_id, set_custom_mining_job, allocated_token)
             .await
         {
             SetCustomMiningJobResult::Success => {

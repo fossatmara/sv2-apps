@@ -2,7 +2,7 @@
 
 use stratum_core::{
     bitcoin::{BlockHash, CompactTarget, Transaction, Txid, Wtxid, block::Version},
-    job_declaration_sv2::PushSolution,
+    job_declaration_sv2::PushSolutionOwned,
 };
 use tokio::sync::oneshot;
 
@@ -10,7 +10,7 @@ use tokio::sync::oneshot;
 ///
 /// This lets callers distinguish stale-tip races from other validation failures.
 ///
-/// Please check https://github.com/stratum-mining/sv2-apps/issues/364
+/// Please check <https://github.com/stratum-mining/sv2-apps/issues/364>
 /// for more details on the regression that motivated this field.
 #[derive(Debug, Clone, Copy)]
 pub struct ValidationContext {
@@ -34,9 +34,7 @@ pub enum JdRequest {
         response_tx: oneshot::Sender<JdResponse>,
     },
     /// Submit a mining solution to Bitcoin Core (fire-and-forget).
-    PushSolution {
-        push_solution: PushSolution<'static>,
-    },
+    PushSolution { push_solution: PushSolutionOwned },
 }
 
 /// The result of trying to handle a DeclareMiningJob request.

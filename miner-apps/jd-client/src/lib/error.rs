@@ -1,6 +1,6 @@
 //! ## Error Module
 //!
-//! Defines [`Error`], the central error enum used throughout the Job Declarator Client (JDC).
+//! Defines [`JDCError`], the central error struct used throughout the Job Declarator Client (JDC).
 //!
 //! It unifies errors from:
 //! - I/O operations
@@ -15,6 +15,7 @@ use ext_config::ConfigError;
 use std::{
     fmt::{self, Formatter},
     marker::PhantomData,
+    sync::PoisonError,
 };
 use stratum_apps::{
     network_helpers,
@@ -23,9 +24,12 @@ use stratum_apps::{
         channels_sv2::{
             client::error::ExtendedChannelError as ExtendedChannelClientError,
             extranonce_manager::ExtranonceAllocatorError,
-            server::error::{
-                ExtendedChannelError as ExtendedChannelServerError, GroupChannelError,
-                StandardChannelError,
+            server::{
+                error::{
+                    ExtendedChannelError as ExtendedChannelServerError, GroupChannelError,
+                    StandardChannelError,
+                },
+                share_accounting::ShareValidationError,
             },
         },
         framing_sv2,
@@ -39,6 +43,8 @@ use stratum_apps::{
     },
 };
 use tokio::time::error::Elapsed;
+
+use crate::config::ConfigJDCMode;
 
 pub type JDCResult<T, Owner> = Result<T, JDCError<Owner>>;
 
@@ -58,6 +64,9 @@ pub struct Upstream;
 pub struct Downstream;
 
 #[derive(Debug)]
+pub struct JobDeclaratorClient;
+
+#[derive(Debug)]
 pub struct JDCError<Owner> {
     pub kind: JDCErrorKind,
     pub action: Action,
@@ -72,6 +81,12 @@ pub enum Action {
     Shutdown,
 }
 
+impl Action {
+    pub fn is_shutdown(self) -> bool {
+        matches!(self, Self::Shutdown)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoopControl {
     Continue,
@@ -84,12 +99,14 @@ impl CanDisconnect for ChannelManager {}
 impl CanFallback for Upstream {}
 impl CanFallback for JobDeclarator {}
 impl CanFallback for ChannelManager {}
+impl CanFallback for JobDeclaratorClient {}
 
 impl CanShutdown for ChannelManager {}
 impl CanShutdown for TemplateProvider {}
 impl CanShutdown for Downstream {}
 impl CanShutdown for Upstream {}
 impl CanShutdown for JobDeclarator {}
+impl CanShutdown for JobDeclaratorClient {}
 
 impl<O> JDCError<O> {
     pub fn log<E: Into<JDCErrorKind>>(kind: E) -> Self {
@@ -147,6 +164,7 @@ pub enum ChannelSv2Error {
     ExtranonceError(ExtranonceAllocatorError),
     StandardChannelServerSide(StandardChannelError),
     GroupChannelServerSide(GroupChannelError),
+    ShareValidationError(ShareValidationError),
 }
 
 #[derive(Debug)]
@@ -165,6 +183,8 @@ pub enum JDCErrorKind {
     Io(std::io::Error),
     /// Errors on bad `String` to `int` conversion.
     ParseInt(std::num::ParseIntError),
+    /// Mutex poison lock error.
+    PoisonLock,
     Parser(ParserError),
     /// Channel receiver error
     ChannelErrorReceiver(async_channel::RecvError),
@@ -256,6 +276,14 @@ pub enum JDCErrorKind {
     InvalidKey,
     /// Upstream not found
     UpstreamNotFound,
+    /// Cannot determine Bitcoin data directory
+    InvalidBitcoinDataDir,
+    /// No upstream specified for pooled mining
+    NoUpstreamConfig(ConfigJDCMode),
+    /// Invalid coinbase output in config
+    InvalidCoinbaseOutput,
+    /// Cannot initialize monitoring tasks
+    MonitoringServerError(String),
 }
 
 impl std::error::Error for JDCErrorKind {}
@@ -265,22 +293,23 @@ impl fmt::Display for JDCErrorKind {
         use JDCErrorKind::*;
         match self {
             BadCliArgs => write!(f, "Bad CLI arg input"),
-            BadConfigDeserialize(ref e) => write!(f, "Bad `config` TOML deserialize: `{e:?}`"),
-            BinarySv2(ref e) => write!(f, "Binary SV2 error: `{e:?}`"),
-            CodecNoise(ref e) => write!(f, "Noise error: `{e:?}"),
-            FramingSv2(ref e) => write!(f, "Framing SV2 error: `{e:?}`"),
-            Io(ref e) => write!(f, "I/O error: `{e:?}"),
-            ParseInt(ref e) => write!(f, "Bad convert from `String` to `int`: `{e:?}`"),
-            ChannelErrorReceiver(ref e) => write!(f, "Channel receive error: `{e:?}`"),
-            Parser(ref e) => write!(f, "Parser error: `{e:?}`"),
+            BadConfigDeserialize(e) => write!(f, "Bad `config` TOML deserialize: `{e:?}`"),
+            BinarySv2(e) => write!(f, "Binary SV2 error: `{e:?}`"),
+            CodecNoise(e) => write!(f, "Noise error: `{e:?}"),
+            FramingSv2(e) => write!(f, "Framing SV2 error: `{e:?}`"),
+            Io(e) => write!(f, "I/O error: `{e:?}"),
+            ParseInt(e) => write!(f, "Bad convert from `String` to `int`: `{e:?}`"),
+            PoisonLock => write!(f, "Mutex poison lock error"),
+            ChannelErrorReceiver(e) => write!(f, "Channel receive error: `{e:?}`"),
+            Parser(e) => write!(f, "Parser error: `{e:?}`"),
             ChannelErrorSender => write!(f, "Sender error"),
-            NetworkHelpersError(ref e) => write!(f, "Network error: {e:?}"),
+            NetworkHelpersError(e) => write!(f, "Network error: {e:?}"),
             UnexpectedMessage(extension_type, message_type) => {
                 write!(f, "Unexpected Message: {extension_type} {message_type}")
             }
             InvalidUserIdentity(_) => write!(f, "User ID is invalid"),
             BitcoinEncodeError(_) => write!(f, "Error generated during encoding"),
-            InvalidSocketAddress(ref s) => write!(f, "Invalid socket address: {s}"),
+            InvalidSocketAddress(s) => write!(f, "Invalid socket address: {s}"),
             Timeout => write!(f, "Time out error"),
             LastDeclareJobNotFound(request_id) => {
                 write!(f, "last declare job not found for request id: {request_id}")
@@ -333,7 +362,7 @@ impl fmt::Display for JDCErrorKind {
             ExtranonceSizeTooSmall => {
                 write!(f, "Extranonce size too small")
             }
-            FailedToCreateGroupChannel(ref e) => {
+            FailedToCreateGroupChannel(e) => {
                 write!(f, "Failed to create group channel: {e:?}")
             }
             ExtranoncePrefixFactoryError(e) => {
@@ -367,7 +396,10 @@ impl fmt::Display for JDCErrorKind {
                 )
             }
             ServerRequiresUnsupportedExtensions(extensions) => {
-                write!(f, "Server requires extensions that the translator doesn't support: {extensions:?}")
+                write!(
+                    f,
+                    "Server requires extensions that the translator doesn't support: {extensions:?}"
+                )
             }
             BitcoinCoreSv2TDPCancellationTokenActivated => {
                 write!(f, "BitcoinCoreSv2TDP cancellation token activated")
@@ -395,6 +427,16 @@ impl fmt::Display for JDCErrorKind {
             CouldNotInitiateSystem => write!(f, "Could not initiate subsystem"),
             InvalidKey => write!(f, "Invalid key used during noise handshake"),
             UpstreamNotFound => write!(f, "Upstream not found"),
+            InvalidBitcoinDataDir => write!(
+                f,
+                "Could not determine Bitcoin data directory. Please set data_dir in config."
+            ),
+            NoUpstreamConfig(mode) => write!(
+                f,
+                "No upstreams configured for {mode:?} mode - at least one upstream is required"
+            ),
+            InvalidCoinbaseOutput => write!(f, "Invalid coinbase output in config"),
+            MonitoringServerError(e) => write!(f, "Failed to initialize monitoring tasks: `{e:?}`"),
         }
     }
 }
@@ -432,6 +474,12 @@ impl From<std::io::Error> for JDCErrorKind {
 impl From<std::num::ParseIntError> for JDCErrorKind {
     fn from(e: std::num::ParseIntError) -> Self {
         JDCErrorKind::ParseInt(e)
+    }
+}
+
+impl<T> From<PoisonError<T>> for JDCErrorKind {
+    fn from(_e: PoisonError<T>) -> Self {
+        JDCErrorKind::PoisonLock
     }
 }
 
@@ -496,6 +544,12 @@ impl From<StandardChannelError> for JDCErrorKind {
 impl From<ExtranonceAllocatorError> for JDCErrorKind {
     fn from(value: ExtranonceAllocatorError) -> Self {
         JDCErrorKind::ChannelSv2(ChannelSv2Error::ExtranonceError(value))
+    }
+}
+
+impl From<ShareValidationError> for JDCErrorKind {
+    fn from(value: ShareValidationError) -> Self {
+        JDCErrorKind::ChannelSv2(ChannelSv2Error::ShareValidationError(value))
     }
 }
 

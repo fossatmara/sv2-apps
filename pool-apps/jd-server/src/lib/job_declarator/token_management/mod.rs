@@ -19,16 +19,16 @@
 //! - Checking if a token is active.
 
 use super::{ACTIVE_TOKEN_TIMEOUT_SECS, ALLOCATED_TOKEN_TIMEOUT_SECS, JANITOR_INTERVAL_SECS};
-use bitcoin_core_sv2::job_declaration_protocol::CancellationToken;
-use dashmap::DashMap;
 use std::{
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
 use stratum_apps::{
+    bitcoin_core_sv2::CancellationToken,
+    sync::SharedMap,
     task_manager::TaskManager,
     utils::types::{DownstreamId, JdToken},
 };
@@ -48,8 +48,8 @@ pub type ActiveTokenData = (JdToken, Instant, DownstreamId);
 #[derive(Clone)]
 pub struct TokenManager {
     token_factory: Arc<AtomicU64>,
-    allocated_tokens: Arc<DashMap<JdToken, AllocatedTokenData>>,
-    active_tokens: Arc<DashMap<JdToken, ActiveTokenData>>,
+    allocated_tokens: SharedMap<JdToken, AllocatedTokenData>,
+    active_tokens: SharedMap<JdToken, ActiveTokenData>,
     cancellation_token: CancellationToken,
     task_manager: Arc<TaskManager>,
 }
@@ -63,8 +63,8 @@ impl TokenManager {
     pub fn new(cancellation_token: CancellationToken, task_manager: Arc<TaskManager>) -> Self {
         let token_manager = Self {
             token_factory: Arc::new(AtomicU64::new(0)),
-            allocated_tokens: Arc::new(DashMap::new()),
-            active_tokens: Arc::new(DashMap::new()),
+            allocated_tokens: SharedMap::new(),
+            active_tokens: SharedMap::new(),
             cancellation_token,
             task_manager,
         };
@@ -87,17 +87,25 @@ impl TokenManager {
 
     /// Checks if a token is allocated.
     pub fn is_allocated(&self, token: JdToken, downstream_id: DownstreamId) -> bool {
-        if let Some(allocation_info) = self.allocated_tokens.get(&token) {
-            allocation_info.1 == downstream_id
-        } else {
-            false
-        }
+        self.allocated_tokens
+            .with(&token, |(_, owner)| *owner == downstream_id)
+            .unwrap_or(false)
     }
 
     /// Takes an allocated token and removes it from the internal set.
     /// Creates a corresponding active token and adds it to the internal set.
-    pub fn activate(&self, allocated_token: JdToken, downstream_id: DownstreamId) -> JdToken {
-        let removed_allocated = self.allocated_tokens.remove(&allocated_token).is_some();
+    ///
+    /// Returns `Some` with the new active token if the allocated token was present
+    /// and owned by `downstream_id`. Returns `None` if the allocated token has
+    /// already been removed (e.g. by disconnect cleanup) or is owned by a
+    /// different downstream.
+    pub fn activate(
+        &self,
+        allocated_token: JdToken,
+        downstream_id: DownstreamId,
+    ) -> Option<JdToken> {
+        self.allocated_tokens
+            .remove_if(&allocated_token, |_, (_, owner)| *owner == downstream_id)?;
 
         let activated_token = self.token_factory.fetch_add(1, Ordering::Relaxed);
         self.active_tokens.insert(
@@ -110,13 +118,12 @@ impl TokenManager {
             allocated_token,
             activated_token,
             downstream_id,
-            allocated_token_was_present = removed_allocated,
             allocated_tokens_len = self.allocated_tokens.len(),
             active_tokens_len = self.active_tokens.len(),
             "TokenManager: activated token"
         );
 
-        activated_token
+        Some(activated_token)
     }
 
     /// Removes an active token from the internal set.
@@ -134,13 +141,18 @@ impl TokenManager {
         );
     }
 
-    /// Returns the allocated token that corresponds to an active token.
+    /// Returns the allocated token and owning downstream that correspond to an active token.
     /// Returns `None` if the active token is not found.
-    pub fn allocated_from_active(&self, active_token: JdToken) -> Option<JdToken> {
-        let mapped = self.active_tokens.get(&active_token).map(|entry| entry.0);
+    pub fn allocated_from_active(&self, active_token: JdToken) -> Option<(JdToken, DownstreamId)> {
+        let mapped = self
+            .active_tokens
+            .with(&active_token, |(allocated, _, downstream_id)| {
+                (*allocated, *downstream_id)
+            });
         debug!(
             active_token,
-            mapped_allocated_token = mapped,
+            mapped_allocated_token = mapped.map(|(allocated, _)| allocated),
+            mapped_downstream_id = mapped.map(|(_, downstream_id)| downstream_id),
             found = mapped.is_some(),
             active_tokens_len = self.active_tokens.len(),
             allocated_tokens_len = self.allocated_tokens.len(),
@@ -156,15 +168,15 @@ impl TokenManager {
     }
 
     /// Removes allocated tokens belonging to a given downstream.
-    ///
-    /// Active tokens are intentionally retained here and can still be consumed by
-    /// `SetCustomMiningJob` or evicted later by the janitor timeout.
+    /// Also removes active tokens that were activated by the same downstream.
     pub fn remove_downstream(&self, downstream_id: DownstreamId) {
         let allocated_tokens_before = self.allocated_tokens.len();
         let active_tokens_before = self.active_tokens.len();
 
         self.allocated_tokens
             .retain(|_, (_, owner)| *owner != downstream_id);
+        self.active_tokens
+            .retain(|_, (_, _, owner)| *owner != downstream_id);
 
         let allocated_tokens_after = self.allocated_tokens.len();
         let active_tokens_after = self.active_tokens.len();
@@ -174,19 +186,20 @@ impl TokenManager {
             downstream_id,
             removed_allocated_tokens =
                 allocated_tokens_before.saturating_sub(allocated_tokens_after),
+            removed_active_tokens = active_tokens_before.saturating_sub(active_tokens_after),
             allocated_tokens_before,
             allocated_tokens_after,
             active_tokens_before,
             active_tokens_after,
-            "TokenManager: removed downstream-allocated tokens and retained active tokens"
+            "TokenManager: removed downstream tokens"
         );
     }
 
     /// Spawns a janitor task that removes expired allocated and active tokens.
     fn spawn_janitor_task(&self) {
         let cancellation_token = self.cancellation_token.clone();
-        let allocated_tokens = Arc::clone(&self.allocated_tokens);
-        let active_tokens = Arc::clone(&self.active_tokens);
+        let allocated_tokens = self.allocated_tokens.clone();
+        let active_tokens = self.active_tokens.clone();
         let allocated_token_timeout = Duration::from_secs(ALLOCATED_TOKEN_TIMEOUT_SECS);
         let active_token_timeout = Duration::from_secs(ACTIVE_TOKEN_TIMEOUT_SECS);
         let janitor_interval = Duration::from_secs(JANITOR_INTERVAL_SECS);
@@ -197,7 +210,7 @@ impl TokenManager {
                         break;
                     }
                     _ = tokio::time::sleep(janitor_interval) => {
-                        // Avoid removing while iterating the same DashMap, which can block.
+                        // Avoid removing while iterating the same map, which can block.
                         let now = Instant::now();
 
                         let allocated_before = allocated_tokens.len();

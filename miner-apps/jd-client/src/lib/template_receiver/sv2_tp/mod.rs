@@ -11,22 +11,26 @@
 //! - Send [`CoinbaseOutputConstraints`] to the template provider
 
 use std::sync::Arc;
+use stratum_apps::stratum_core::parsers_sv2::AnyMessageOwned;
 
-use async_channel::{unbounded, Receiver, Sender};
-use bitcoin_core_sv2::template_distribution_protocol::CancellationToken;
+use async_channel::{Receiver, Sender, unbounded};
 use stratum_apps::{
+    bitcoin_core_sv2::CancellationToken,
     channel_utils::ReceiverCleanup,
     key_utils::Secp256k1PublicKey,
-    network_helpers::{self, connect_with_noise, resolve_host_port, TCP_CONNECT_TIMEOUT},
+    network_helpers::{self, TCP_CONNECT_TIMEOUT, connect_with_noise, resolve_host_port},
     stratum_core::{
+        common_messages_sv2::{
+            MESSAGE_TYPE_SETUP_CONNECTION_ERROR, MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS,
+        },
         framing_sv2,
-        handlers_sv2::HandleCommonMessagesFromServerAsync,
+        handlers_sv2::HandleCommonMessagesFromServerOwnedAsync,
         noise_sv2,
-        parsers_sv2::{AnyMessage, TemplateDistribution},
+        parsers_sv2::{TemplateDistribution, TemplateDistributionOwned},
     },
     task_manager::TaskManager,
     utils::{
-        protocol_message_type::{protocol_message_type, MessageType},
+        protocol_message_type::{MessageType, protocol_message_type},
         types::{Message, Sv2Frame},
     },
 };
@@ -50,8 +54,8 @@ mod message_handler;
 /// - `inbound_rx` → receives frames from the template provider
 #[derive(Clone)]
 pub struct Sv2TpIo {
-    channel_manager_sender: Sender<TemplateDistribution<'static>>,
-    channel_manager_receiver: Receiver<TemplateDistribution<'static>>,
+    channel_manager_sender: Sender<TemplateDistributionOwned>,
+    channel_manager_receiver: Receiver<TemplateDistributionOwned>,
     tp_sender: Sender<Sv2Frame>,
     tp_receiver: Receiver<Sv2Frame>,
 }
@@ -134,8 +138,8 @@ impl Sv2Tp {
     pub async fn new(
         tp_address: String,
         public_key: Option<Secp256k1PublicKey>,
-        channel_manager_receiver: Receiver<TemplateDistribution<'static>>,
-        channel_manager_sender: Sender<TemplateDistribution<'static>>,
+        channel_manager_receiver: Receiver<TemplateDistributionOwned>,
+        channel_manager_sender: Sender<TemplateDistributionOwned>,
         cancellation_token: CancellationToken,
         task_manager: Arc<TaskManager>,
     ) -> JDCResult<Sv2Tp, error::TemplateProvider> {
@@ -324,7 +328,7 @@ impl Sv2Tp {
             MessageType::TemplateDistribution => {
                 let message = TemplateDistribution::try_from((message_type, sv2_frame.payload()))
                     .map_err(JDCError::shutdown)?
-                    .into_static();
+                    .into_owned();
                 self.sv2_tp_io
                     .channel_manager_sender
                     .send(message)
@@ -345,7 +349,7 @@ impl Sv2Tp {
     ///
     /// Forwards outbound frames upstream
     pub async fn handle_channel_manager_message(&self) -> JDCResult<(), error::TemplateProvider> {
-        let msg = AnyMessage::TemplateDistribution(
+        let msg = AnyMessageOwned::TemplateDistribution(
             self.sv2_tp_io
                 .channel_manager_receiver
                 .recv()
@@ -399,9 +403,67 @@ impl Sv2Tp {
             msg_type = ?header.msg_type(),
             "Received upstream handshake response");
 
+        if header.ext_type() != 0
+            || !matches!(
+                header.msg_type(),
+                MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS | MESSAGE_TYPE_SETUP_CONNECTION_ERROR
+            )
+        {
+            return Err(JDCError::shutdown(JDCErrorKind::UnexpectedMessage(
+                header.ext_type(),
+                header.msg_type(),
+            )));
+        }
+
         self.handle_common_message_frame_from_server(None, header, incoming.payload())
             .await?;
         info!("Handshake with upstream completed successfully");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stratum_apps::stratum_core::{
+        common_messages_sv2::ChannelEndpointChangedOwned, parsers_sv2::CommonMessagesOwned,
+    };
+
+    #[tokio::test]
+    async fn setup_connection_rejects_channel_endpoint_changed_response() {
+        let (channel_manager_sender, _cm_rx) = unbounded();
+        let (_cm_tx, channel_manager_receiver) = unbounded();
+        let (tp_sender, _tp_outbound_rx) = unbounded();
+        let (tp_inbound_tx, tp_receiver) = unbounded();
+
+        let mut sv2_tp = Sv2Tp {
+            sv2_tp_io: Sv2TpIo {
+                channel_manager_sender,
+                channel_manager_receiver,
+                tp_sender,
+                tp_receiver,
+            },
+            tp_address: "127.0.0.1:1234".to_string(),
+        };
+
+        let response: Message = Message::Common(CommonMessagesOwned::ChannelEndpointChanged(
+            ChannelEndpointChangedOwned { channel_id: 0 },
+        ));
+        let frame: Sv2Frame = response
+            .try_into()
+            .expect("Failed to serialize ChannelEndpointChanged frame");
+        tp_inbound_tx
+            .send(frame)
+            .await
+            .expect("Failed to inject ChannelEndpointChanged response");
+
+        assert!(
+            sv2_tp
+                .setup_connection("127.0.0.1:1234".to_string())
+                .await
+                .is_err(),
+            "setup_connection must reject a handshake response other than \
+             SetupConnectionSuccess/SetupConnectionError"
+        );
     }
 }

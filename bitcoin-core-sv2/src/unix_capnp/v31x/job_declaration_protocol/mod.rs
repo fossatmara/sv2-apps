@@ -1,27 +1,33 @@
-//! Module for interacting with Bitcoin Core via Sv2 Job Declaration Protocol.
+//! Module for interacting with Bitcoin Core v31.x via Sv2 Job Declaration Protocol via capnp over
+//! UNIX socket.
 
-use crate::job_declaration_protocol::{
-    error::BitcoinCoreSv2JDPError, io::JdRequest, mempool::MempoolMirror,
+use crate::{
+    runtime_api::job_declaration_protocol::io::JdRequest,
+    unix_capnp::{
+        FORCE_UPDATE_MAX_ATTEMPTS, FORCE_UPDATE_RETRY_BACKOFF_MS,
+        v31x::job_declaration_protocol::{error::BitcoinCoreSv2JDPError, mempool::MempoolMirror},
+    },
 };
 use async_channel::Receiver;
 use bitcoin_capnp_types::{
+    capnp,
+    capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty},
     init_capnp::init::Client as InitIpcClient,
     mining_capnp::{
         block_template::Client as BlockTemplateIpcClient, mining::Client as MiningIpcClient,
     },
     proxy_capnp::{thread::Client as ThreadIpcClient, thread_map::Client as ThreadMapIpcClient},
 };
-use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
+use bitcoin_capnp_types_v31 as bitcoin_capnp_types;
 use std::{cell::RefCell, path::Path, rc::Rc};
 use stratum_core::bitcoin::{Block, consensus::deserialize};
 use tokio::net::UnixStream;
 use tokio_util::compat::*;
 pub use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{debug, error, info, warn};
 
 pub mod error;
 mod handlers;
-pub mod io;
 mod mempool;
 mod monitors;
 
@@ -30,22 +36,26 @@ mod monitors;
 /// It is instantiated with:
 /// - A `&`[`std::path::Path`] to the Bitcoin Core UNIX socket
 /// - A [`async_channel::Receiver`] for incoming [`JdRequest`] messages (handles
-///   [`DeclareMiningJob`] and [`PushSolution`] requests)
+///   [`JdRequest::DeclareMiningJob`] and [`JdRequest::PushSolution`] requests)
 /// - A [`tokio_util::sync::CancellationToken`] to stop the internally spawned tasks
 ///
 /// The instance bootstraps its internal mempool state by fetching the current block template
 /// from Bitcoin Core before accepting requests. It then spawns a background monitor task that
 /// tracks mempool changes via `waitNext` requests.
 ///
-/// Incoming [`DeclareMiningJob`] requests are validated by:
+/// Incoming [`JdRequest::DeclareMiningJob`] requests are validated by:
 /// - Verifying all transactions exist in the mempool
 /// - Assembling a test block with the declared coinbase and transactions
 /// - Using Bitcoin Core's `checkBlock` to validate block structure
 ///
-/// If transactions are missing, a [`MissingTransactions`] response is sent. If validation
-/// succeeds, a [`Success`] response with current template parameters is sent.
+/// If transactions are missing, a
+/// [`crate::runtime_api::job_declaration_protocol::io::JdResponse::MissingTransactions`] response
+/// is sent. If validation succeeds, a
+/// [`crate::runtime_api::job_declaration_protocol::io::JdResponse::Success`] response with current
+/// template parameters is sent.
 ///
-/// Incoming [`PushSolution`] requests are used to submit mining solutions to Bitcoin Core.
+/// Incoming [`JdRequest::PushSolution`] requests are used to submit mining solutions to Bitcoin
+/// Core.
 #[derive(Clone)]
 pub struct BitcoinCoreSv2JDP {
     thread_map: ThreadMapIpcClient,
@@ -129,24 +139,24 @@ impl BitcoinCoreSv2JDP {
             .get()
             .get_options()
             .map_err(|e| {
-                tracing::error!("Failed to get template IPC client request options: {e}");
+                error!("Failed to get template IPC client request options: {e}");
                 e
             })?;
         template_ipc_client_request_options.set_use_mempool(true);
 
-        tracing::debug!("Sending createNewBlock request to Bitcoin Core");
+        debug!("Sending createNewBlock request to Bitcoin Core");
         let create_new_block_promise = template_ipc_client_request.send().promise;
         // During IBD this startup call can block for a long time, so shutdown must interrupt the
         // in-flight request instead of only abandoning the outer wait loop.
         let template_ipc_client_response = tokio::select! {
             template_ipc_client_response = create_new_block_promise => {
                 template_ipc_client_response.map_err(|e| {
-                    tracing::error!("Failed to send template IPC client request: {}", e);
+                    error!("Failed to send template IPC client request: {}", e);
                     e
                 })?
             }
             _ = cancellation_token.cancelled() => {
-                tracing::debug!("Interrupting initial createNewBlock request");
+                debug!("Interrupting initial createNewBlock request");
                 Self::interrupt_create_new_block_request(&mining_ipc_client).await?;
                 return Err(capnp::Error::failed(
                     "createNewBlock request interrupted during shutdown".to_string(),
@@ -156,12 +166,12 @@ impl BitcoinCoreSv2JDP {
         };
 
         let template_ipc_client_result = template_ipc_client_response.get().map_err(|e| {
-            tracing::error!("Failed to get template IPC client result: {}", e);
+            error!("Failed to get template IPC client result: {}", e);
             e
         })?;
 
         let template_ipc_client = template_ipc_client_result.get_result().map_err(|e| {
-            tracing::error!("Failed to get template IPC client result: {}", e);
+            error!("Failed to get template IPC client result: {}", e);
             e
         })?;
 
@@ -178,17 +188,17 @@ impl BitcoinCoreSv2JDP {
         };
 
         // Bootstrap initial mempool state before signaling readiness
-        tracing::debug!("Bootstrapping initial mempool state");
+        debug!("Bootstrapping initial mempool state");
         if let Err(e) = self_.update_mempool_mirror().await {
-            tracing::error!("Failed to bootstrap mempool mirror: {:?}", e);
+            error!("Failed to bootstrap mempool mirror: {:?}", e);
             // Don't send readiness signal on failure (ready_tx dropped)
             return Err(e);
         }
-        tracing::debug!("Initial mempool state bootstrapped successfully");
+        debug!("Initial mempool state bootstrapped successfully");
 
         // Signal that we're ready to accept requests
         ready_tx.send(()).map_err(|_| {
-            tracing::error!("Ready signal receiver dropped - caller gave up waiting");
+            error!("Ready signal receiver dropped - caller gave up waiting");
             BitcoinCoreSv2JDPError::ReadinessSignalFailed
         })?;
 
@@ -199,22 +209,22 @@ impl BitcoinCoreSv2JDP {
     async fn new_thread_ipc_client(&self) -> Result<ThreadIpcClient, BitcoinCoreSv2JDPError> {
         let thread_request = self.thread_map.make_thread_request();
         let thread_response = thread_request.send().promise.await.map_err(|e| {
-            let details = format!("Failed to send make_thread request: {}", e);
-            tracing::error!("{}", details);
+            let details = format!("Failed to send make_thread request: {e}");
+            error!("{}", details);
             BitcoinCoreSv2JDPError::FailedToCreateThreadIpcClient(details)
         })?;
 
         let thread_ipc_client = thread_response
             .get()
             .map_err(|e| {
-                let details = format!("Failed to read make_thread response: {}", e);
-                tracing::error!("{}", details);
+                let details = format!("Failed to read make_thread response: {e}");
+                error!("{}", details);
                 BitcoinCoreSv2JDPError::FailedToCreateThreadIpcClient(details)
             })?
             .get_result()
             .map_err(|e| {
-                let details = format!("Failed to get thread IPC client: {}", e);
-                tracing::error!("{}", details);
+                let details = format!("Failed to get thread IPC client: {e}");
+                error!("{}", details);
                 BitcoinCoreSv2JDPError::FailedToCreateThreadIpcClient(details)
             })?;
 
@@ -227,7 +237,7 @@ impl BitcoinCoreSv2JDP {
     ) -> Result<(), BitcoinCoreSv2JDPError> {
         let interrupt_request = mining_ipc_client.interrupt_request();
         if let Err(e) = interrupt_request.send().promise.await {
-            tracing::error!("Failed to send interrupt createNewBlock request: {}", e);
+            error!("Failed to send interrupt createNewBlock request: {}", e);
             return Err(BitcoinCoreSv2JDPError::CapnpError(e));
         }
 
@@ -246,7 +256,7 @@ impl BitcoinCoreSv2JDP {
             tokio::select! {
                 // Handle shutdown
                 _ = self.cancellation_token.cancelled() => {
-                    tracing::info!("BitcoinCoreSv2JDP shutting down");
+                    info!("BitcoinCoreSv2JDP shutting down");
                     break;
                 }
 
@@ -260,7 +270,7 @@ impl BitcoinCoreSv2JDP {
                             self.process_request(request).await;
                         }
                         Err(_) => {
-                            tracing::info!("Incoming requests channel closed");
+                            info!("Incoming requests channel closed");
                             self.cancellation_token.cancel();
                             break;
                         }
@@ -270,13 +280,13 @@ impl BitcoinCoreSv2JDP {
         }
 
         // Wait for the monitor_mempool_mirror task to finish gracefully
-        tracing::debug!("Waiting for monitor_mempool_mirror() task to finish");
+        debug!("Waiting for monitor_mempool_mirror() task to finish");
         match monitor_handle.await {
             Ok(()) => {
-                tracing::debug!("monitor_mempool_mirror() task finished successfully");
+                debug!("monitor_mempool_mirror() task finished successfully");
             }
             Err(e) => {
-                tracing::error!(
+                error!(
                     "error waiting for monitor_mempool_mirror task to finish: {:?}",
                     e
                 );
@@ -302,7 +312,7 @@ impl BitcoinCoreSv2JDP {
             .get()?
             .get_result()?
             .to_vec();
-        tracing::debug!("Deserializing block ({} bytes)", block_bytes.len());
+        debug!("Deserializing block ({} bytes)", block_bytes.len());
         let block: Block =
             deserialize(&block_bytes).map_err(BitcoinCoreSv2JDPError::FailedToDeserializeBlock)?;
 
@@ -322,12 +332,9 @@ impl BitcoinCoreSv2JDP {
     /// On transient `"thread busy"` IPC contention, this method retries a few times with
     /// a short backoff before returning the error.
     pub(crate) async fn force_update_mempool_mirror(&self) -> Result<(), BitcoinCoreSv2JDPError> {
-        const MAX_ATTEMPTS: usize = 3;
-        const RETRY_BACKOFF_MS: u64 = 25;
-
         let mut last_error: Option<BitcoinCoreSv2JDPError> = None;
 
-        for attempt in 1..=MAX_ATTEMPTS {
+        for attempt in 1..=FORCE_UPDATE_MAX_ATTEMPTS {
             let result = async {
                 let mut create_new_block_request =
                     self.mining_ipc_client.create_new_block_request();
@@ -336,14 +343,14 @@ impl BitcoinCoreSv2JDP {
                     .get()
                     .get_context()
                     .map_err(|e| {
-                        tracing::error!("Failed to get template IPC client request context: {e}");
+                        error!("Failed to get template IPC client request context: {e}");
                         e
                     })?
                     .set_thread(self.thread_ipc_client.clone());
 
                 let mut create_new_block_options =
                     create_new_block_request.get().get_options().map_err(|e| {
-                        tracing::error!("Failed to get createNewBlock options: {e}");
+                        error!("Failed to get createNewBlock options: {e}");
                         e
                     })?;
 
@@ -351,19 +358,19 @@ impl BitcoinCoreSv2JDP {
 
                 let create_new_block_response =
                     create_new_block_request.send().promise.await.map_err(|e| {
-                        tracing::error!("Failed to send createNewBlock request: {e}");
+                        error!("Failed to send createNewBlock request: {e}");
                         e
                     })?;
 
                 let new_template_ipc_client = create_new_block_response
                     .get()
                     .map_err(|e| {
-                        tracing::error!("Failed to read createNewBlock response: {e}");
+                        error!("Failed to read createNewBlock response: {e}");
                         e
                     })?
                     .get_result()
                     .map_err(|e| {
-                        tracing::error!("Failed to get BlockTemplate from createNewBlock: {e}");
+                        error!("Failed to get BlockTemplate from createNewBlock: {e}");
                         e
                     })?;
 
@@ -379,15 +386,18 @@ impl BitcoinCoreSv2JDP {
 
             match result {
                 Ok(()) => return Ok(()),
-                Err(e) if e.is_thread_busy() && attempt < MAX_ATTEMPTS => {
-                    tracing::warn!(
+                Err(e) if e.is_thread_busy() && attempt < FORCE_UPDATE_MAX_ATTEMPTS => {
+                    warn!(
                         error = ?e,
                         attempt,
-                        max_attempts = MAX_ATTEMPTS,
+                        max_attempts = FORCE_UPDATE_MAX_ATTEMPTS,
                         "Transient IPC contention during force_update_mempool_mirror (thread busy); retrying"
                     );
                     last_error = Some(e);
-                    tokio::time::sleep(std::time::Duration::from_millis(RETRY_BACKOFF_MS)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        FORCE_UPDATE_RETRY_BACKOFF_MS,
+                    ))
+                    .await;
                 }
                 Err(e) => return Err(e),
             }
@@ -437,7 +447,7 @@ impl BitcoinCoreSv2JDP {
 
         let interrupt_wait_request = template_ipc_client.interrupt_wait_request();
         if let Err(e) = interrupt_wait_request.send().promise.await {
-            tracing::error!("Failed to send interrupt wait request: {}", e);
+            error!("Failed to send interrupt wait request: {}", e);
             return Err(BitcoinCoreSv2JDPError::CapnpError(e));
         }
 

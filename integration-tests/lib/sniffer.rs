@@ -3,15 +3,15 @@ use crate::{
     message_aggregator::MessagesAggregator,
     types::MsgType,
     utils::{
-        create_downstream, create_upstream, recv_from_down_send_to_up, recv_from_up_send_to_down,
-        wait_for_client,
+        CONNECT_RETRY_INTERVAL, POLL_INTERVAL, create_downstream, create_upstream,
+        recv_from_down_send_to_up, recv_from_up_send_to_down, wait_for_client,
     },
 };
 use std::{
     net::SocketAddr,
     sync::{Arc, Mutex},
 };
-use stratum_apps::stratum_core::parsers_sv2::{message_type_to_name, AnyMessage};
+use stratum_apps::stratum_core::parsers_sv2::{AnyMessageOwned, message_type_to_name};
 use tokio::{net::TcpStream, select};
 
 const DEFAULT_TIMEOUT: u64 = 60;
@@ -96,18 +96,18 @@ impl<'a> Sniffer<'a> {
                     Ok(stream) => break stream,
                     Err(_) => {
                         tracing::warn!(
-                            "Sniffer {}: unable to connect to upstream {}, retrying after 1 second",
+                            "Sniffer {}: unable to connect to upstream {}, retrying in {:?}",
                             identifier,
-                            upstream_address
+                            upstream_address,
+                            CONNECT_RETRY_INTERVAL
                         );
-                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                        tokio::time::sleep(CONNECT_RETRY_INTERVAL).await;
                     }
                 }
             })
             .await
             .expect("Failed to create upstream");
             select! {
-                _ = tokio::signal::ctrl_c() => { },
                 _ = recv_from_down_send_to_up(downstream_receiver, upstream_sender, messages_from_downstream, action.clone(), &identifier, negotiated_extensions.clone()) => { },
                 _ = recv_from_up_send_to_down(upstream_receiver, downstream_sender, messages_from_upstream, action, &identifier, negotiated_extensions.clone()) => { },
             };
@@ -121,7 +121,7 @@ impl<'a> Sniffer<'a> {
     /// This can be used to assert that the downstream sent:
     /// - specific message types
     /// - specific message fields
-    pub fn next_message_from_downstream(&self) -> Option<(MsgType, AnyMessage<'static>)> {
+    pub fn next_message_from_downstream(&self) -> Option<(MsgType, AnyMessageOwned)> {
         self.messages_from_downstream.next_message()
     }
 
@@ -132,7 +132,7 @@ impl<'a> Sniffer<'a> {
         &self,
     ) -> Option<(
         MsgType,
-        AnyMessage<'static>,
+        AnyMessageOwned,
         Option<Vec<stratum_apps::stratum_core::parsers_sv2::Tlv>>,
     )> {
         self.messages_from_downstream.next_message_with_tlvs()
@@ -145,7 +145,7 @@ impl<'a> Sniffer<'a> {
     /// This can be used to assert that the upstream sent:
     /// - specific message types
     /// - specific message fields
-    pub fn next_message_from_upstream(&self) -> Option<(MsgType, AnyMessage<'static>)> {
+    pub fn next_message_from_upstream(&self) -> Option<(MsgType, AnyMessageOwned)> {
         self.messages_from_upstream.next_message()
     }
 
@@ -156,7 +156,7 @@ impl<'a> Sniffer<'a> {
         &self,
     ) -> Option<(
         MsgType,
-        AnyMessage<'static>,
+        AnyMessageOwned,
         Option<Vec<stratum_apps::stratum_core::parsers_sv2::Tlv>>,
     )> {
         self.messages_from_upstream.next_message_with_tlvs()
@@ -194,8 +194,7 @@ impl<'a> Sniffer<'a> {
                 );
             }
 
-            // sleep to reduce async lock contention
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            tokio::time::sleep(POLL_INTERVAL).await;
         }
     }
 
@@ -258,8 +257,7 @@ impl<'a> Sniffer<'a> {
                 );
             }
 
-            // sleep to reduce async lock contention
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            tokio::time::sleep(POLL_INTERVAL).await;
         }
     }
 
@@ -293,19 +291,19 @@ impl<'a> Sniffer<'a> {
 // This macro can be called in two ways:
 // 1. If you want to assert the message without any of its properties, you can invoke the macro
 //   with the message group, the nested message group, the message, and the expected message:
-//   `assert_message!(TemplateDistribution, TemplateDistribution, $msg,
+//   `assert_message!(TemplateDistribution, TemplateDistributionOwned, $msg,
 // $expected_message_variant);`.
 //
 // 2. If you want to assert the message with its properties, you can invoke the macro with the
 //  message group, the nested message group, the message, the expected message, and the expected
 //  properties and values:
-//  `assert_message!(TemplateDistribution, TemplateDistribution, $msg, $expected_message_variant,
-//  $expected_property, $expected_property_value, ...);`.
+//  `assert_message!(TemplateDistribution, TemplateDistributionOwned, $msg,
+// $expected_message_variant,  $expected_property, $expected_property_value, ...);`.
 //  Note that you can provide any number of properties and values.
 //
-//  In both cases, the `$message_group` could be any variant of `AnyMessage::$message_group` and
-//  the `$nested_message_group` could be any variant of
-//  `AnyMessage::$message_group($nested_message_group)`.
+//  In both cases, the `$message_group` could be any variant of `AnyMessageOwned::$message_group`
+// and  the `$nested_message_group` could be any variant of
+//  `AnyMessageOwned::$message_group($nested_message_group)`.
 //
 //  If you dont want to provide the `$message_group` and `$nested_message_group` arguments, you can
 //  utilize `assert_common_message!`, `assert_tp_message!`, `assert_mining_message!`, and
@@ -317,15 +315,11 @@ macro_rules! assert_message {
   ($message_group:ident, $nested_message_group:ident, $msg:expr, $expected_message_variant:ident,
    $($expected_property:ident, $expected_property_value:expr),*) => { match $msg {
 	  Some((_, message)) => {
+		use stratum_apps::stratum_core::parsers_sv2::{AnyMessageOwned, $nested_message_group};
 		match message {
-		  AnyMessage::$message_group($nested_message_group::$expected_message_variant(
-			  $expected_message_variant {
-				$($expected_property,)*
-				  ..
-			  },
-		  )) => {
+		  AnyMessageOwned::$message_group($nested_message_group::$expected_message_variant(message_payload)) => {
 			$(
-			  assert_eq!($expected_property.clone(), $expected_property_value);
+			  assert_eq!(message_payload.$expected_property.clone(), $expected_property_value);
 			)*
 		  }
 		  _ => {
@@ -342,8 +336,9 @@ macro_rules! assert_message {
   ($message_group:ident, $nested_message_group:ident, $msg:expr, $expected_message_variant:ident) => {
 	match $msg {
 	  Some((_, message)) => {
+		use stratum_apps::stratum_core::parsers_sv2::{AnyMessageOwned, $nested_message_group};
 		match message {
-		  AnyMessage::$message_group($nested_message_group::$expected_message_variant(_)) => {}
+		  AnyMessageOwned::$message_group($nested_message_group::$expected_message_variant(_)) => {}
 		  _ => {
 			panic!(
 			  "Sent wrong message: {:?}",
@@ -361,10 +356,10 @@ macro_rules! assert_message {
 #[macro_export]
 macro_rules! assert_common_message {
   ($msg:expr, $expected_message_variant:ident, $($expected_property:ident, $expected_property_value:expr),*) => {
-	assert_message!(Common, CommonMessages, $msg, $expected_message_variant, $($expected_property, $expected_property_value),*);
+	assert_message!(Common, CommonMessagesOwned, $msg, $expected_message_variant, $($expected_property, $expected_property_value),*);
   };
   ($msg:expr, $expected_message_variant:ident) => {
-	assert_message!(Common, CommonMessages, $msg, $expected_message_variant);
+	assert_message!(Common, CommonMessagesOwned, $msg, $expected_message_variant);
   };
 }
 
@@ -373,10 +368,10 @@ macro_rules! assert_common_message {
 #[macro_export]
 macro_rules! assert_tp_message {
   ($msg:expr, $expected_message_variant:ident, $($expected_property:ident, $expected_property_value:expr),*) => {
-	assert_message!(TemplateDistribution, TemplateDistribution, $msg, $expected_message_variant, $($expected_property, $expected_property_value),*);
+	assert_message!(TemplateDistribution, TemplateDistributionOwned, $msg, $expected_message_variant, $($expected_property, $expected_property_value),*);
   };
   ($msg:expr, $expected_message_variant:ident) => {
-	assert_message!(TemplateDistribution, TemplateDistribution, $msg, $expected_message_variant);
+	assert_message!(TemplateDistribution, TemplateDistributionOwned, $msg, $expected_message_variant);
   };
 }
 
@@ -384,10 +379,10 @@ macro_rules! assert_tp_message {
 #[macro_export]
 macro_rules! assert_mining_message {
   ($msg:expr, $expected_message_variant:ident, $($expected_property:ident, $expected_property_value:expr),*) => {
-	assert_message!(Mining, Mining, $msg, $expected_message_variant, $($expected_property, $expected_property_value),*);
+	assert_message!(Mining, MiningOwned, $msg, $expected_message_variant, $($expected_property, $expected_property_value),*);
   };
   ($msg:expr, $expected_message_variant:ident) => {
-	assert_message!(Mining, Mining, $msg, $expected_message_variant);
+	assert_message!(Mining, MiningOwned, $msg, $expected_message_variant);
   };
 }
 
@@ -396,10 +391,10 @@ macro_rules! assert_mining_message {
 #[macro_export]
 macro_rules! assert_jd_message {
   ($msg:expr, $expected_message_variant:ident, $($expected_property:ident, $expected_property_value:expr),*) => {
-	assert_message!(JobDeclaration, JobDeclaration, $msg, $expected_message_variant, $($expected_property, $expected_property_value),*);
+	assert_message!(JobDeclaration, JobDeclarationOwned, $msg, $expected_message_variant, $($expected_property, $expected_property_value),*);
   };
   ($msg:expr, $expected_message_variant:ident) => {
-	assert_message!(JobDeclaration, JobDeclaration, $msg, $expected_message_variant);
+	assert_message!(JobDeclaration, JobDeclarationOwned, $msg, $expected_message_variant);
   };
 }
 

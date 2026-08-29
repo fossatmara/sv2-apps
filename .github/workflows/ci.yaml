@@ -15,6 +15,8 @@ jobs:
   clippy:
     name: Clippy Check
     runs-on: ubuntu-latest
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -23,15 +25,22 @@ jobs:
         run: sudo apt-get install -y capnproto libcapnp-dev
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.85
+        uses: dtolnay/rust-toolchain@1.88
         with:
           components: clippy
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: "false"
+          # Hash every Cargo workspace without registering the shared target more than once.
+          key: cargo-inputs-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
+          workspaces: integration-tests -> ../target
 
       - name: Clippy check
         run: |
           cargo clippy --manifest-path=stratum-apps/Cargo.toml --all-features -- -D warnings
           cargo clippy --manifest-path=pool-apps/Cargo.toml -- -D warnings
-          cargo clippy --manifest-path=pool-apps/jd-server/Cargo.toml -- -D warnings
           cargo clippy --manifest-path=miner-apps/Cargo.toml -- -D warnings
           cargo clippy --manifest-path=integration-tests/Cargo.toml -- -D warnings
           cargo clippy --manifest-path=bitcoin-core-sv2/Cargo.toml -- -D warnings
@@ -55,7 +64,6 @@ jobs:
         run: |
           cargo fmt --all --manifest-path=stratum-apps/Cargo.toml -- --check
           cargo fmt --all --manifest-path=pool-apps/Cargo.toml -- --check
-          cargo fmt --all --manifest-path=pool-apps/jd-server/Cargo.toml -- --check
           cargo fmt --all --manifest-path=miner-apps/Cargo.toml -- --check
           cargo fmt --all --manifest-path=integration-tests/Cargo.toml -- --check 
           cargo fmt --all --manifest-path=bitcoin-core-sv2/Cargo.toml -- --check

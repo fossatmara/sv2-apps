@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
 
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 
 type SharedLockResult<'a, T, R> = Result<R, PoisonError<MutexGuard<'a, T>>>;
 type SharedRwReadResult<'a, T, R> = Result<R, PoisonError<RwLockReadGuard<'a, T>>>;
@@ -108,6 +108,7 @@ impl<T> SharedRw<T> {
 }
 
 /// Concurrent map wrapper over `DashMap` providing ergonomic scoped access.
+#[derive(Debug)]
 pub struct SharedMap<K: Eq + Clone + Hash, V>(Arc<DashMap<K, V>>);
 
 impl<K: Eq + Clone + Hash, V> Clone for SharedMap<K, V> {
@@ -120,6 +121,19 @@ impl<K: Eq + Hash + Clone, V> SharedMap<K, V> {
     /// Create a new concurrent map.
     pub fn new() -> Self {
         SharedMap(Arc::new(DashMap::new()))
+    }
+
+    /// Get an owned clone of a value.
+    ///
+    /// This releases the map entry guard immediately, so the entry may be removed
+    /// or replaced while the caller is still using the clone. Use this only when
+    /// stale clones are acceptable. Prefer [`Self::with`] or [`Self::with_mut`]
+    /// when later work depends on the entry still being present.
+    pub fn get_cloned(&self, key: &K) -> Option<V>
+    where
+        V: Clone,
+    {
+        self.0.get(key).map(|refc| refc.value().clone())
     }
 
     /// Read a value for a key using a closure.
@@ -147,6 +161,25 @@ impl<K: Eq + Hash + Clone, V> SharedMap<K, V> {
         let mut guard = self.0.get_mut(key)?;
         let result = f(guard.value_mut());
         Some(result)
+    }
+
+    /// Mutate an entry, inserting a value produced by `default` when absent.
+    pub fn with_mut_or_insert_with<F, D, R>(&self, key: K, default: D, f: F) -> R
+    where
+        F: FnOnce(&mut V) -> R,
+        D: FnOnce() -> V,
+    {
+        let mut entry = self.0.entry(key).or_insert_with(default);
+        f(entry.value_mut())
+    }
+
+    /// Mutate an entry, inserting its default value when absent.
+    pub fn with_mut_or_default<F, R>(&self, key: K, f: F) -> R
+    where
+        V: Default,
+        F: FnOnce(&mut V) -> R,
+    {
+        self.with_mut_or_insert_with(key, V::default, f)
     }
 
     /// Iterate over all entries immutably.
@@ -193,9 +226,9 @@ impl<K: Eq + Hash + Clone, V> SharedMap<K, V> {
     ///
     /// Caution: `f` runs while an iterator entry guard is held. Avoid
     /// re-entering this `SharedMap` from inside the closure.
-    pub fn try_for_each<F, E>(&self, f: F) -> Result<(), E>
+    pub fn try_for_each<F, E>(&self, mut f: F) -> Result<(), E>
     where
-        F: Fn(K, &V) -> Result<(), E>,
+        F: FnMut(K, &V) -> Result<(), E>,
     {
         for entry in self.0.iter() {
             f(entry.key().clone(), entry.value())?;
@@ -211,6 +244,17 @@ impl<K: Eq + Hash + Clone, V> SharedMap<K, V> {
     /// Remove a key.
     pub fn remove(&self, key: &K) -> Option<(K, V)> {
         self.0.remove(key)
+    }
+
+    /// Remove a key only when the predicate matches the current entry.
+    ///
+    /// Caution: `f` runs while `DashMap` is mutating internal shards. Avoid
+    /// re-entering this `SharedMap` from inside the predicate.
+    pub fn remove_if<F>(&self, key: &K, f: F) -> Option<(K, V)>
+    where
+        F: FnOnce(&K, &V) -> bool,
+    {
+        self.0.remove_if(key, f)
     }
 
     /// Check if a key exists.
@@ -246,9 +290,145 @@ impl<K: Eq + Hash + Clone, V> SharedMap<K, V> {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+
+    /// Clears the collection.
+    pub fn clear(&self) {
+        self.0.clear()
+    }
 }
 
 impl<K: Eq + Hash + Clone, V> Default for SharedMap<K, V> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Concurrent set wrapper over `DashSet` providing ergonomic scoped access.
+#[derive(Debug)]
+pub struct SharedSet<K: Eq + Clone + Hash>(Arc<DashSet<K>>);
+
+impl<K: Eq + Clone + Hash> Clone for SharedSet<K> {
+    fn clone(&self) -> Self {
+        SharedSet(Arc::clone(&self.0))
+    }
+}
+
+impl<K: Eq + Hash + Clone> SharedSet<K> {
+    /// Create a new concurrent set.
+    pub fn new() -> Self {
+        SharedSet(Arc::new(DashSet::new()))
+    }
+
+    /// Get an owned clone of an item.
+    ///
+    /// This releases the set entry guard immediately, so the entry may be removed
+    /// while the caller is still using the clone. Use this only when stale clones
+    /// are acceptable. Prefer [`Self::with`] when later work depends on the entry
+    /// still being present.
+    pub fn get_cloned(&self, key: &K) -> Option<K> {
+        self.0.get(key).map(|item| (*item).clone())
+    }
+
+    /// Read an item using a closure.
+    ///
+    /// Caution: `f` runs while the entry guard is held. Avoid re-entering this
+    /// `SharedSet` from inside the closure.
+    pub fn with<F, R>(&self, key: &K, f: F) -> Option<R>
+    where
+        F: FnOnce(&K) -> R,
+    {
+        let guard = self.0.get(key)?;
+        let result = f(guard.key());
+        drop(guard);
+        Some(result)
+    }
+
+    /// Insert a key, returning `true` if the key was not already present.
+    pub fn insert(&self, key: K) -> bool {
+        self.0.insert(key)
+    }
+
+    /// Remove a key, returning it if present.
+    pub fn remove(&self, key: &K) -> Option<K> {
+        self.0.remove(key)
+    }
+
+    /// Remove a key if the predicate returns `true`, returning it if present.
+    ///
+    /// Caution: `f` runs while `DashSet` is mutating internal shards. Avoid
+    /// re-entering this `SharedSet` from inside the predicate.
+    pub fn remove_if<F>(&self, key: &K, f: F) -> Option<K>
+    where
+        F: FnOnce(&K) -> bool,
+    {
+        self.0.remove_if(key, f)
+    }
+
+    /// Check if a key exists.
+    pub fn contains(&self, key: &K) -> bool {
+        self.0.contains(key)
+    }
+
+    /// Iterate over all entries immutably.
+    ///
+    /// Caution: `f` runs while an iterator entry guard is held. Avoid
+    /// re-entering this `SharedSet` from inside the closure.
+    pub fn for_each<F, Ret>(&self, mut f: F)
+    where
+        F: FnMut(&K) -> Ret,
+    {
+        for entry in self.0.iter() {
+            f(entry.key());
+        }
+    }
+
+    /// Fallible iteration over all entries.
+    ///
+    /// Caution: `f` runs while an iterator entry guard is held. Avoid
+    /// re-entering this `SharedSet` from inside the closure.
+    pub fn try_for_each<F, E>(&self, mut f: F) -> Result<(), E>
+    where
+        F: FnMut(&K) -> Result<(), E>,
+    {
+        for entry in self.0.iter() {
+            f(entry.key())?;
+        }
+        Ok(())
+    }
+
+    /// Retain entries matching predicate.
+    ///
+    /// Caution: `f` runs while `DashSet` is mutating internal shards. Avoid
+    /// re-entering this `SharedSet` from inside the predicate.
+    pub fn retain<F>(&self, f: F)
+    where
+        F: FnMut(&K) -> bool,
+    {
+        self.0.retain(f);
+    }
+
+    /// Collect all items.
+    pub fn items(&self) -> Vec<K> {
+        self.0.iter().map(|entry| entry.key().clone()).collect()
+    }
+
+    /// Number of entries.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Check if empty.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Clears the collection.
+    pub fn clear(&self) {
+        self.0.clear()
+    }
+}
+
+impl<K: Eq + Hash + Clone> Default for SharedSet<K> {
     fn default() -> Self {
         Self::new()
     }
@@ -294,11 +474,51 @@ mod tests {
         map.with_mut(&"a", |v| *v += 10);
         assert_eq!(map.with(&"a", |v| *v).unwrap(), 11);
 
+        map.with_mut_or_default("c", |v| *v += 3);
+        assert_eq!(map.get_cloned(&"c"), Some(3));
+
         let mut sum = 0;
         map.for_each(|_, v| sum += v);
-        assert_eq!(sum, 13);
+        assert_eq!(sum, 16);
 
         map.remove(&"a");
         assert!(!map.contains_key(&"a"));
+    }
+
+    #[test]
+    fn shared_set_usage() {
+        let set = SharedSet::new();
+
+        assert!(set.insert("a"));
+        assert!(!set.insert("a"));
+        assert!(set.contains(&"a"));
+        assert_eq!(set.get_cloned(&"a"), Some("a"));
+        assert_eq!(set.with(&"a", |item| item.len()), Some(1));
+
+        assert_eq!(set.remove_if(&"a", |item| item.starts_with("z")), None);
+        assert!(set.contains(&"a"));
+        assert_eq!(set.remove_if(&"a", |item| item.starts_with("a")), Some("a"));
+        assert!(!set.contains(&"a"));
+
+        set.insert("a");
+        set.insert("b");
+        let mut items = set.items();
+        items.sort();
+        assert_eq!(items, vec!["a", "b"]);
+
+        let mut iterated = Vec::new();
+        set.for_each(|item| iterated.push(item.to_string()));
+        iterated.sort();
+        assert_eq!(iterated, vec!["a".to_string(), "b".to_string()]);
+
+        let result: Result<(), ()> =
+            set.try_for_each(|item| if *item == "b" { Err(()) } else { Ok(()) });
+        assert!(result.is_err());
+
+        set.retain(|item| *item != "a");
+        assert_eq!(set.items(), vec!["b"]);
+
+        set.clear();
+        assert!(set.is_empty());
     }
 }

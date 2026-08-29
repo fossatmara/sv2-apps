@@ -13,12 +13,15 @@ use std::time::Duration;
 use crate::network_helpers::Error;
 use stratum_core::{
     binary_sv2::{Deserialize, GetSize, Serialize},
-    codec_sv2::{HandshakeRole, NoiseEncoder, StandardNoiseDecoder, State},
+    codec_sv2::{
+        HandshakeRole, NoiseEncoder, StandardNoiseDecoder, State, TransportDecryptState,
+        TransportEncryptState,
+    },
     noise_sv2::INITIATOR_EXPECTED_HANDSHAKE_MESSAGE_SIZE,
 };
 use tokio::net::{
-    tcp::{OwnedReadHalf, OwnedWriteHalf},
     TcpStream,
+    tcp::{OwnedReadHalf, OwnedWriteHalf},
 };
 
 use stratum_core::{
@@ -38,7 +41,9 @@ use tracing::{debug, error};
 /// If `read_frame()` or `write_frame()` is canceled mid-way,
 /// internal state may be left in an inconsistent state, which can lead to
 /// protocol errors or dropped frames.
-pub struct NoiseTcpStream<Message: Serialize + Deserialize<'static> + GetSize + Send + 'static> {
+pub struct NoiseTcpStream<
+    Message: Serialize + for<'decoder> Deserialize<'decoder> + GetSize + Send + 'static,
+> {
     reader: NoiseTcpReadHalf<Message>,
     writer: NoiseTcpWriteHalf<Message>,
 }
@@ -47,10 +52,12 @@ pub struct NoiseTcpStream<Message: Serialize + Deserialize<'static> + GetSize + 
 ///
 /// It buffers incoming encrypted bytes, attempts to decode full Noise frames,
 /// and exposes a method to retrieve structured messages of type `Message`.
-pub struct NoiseTcpReadHalf<Message: Serialize + Deserialize<'static> + GetSize + Send + 'static> {
+pub struct NoiseTcpReadHalf<
+    Message: Serialize + for<'decoder> Deserialize<'decoder> + GetSize + Send + 'static,
+> {
     reader: OwnedReadHalf,
     decoder: StandardNoiseDecoder<Message>,
-    state: State,
+    state: TransportDecryptState,
     current_frame_buf: Vec<u8>,
     bytes_read: usize,
 }
@@ -59,23 +66,26 @@ pub struct NoiseTcpReadHalf<Message: Serialize + Deserialize<'static> + GetSize 
 ///
 /// It accepts structured messages, encodes them via the Noise protocol,
 /// and writes the result to the socket.
-pub struct NoiseTcpWriteHalf<Message: Serialize + Deserialize<'static> + GetSize + Send + 'static> {
+pub struct NoiseTcpWriteHalf<
+    Message: Serialize + for<'decoder> Deserialize<'decoder> + GetSize + Send + 'static,
+> {
     writer: OwnedWriteHalf,
     encoder: NoiseEncoder<Message>,
-    state: State,
+    state: TransportEncryptState,
 }
 
 impl<Message> NoiseTcpStream<Message>
 where
-    Message: Serialize + Deserialize<'static> + GetSize + Send + 'static,
+    Message: Serialize + for<'decoder> Deserialize<'decoder> + GetSize + Send + 'static,
 {
     /// Constructs a new `NoiseTcpStream` over the given TCP stream,
     /// performing the Noise handshake in the given `role`.
     ///
     /// On success, returns a stream with encrypted communication channels.
     ///
-    /// `timeout` applies to each individual handshake read. Prefer [`super::connect`] or
-    /// [`super::accept`]. For typical use. They apply a sensible default timeout automatically.
+    /// `timeout` applies to each individual handshake read. Prefer [`super::connect_with_noise`] or
+    /// [`super::accept_noise_connection`]. For typical use. They apply a sensible default timeout
+    /// automatically.
     pub async fn new(
         stream: TcpStream,
         role: HandshakeRole,
@@ -85,89 +95,84 @@ where
 
         let mut decoder = StandardNoiseDecoder::<Message>::new();
         let mut encoder = NoiseEncoder::<Message>::new();
-        let mut state = State::initialized(role.clone());
+        let mut peer_state = State::not_initialized(&role);
+        let is_initiator = matches!(role, HandshakeRole::Initiator(_));
+        let mut state = State::initialized(role);
 
-        match role {
-            HandshakeRole::Initiator(_) => {
-                let mut responder_state = State::not_initialized(&role);
-                let first_msg = state.step_0()?;
-                send_message(&mut writer, first_msg.into(), &mut state, &mut encoder).await?;
-                debug!("First handshake message sent");
+        if is_initiator {
+            let first_msg = state.step_0()?;
+            send_message(&mut writer, first_msg.into(), &mut state, &mut encoder).await?;
+            debug!("First handshake message sent");
 
-                loop {
-                    match receive_message(&mut reader, &mut responder_state, &mut decoder, timeout)
-                        .await
-                    {
-                        Ok(second_msg) => {
-                            debug!("Second handshake message received");
-                            let handshake_frame: HandShakeFrame = second_msg
-                                .try_into()
-                                .map_err(|_| Error::HandshakeRemoteInvalidMessage)?;
-                            let payload: [u8; INITIATOR_EXPECTED_HANDSHAKE_MESSAGE_SIZE] =
-                                handshake_frame
-                                    .get_payload_when_handshaking()
-                                    .try_into()
-                                    .map_err(|_| Error::HandshakeRemoteInvalidMessage)?;
-                            let transport_state = state.step_2(payload)?;
-                            state = transport_state;
-                            break;
-                        }
-                        Err(Error::CodecError(stratum_core::codec_sv2::Error::MissingBytes(_))) => {
-                            debug!("Waiting for more bytes during handshake");
-                        }
-                        Err(e) => {
-                            error!("Handshake failed with upstream: {:?}", e);
-                            return Err(e);
-                        }
-                    }
-                }
-            }
-            HandshakeRole::Responder(_) => {
-                let mut initiator_state = State::not_initialized(&role);
-
-                loop {
-                    match receive_message(&mut reader, &mut initiator_state, &mut decoder, timeout)
-                        .await
-                    {
-                        Ok(first_msg) => {
-                            debug!("First handshake message received");
-                            let handshake_frame: HandShakeFrame = first_msg
-                                .try_into()
-                                .map_err(|_| Error::HandshakeRemoteInvalidMessage)?;
-                            let payload: [u8; ELLSWIFT_ENCODING_SIZE] = handshake_frame
+            loop {
+                match receive_message(&mut reader, &mut peer_state, &mut decoder, timeout).await {
+                    Ok(second_msg) => {
+                        debug!("Second handshake message received");
+                        let handshake_frame: HandShakeFrame = second_msg
+                            .try_into()
+                            .map_err(|_| Error::HandshakeRemoteInvalidMessage)?;
+                        let payload: [u8; INITIATOR_EXPECTED_HANDSHAKE_MESSAGE_SIZE] =
+                            handshake_frame
                                 .get_payload_when_handshaking()
                                 .try_into()
                                 .map_err(|_| Error::HandshakeRemoteInvalidMessage)?;
-                            let (second_msg, transport_state) = state.step_1(payload)?;
-                            send_message(&mut writer, second_msg.into(), &mut state, &mut encoder)
-                                .await?;
-                            debug!("Second handshake message sent");
-                            state = transport_state;
-                            break;
-                        }
-                        Err(Error::CodecError(stratum_core::codec_sv2::Error::MissingBytes(_))) => {
-                            debug!("Waiting for more bytes during handshake");
-                        }
-                        Err(e) => {
-                            error!("Handshake failed with downstream: {:?}", e);
-                            return Err(e);
-                        }
+                        let transport_state = state.step_2(payload)?;
+                        state = transport_state;
+                        break;
+                    }
+                    Err(Error::CodecError(stratum_core::codec_sv2::Error::MissingBytes(_))) => {
+                        debug!("Waiting for more bytes during handshake");
+                    }
+                    Err(e) => {
+                        error!("Handshake failed with upstream: {:?}", e);
+                        return Err(e);
                     }
                 }
             }
-        };
+        } else {
+            loop {
+                match receive_message(&mut reader, &mut peer_state, &mut decoder, timeout).await {
+                    Ok(first_msg) => {
+                        debug!("First handshake message received");
+                        let handshake_frame: HandShakeFrame = first_msg
+                            .try_into()
+                            .map_err(|_| Error::HandshakeRemoteInvalidMessage)?;
+                        let payload: [u8; ELLSWIFT_ENCODING_SIZE] = handshake_frame
+                            .get_payload_when_handshaking()
+                            .try_into()
+                            .map_err(|_| Error::HandshakeRemoteInvalidMessage)?;
+                        let (second_msg, transport_state) = state.step_1(payload)?;
+                        send_message(&mut writer, second_msg.into(), &mut state, &mut encoder)
+                            .await?;
+                        debug!("Second handshake message sent");
+                        state = transport_state;
+                        break;
+                    }
+                    Err(Error::CodecError(stratum_core::codec_sv2::Error::MissingBytes(_))) => {
+                        debug!("Waiting for more bytes during handshake");
+                    }
+                    Err(e) => {
+                        error!("Handshake failed with downstream: {:?}", e);
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        // Give each half only the direction it uses: the writer encrypts, the reader decrypts.
+        let (encrypt_state, decrypt_state) = state.split_transport()?;
+
         Ok(Self {
             reader: NoiseTcpReadHalf {
                 reader,
                 decoder,
-                state: state.clone(),
+                state: decrypt_state,
                 current_frame_buf: vec![],
                 bytes_read: 0,
             },
             writer: NoiseTcpWriteHalf {
                 writer,
                 encoder,
-                state,
+                state: encrypt_state,
             },
         })
     }
@@ -180,7 +185,7 @@ where
 
 impl<Message> NoiseTcpWriteHalf<Message>
 where
-    Message: Serialize + Deserialize<'static> + GetSize + Send + 'static,
+    Message: Serialize + for<'decoder> Deserialize<'decoder> + GetSize + Send + 'static,
 {
     /// Encrypts and writes a full message frame to the socket.
     ///
@@ -188,7 +193,7 @@ where
     ///
     /// Not cancellation-safe: A canceled write may cause partial writes or state corruption.
     pub async fn write_frame(&mut self, frame: StandardEitherFrame<Message>) -> Result<(), Error> {
-        let buf = self.encoder.encode(frame, &mut self.state)?;
+        let buf = self.encoder.encode_transport(frame, &mut self.state)?;
         self.writer
             .write_all(buf.as_ref())
             .await
@@ -203,7 +208,7 @@ where
     /// - `Ok(false)` if the socket is not ready (would block).
     /// - `Err(_)` on socket or encoding errors.
     pub fn try_write_frame(&mut self, frame: StandardEitherFrame<Message>) -> Result<bool, Error> {
-        let buf = self.encoder.encode(frame, &mut self.state)?;
+        let buf = self.encoder.encode_transport(frame, &mut self.state)?;
 
         match self.writer.try_write(buf.as_ref()) {
             Ok(n) if n == buf.len() => Ok(true),
@@ -226,7 +231,7 @@ where
 
 impl<Message> NoiseTcpReadHalf<Message>
 where
-    Message: Serialize + Deserialize<'static> + GetSize + Send + 'static,
+    Message: Serialize + for<'decoder> Deserialize<'decoder> + GetSize + Send + 'static,
 {
     /// Reads and decodes a complete frame from the socket.
     ///
@@ -263,7 +268,7 @@ where
 
             self.bytes_read = 0;
 
-            match self.decoder.next_frame(&mut self.state) {
+            match self.decoder.next_transport_frame(&mut self.state) {
                 Ok(frame) => return Ok(frame),
                 Err(stratum_core::codec_sv2::Error::MissingBytes(_)) => {
                     tokio::task::yield_now().await;
@@ -308,7 +313,7 @@ where
 
         self.bytes_read = 0;
 
-        match self.decoder.next_frame(&mut self.state) {
+        match self.decoder.next_transport_frame(&mut self.state) {
             Ok(frame) => Ok(Some(frame)),
             Err(stratum_core::codec_sv2::Error::MissingBytes(_)) => Ok(None),
             Err(e) => Err(Error::CodecError(e)),
@@ -316,7 +321,9 @@ where
     }
 }
 
-async fn send_message<Message: Serialize + Deserialize<'static> + GetSize + Send + 'static>(
+async fn send_message<
+    Message: Serialize + for<'decoder> Deserialize<'decoder> + GetSize + Send + 'static,
+>(
     writer: &mut OwnedWriteHalf,
     msg: StandardEitherFrame<Message>,
     state: &mut State,
@@ -330,7 +337,9 @@ async fn send_message<Message: Serialize + Deserialize<'static> + GetSize + Send
     Ok(())
 }
 
-async fn receive_message<Message: Serialize + Deserialize<'static> + GetSize + Send + 'static>(
+async fn receive_message<
+    Message: Serialize + for<'decoder> Deserialize<'decoder> + GetSize + Send + 'static,
+>(
     reader: &mut OwnedReadHalf,
     state: &mut State,
     decoder: &mut StandardNoiseDecoder<Message>,

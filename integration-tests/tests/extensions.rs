@@ -1,3 +1,6 @@
+use stratum_apps::stratum_core::parsers_sv2::{
+    AnyMessageOwned, ExtensionsNegotiationOwned, ExtensionsOwned, MiningOwned,
+};
 // Integration test for translator extension negotiation with extension 0x0002
 // (EXTENSION_TYPE_WORKER_HASHRATE_TRACKING) and user_identity TLV validation.
 //
@@ -9,11 +12,13 @@
 
 use integration_tests_sv2::{interceptor::MessageDirection, template_provider::DifficultyLevel, *};
 use stratum_apps::stratum_core::{
-    binary_sv2::Seq064K,
+    binary_sv2::Seq064KOwned,
     common_messages_sv2::*,
-    extensions_sv2::{EXTENSION_TYPE_WORKER_HASHRATE_TRACKING, TLV_FIELD_TYPE_USER_IDENTITY},
+    extensions_sv2::{
+        EXTENSION_TYPE_WORKER_HASHRATE_TRACKING, TLV_FIELD_TYPE_USER_IDENTITY,
+        extensions_negotiation::MESSAGE_TYPE_REQUEST_EXTENSIONS,
+    },
     mining_sv2::*,
-    parsers_sv2::{AnyMessage, Extensions, ExtensionsNegotiation, Mining},
 };
 use tracing::info;
 
@@ -25,6 +30,8 @@ async fn test_extension_negotiation_with_tlv_in_submit_shares() {
     // Extension 0x0002 for worker hashrate tracking
     let supported_extensions = vec![EXTENSION_TYPE_WORKER_HASHRATE_TRACKING];
     let required_extensions = vec![EXTENSION_TYPE_WORKER_HASHRATE_TRACKING];
+    let sv1_username = "account.SRI-miner";
+    let expected_tlv_user_identity = "SRI-miner";
 
     let (_tp, tp_addr) = start_template_provider(None, DifficultyLevel::Low);
     // Start pool with extension 0x0002 support
@@ -37,8 +44,8 @@ async fn test_extension_negotiation_with_tlv_in_submit_shares() {
     .await;
     let (pool_translator_sniffer, pool_translator_sniffer_addr) =
         start_sniffer("pool-translator", pool_addr, false, vec![], None);
-    // Start translator with extension 0x0002 support and user_identity configured
-    // aggregate_channels = false ensures TLV fields are added
+    // Start translator with extension 0x0002 support. TLV emission is gated by
+    // extension negotiation, not by aggregate_channels.
     let (translator, tproxy_addr, _) = start_sv2_translator(
         &[pool_translator_sniffer_addr],
         false, // aggregate_channels = false
@@ -48,10 +55,11 @@ async fn test_extension_negotiation_with_tlv_in_submit_shares() {
         false,
     )
     .await;
-    // Start SV1 miner (minerd) connected to translator with username "SRI-miner"
+    // Start SV1 miner (minerd) with a full SV1 username so the TLV can prove
+    // that only the worker name suffix is forwarded.
     let (_minerd_process, _minerd_addr) = start_minerd(
         tproxy_addr,
-        Some("SRI-miner".to_string()),
+        Some(sv1_username.to_string()),
         Some("password".to_string()),
         false,
     )
@@ -71,22 +79,28 @@ async fn test_extension_negotiation_with_tlv_in_submit_shares() {
         )
         .await;
 
+    // RequestExtensions is sent *after* SetupConnectionSuccess, so wait for it rather than
+    // assuming it has already been queued by the time the success message lands.
+    pool_translator_sniffer
+        .wait_for_message_type(
+            MessageDirection::ToUpstream,
+            MESSAGE_TYPE_REQUEST_EXTENSIONS,
+        )
+        .await;
+
     // Verify RequestExtensions includes extension 0x0002
     let request_extensions_msg = match pool_translator_sniffer.next_message_from_downstream() {
         Some((
             _,
-            AnyMessage::Extensions(Extensions::ExtensionsNegotiation(
-                ExtensionsNegotiation::RequestExtensions(msg),
+            AnyMessageOwned::Extensions(ExtensionsOwned::ExtensionsNegotiation(
+                ExtensionsNegotiationOwned::RequestExtensions(msg),
             )),
         )) => msg,
-        _ => panic!(
-            "received unexpected message: {:?}",
-            pool_translator_sniffer.next_message_from_downstream()
-        ),
+        msg => panic!("received unexpected message: {msg:?}"),
     };
     assert_eq!(
         request_extensions_msg.requested_extensions,
-        Seq064K::new(supported_extensions.clone()).unwrap()
+        Seq064KOwned::new(supported_extensions.clone()).unwrap()
     );
 
     // Verify RequestExtensionsSuccess acknowledges the extension
@@ -94,13 +108,13 @@ async fn test_extension_negotiation_with_tlv_in_submit_shares() {
     match request_extensions_success_msg {
         Some((
             _,
-            AnyMessage::Extensions(Extensions::ExtensionsNegotiation(
-                ExtensionsNegotiation::RequestExtensionsSuccess(msg),
+            AnyMessageOwned::Extensions(ExtensionsOwned::ExtensionsNegotiation(
+                ExtensionsNegotiationOwned::RequestExtensionsSuccess(msg),
             )),
         )) => {
             assert_eq!(
                 msg.supported_extensions,
-                Seq064K::new(supported_extensions).unwrap()
+                Seq064KOwned::new(supported_extensions).unwrap()
             );
         }
         _ => panic!("Expected RequestExtensionsSuccess message"),
@@ -116,14 +130,11 @@ async fn test_extension_negotiation_with_tlv_in_submit_shares() {
     // Extract and verify user_identity from OpenExtendedMiningChannel
     let open_channel_msg = pool_translator_sniffer.next_message_from_downstream();
     match open_channel_msg {
-        Some((_, AnyMessage::Mining(Mining::OpenExtendedMiningChannel(msg)))) => {
+        Some((_, AnyMessageOwned::Mining(MiningOwned::OpenExtendedMiningChannel(msg)))) => {
             let user_identity = msg.user_identity.as_utf8_or_hex();
             assert_eq!(user_identity, "user_identity.miner1".to_string());
         }
-        _ => panic!(
-            "received unexpected message: {:?}",
-            pool_translator_sniffer.next_message_from_downstream()
-        ),
+        msg => panic!("received unexpected message: {msg:?}"),
     }
 
     pool_translator_sniffer
@@ -149,7 +160,7 @@ async fn test_extension_negotiation_with_tlv_in_submit_shares() {
     // Verify SubmitSharesExtended contains TLV with user_identity
     let submit_shares_msg = pool_translator_sniffer.next_message_from_downstream_with_tlvs();
     match submit_shares_msg {
-        Some((_, AnyMessage::Mining(Mining::SubmitSharesExtended(msg)), tlv_fields)) => {
+        Some((_, AnyMessageOwned::Mining(MiningOwned::SubmitSharesExtended(msg)), tlv_fields)) => {
             info!(
                 "SubmitSharesExtended received - channel_id: {}, sequence_number: {}, job_id: {}",
                 msg.channel_id, msg.sequence_number, msg.job_id
@@ -177,27 +188,17 @@ async fn test_extension_negotiation_with_tlv_in_submit_shares() {
                     "TLV field_type should be user_identity"
                 );
                 let payload_len = tlv.value.len();
-                assert!(
-                    payload_len == 9,
-                    "user_identity TLV payload should be 9 bytes"
+                assert_eq!(
+                    payload_len,
+                    expected_tlv_user_identity.len(),
+                    "user_identity TLV payload length should match the SV1 worker name"
                 );
-                // Try to convert value to string for logging
-                if let Ok(user_identity_str) = std::str::from_utf8(&tlv.value) {
-                    // Verify user_identity format (should be "SRI-miner")
-                    assert_eq!(
-                        user_identity_str, "SRI-miner",
-                        "user_identity should be 'SRI-miner', got: {}",
-                        user_identity_str
-                    );
-                } else {
-                    // If not UTF-8, just log hex representation
-                    let hex_str = tlv
-                        .value
-                        .iter()
-                        .map(|b| format!("{:02x}", b))
-                        .collect::<String>();
-                    info!("✅ user_identity TLV payload (hex): {}", hex_str);
-                }
+                let user_identity_str =
+                    std::str::from_utf8(&tlv.value).expect("user_identity TLV must be UTF-8");
+                assert_eq!(
+                    user_identity_str, expected_tlv_user_identity,
+                    "user_identity TLV should contain the SV1 worker name suffix"
+                );
             }
         }
         _ => panic!("Expected SubmitSharesExtended message with TLV fields"),

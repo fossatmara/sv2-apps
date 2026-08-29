@@ -38,6 +38,10 @@ supported_extensions = [
 monitoring_address = "0.0.0.0:9092"
 monitoring_cache_refresh_secs = 15
 
+# LAN subnet containing ASIC miner web/API addresses (for example, 192.168.1.0/24).
+[miner_telemetry]
+cidrs = ["192.168.1.0/24"]
+
 # Difficulty params
 [downstream_difficulty_config]
 # hashes/s of the weakest miner that will be connecting (e.g.: 10 Th/s = 10_000_000_000_000.0)

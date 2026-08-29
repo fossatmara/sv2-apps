@@ -1,3 +1,4 @@
+use stratum_apps::stratum_core::parsers_sv2::{AnyMessageOwned, CommonMessagesOwned};
 // This file contains integration tests for the `TranslatorSv2` module.
 use integration_tests_sv2::{
     interceptor::{IgnoreMessage, MessageDirection, ReplaceMessage},
@@ -11,7 +12,7 @@ use integration_tests_sv2::{
 use stratum_apps::{
     config_helpers::CoinbaseRewardScript,
     stratum_core::{
-        bitcoin::{consensus::serialize, Amount, TxOut},
+        bitcoin::{Amount, TxOut, consensus::serialize},
         mining_sv2::*,
     },
 };
@@ -22,17 +23,17 @@ use std::{
     time::Duration,
 };
 use stratum_apps::stratum_core::{
-    binary_sv2::{Seq0255, Sv2Option},
+    binary_sv2::{Seq0255Owned, Sv2OptionOwned},
     common_messages_sv2::{
-        Protocol, SetupConnectionError, SetupConnectionSuccess, MESSAGE_TYPE_SETUP_CONNECTION,
-        MESSAGE_TYPE_SETUP_CONNECTION_ERROR, MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS,
+        MESSAGE_TYPE_SETUP_CONNECTION, MESSAGE_TYPE_SETUP_CONNECTION_ERROR,
+        MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS, Protocol, SetupConnectionErrorOwned,
+        SetupConnectionSuccessOwned,
     },
     mining_sv2::{
-        CloseChannel, OpenMiningChannelError, MESSAGE_TYPE_CLOSE_CHANNEL,
-        MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL,
+        MESSAGE_TYPE_CLOSE_CHANNEL, MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL,
         MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS,
     },
-    parsers_sv2::{self, AnyMessage, CommonMessages},
+    parsers_sv2::{self},
     sv1_api,
     template_distribution_sv2::MESSAGE_TYPE_SUBMIT_SOLUTION,
 };
@@ -96,7 +97,8 @@ async fn translate_sv1_to_sv2_successfully() {
     shutdown_all!(translator, pool);
 }
 
-/// Checks that tProxy mines when payout verification passes for address and donation identities.
+/// Checks that tProxy mines when payout verification passes for legacy address and donation
+/// identities.
 #[tokio::test]
 async fn translator_mines_when_payout_matches_address_or_donation_identity() {
     start_tracing();
@@ -111,36 +113,69 @@ async fn translator_mines_when_payout_matches_address_or_donation_identity() {
             .unwrap()
             .script_pubkey();
 
-    let mut solo_coinbase_tx_suffix = hex::decode("feffffff").unwrap();
-    solo_coinbase_tx_suffix.extend(serialize(&vec![TxOut {
-        value: Amount::from_sat(5_000_000_000),
-        script_pubkey: miner_script_pubkey.clone(),
-    }]));
-    solo_coinbase_tx_suffix.extend([0, 0, 0, 0]);
+    let mut legacy_solo_coinbase_tx_suffix = hex::decode("feffffff").unwrap();
+    legacy_solo_coinbase_tx_suffix.extend(serialize(&vec![
+        TxOut {
+            value: Amount::from_sat(4_955_000_000),
+            script_pubkey: miner_script_pubkey.clone(),
+        },
+        TxOut {
+            value: Amount::from_sat(45_000_000),
+            script_pubkey: pool_script_pubkey.clone(),
+        },
+    ]));
+    legacy_solo_coinbase_tx_suffix.extend([0, 0, 0, 0]);
 
     let mut partial_donation_coinbase_tx_suffix = hex::decode("feffffff").unwrap();
     partial_donation_coinbase_tx_suffix.extend(serialize(&vec![
         TxOut {
             value: Amount::from_sat(500_000_000),
-            script_pubkey: pool_script_pubkey,
+            script_pubkey: pool_script_pubkey.clone(),
         },
         TxOut {
             value: Amount::from_sat(4_500_000_000),
-            script_pubkey: miner_script_pubkey,
+            script_pubkey: miner_script_pubkey.clone(),
         },
     ]));
     partial_donation_coinbase_tx_suffix.extend([0, 0, 0, 0]);
 
-    for (identifier, user_identity, coinbase_tx_suffix) in [
+    // Simulates pools that leave extra coinbase scriptSig bytes after the extranonce.
+    let mut suffix_with_remaining_scriptsig_bytes =
+        hex::decode("2f4e65787573506f6f6c2ffeffffff").unwrap();
+    suffix_with_remaining_scriptsig_bytes.extend(serialize(&vec![
+        TxOut {
+            value: Amount::from_sat(4_955_000_000),
+            script_pubkey: miner_script_pubkey,
+        },
+        TxOut {
+            value: Amount::from_sat(45_000_000),
+            script_pubkey: pool_script_pubkey,
+        },
+    ]));
+    suffix_with_remaining_scriptsig_bytes.extend([0, 0, 0, 0]);
+
+    let default_coinbase_tx_prefix = hex::decode("02000000010000000000000000000000000000000000000000000000000000000000000000ffffffff225200162f5374726174756d2056322053524920506f6f6c2f2f08").unwrap();
+    // Extra `/NexusPool/` scriptSig bytes increase the prefix scriptSig length from 0x22 to 0x2d.
+    let coinbase_tx_prefix_with_remaining_scriptsig_bytes = hex::decode("02000000010000000000000000000000000000000000000000000000000000000000000000ffffffff2d5200162f5374726174756d2056322053524920506f6f6c2f2f08").unwrap();
+
+    for (identifier, user_identity, coinbase_tx_prefix, coinbase_tx_suffix) in [
         (
             "payout-address",
             PAYOUT_VERIFICATION_MINER_ADDRESS.to_string(),
-            solo_coinbase_tx_suffix,
+            default_coinbase_tx_prefix.clone(),
+            legacy_solo_coinbase_tx_suffix,
         ),
         (
             "payout-donation",
             format!("sri/donate/10/{PAYOUT_VERIFICATION_MINER_ADDRESS}/worker"),
+            default_coinbase_tx_prefix,
             partial_donation_coinbase_tx_suffix,
+        ),
+        (
+            "payout-address-scriptsig-suffix",
+            PAYOUT_VERIFICATION_MINER_ADDRESS.to_string(),
+            coinbase_tx_prefix_with_remaining_scriptsig_bytes,
+            suffix_with_remaining_scriptsig_bytes,
         ),
     ] {
         let mock_upstream_addr = get_available_address();
@@ -172,20 +207,22 @@ async fn translator_mines_when_payout_matches_address_or_donation_identity() {
                 MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL,
             )
             .await;
-        let open_extended_mining_channel: OpenExtendedMiningChannel = loop {
+        let open_extended_mining_channel: OpenExtendedMiningChannelOwned = loop {
             match sniffer.next_message_from_downstream() {
                 Some((
                     _,
-                    AnyMessage::Mining(parsers_sv2::Mining::OpenExtendedMiningChannel(msg)),
+                    AnyMessageOwned::Mining(parsers_sv2::MiningOwned::OpenExtendedMiningChannel(
+                        msg,
+                    )),
                 )) => break msg,
                 _ => continue,
             };
         };
 
         send_to_tproxy
-            .send(AnyMessage::Mining(
-                parsers_sv2::Mining::OpenExtendedMiningChannelSuccess(
-                    OpenExtendedMiningChannelSuccess {
+            .send(AnyMessageOwned::Mining(
+                parsers_sv2::MiningOwned::OpenExtendedMiningChannelSuccess(
+                    OpenExtendedMiningChannelSuccessOwned {
                         request_id: open_extended_mining_channel.request_id,
                         channel_id: 0,
                         target: hex::decode(
@@ -204,16 +241,18 @@ async fn translator_mines_when_payout_matches_address_or_donation_identity() {
             .unwrap();
 
         send_to_tproxy
-            .send(AnyMessage::Mining(parsers_sv2::Mining::NewExtendedMiningJob(NewExtendedMiningJob {
-                channel_id: 0,
-                job_id: 1,
-                min_ntime: Sv2Option::new(None),
-                version: 0x20000000,
-                version_rolling_allowed: true,
-                merkle_path: Seq0255::new(vec![]).unwrap(),
-                coinbase_tx_prefix: hex::decode("02000000010000000000000000000000000000000000000000000000000000000000000000ffffffff225200162f5374726174756d2056322053524920506f6f6c2f2f08").unwrap().try_into().unwrap(),
-                coinbase_tx_suffix: coinbase_tx_suffix.try_into().unwrap(),
-            })))
+            .send(AnyMessageOwned::Mining(
+                parsers_sv2::MiningOwned::NewExtendedMiningJob(NewExtendedMiningJobOwned {
+                    channel_id: 0,
+                    job_id: 1,
+                    min_ntime: Sv2OptionOwned::new(None),
+                    version: 0x20000000,
+                    version_rolling_allowed: true,
+                    merkle_path: Seq0255Owned::new(vec![]).unwrap(),
+                    coinbase_tx_prefix: coinbase_tx_prefix.try_into().unwrap(),
+                    coinbase_tx_suffix: coinbase_tx_suffix.try_into().unwrap(),
+                }),
+            ))
             .await
             .unwrap();
         sniffer
@@ -224,8 +263,8 @@ async fn translator_mines_when_payout_matches_address_or_donation_identity() {
             .await;
 
         send_to_tproxy
-            .send(AnyMessage::Mining(parsers_sv2::Mining::SetNewPrevHash(
-                SetNewPrevHash {
+            .send(AnyMessageOwned::Mining(
+                parsers_sv2::MiningOwned::SetNewPrevHash(SetNewPrevHashOwned {
                     channel_id: 0,
                     job_id: 1,
                     prev_hash: hex::decode(
@@ -236,8 +275,8 @@ async fn translator_mines_when_payout_matches_address_or_donation_identity() {
                     .unwrap(),
                     min_ntime: 1766782170,
                     nbits: 0x207fffff,
-                },
-            )))
+                }),
+            ))
             .await
             .unwrap();
         sniffer
@@ -323,19 +362,20 @@ async fn translator_falls_back_when_payout_does_not_match_user_identity() {
             MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL,
         )
         .await;
-    let open_extended_mining_channel: OpenExtendedMiningChannel = loop {
+    let open_extended_mining_channel: OpenExtendedMiningChannelOwned = loop {
         match primary_sniffer.next_message_from_downstream() {
-            Some((_, AnyMessage::Mining(parsers_sv2::Mining::OpenExtendedMiningChannel(msg)))) => {
-                break msg
-            }
+            Some((
+                _,
+                AnyMessageOwned::Mining(parsers_sv2::MiningOwned::OpenExtendedMiningChannel(msg)),
+            )) => break msg,
             _ => continue,
         };
     };
 
     primary_sender
-        .send(AnyMessage::Mining(
-            parsers_sv2::Mining::OpenExtendedMiningChannelSuccess(
-                OpenExtendedMiningChannelSuccess {
+        .send(AnyMessageOwned::Mining(
+            parsers_sv2::MiningOwned::OpenExtendedMiningChannelSuccess(
+                OpenExtendedMiningChannelSuccessOwned {
                     request_id: open_extended_mining_channel.request_id,
                     channel_id: 0,
                     target: hex::decode(
@@ -354,13 +394,13 @@ async fn translator_falls_back_when_payout_does_not_match_user_identity() {
         .unwrap();
 
     primary_sender
-        .send(AnyMessage::Mining(parsers_sv2::Mining::NewExtendedMiningJob(NewExtendedMiningJob {
+        .send(AnyMessageOwned::Mining(parsers_sv2::MiningOwned::NewExtendedMiningJob(NewExtendedMiningJobOwned {
             channel_id: 0,
             job_id: 1,
-            min_ntime: Sv2Option::new(None),
+            min_ntime: Sv2OptionOwned::new(None),
             version: 0x20000000,
             version_rolling_allowed: true,
-            merkle_path: Seq0255::new(vec![]).unwrap(),
+            merkle_path: Seq0255Owned::new(vec![]).unwrap(),
             coinbase_tx_prefix: hex::decode("02000000010000000000000000000000000000000000000000000000000000000000000000ffffffff225200162f5374726174756d2056322053524920506f6f6c2f2f08").unwrap().try_into().unwrap(),
             coinbase_tx_suffix: wrong_coinbase_tx_suffix.try_into().unwrap(),
         })))
@@ -406,8 +446,8 @@ async fn test_translator_fallback_on_setup_connection_error() {
     let setup_connection_success_replace = ReplaceMessage::new(
         MessageDirection::ToDownstream,
         MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS,
-        AnyMessage::Common(parsers_sv2::CommonMessages::SetupConnectionError(
-            SetupConnectionError {
+        AnyMessageOwned::Common(parsers_sv2::CommonMessagesOwned::SetupConnectionError(
+            SetupConnectionErrorOwned {
                 flags: 0,
                 error_code: random_error_code.try_into().unwrap(),
             },
@@ -490,8 +530,8 @@ async fn test_translator_fallback_on_open_mining_message_error() {
     let open_mining_channel_success_replace = ReplaceMessage::new(
         MessageDirection::ToDownstream,
         MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS,
-        AnyMessage::Mining(parsers_sv2::Mining::OpenMiningChannelError(
-            OpenMiningChannelError {
+        AnyMessageOwned::Mining(parsers_sv2::MiningOwned::OpenMiningChannelError(
+            OpenMiningChannelErrorOwned {
                 request_id: 0,
                 error_code: random_error_code.try_into().unwrap(),
             },
@@ -759,7 +799,9 @@ async fn aggregated_translator_correctly_deals_with_group_channels() {
     let (aggregated_channel_id, group_channel_id) = match sniffer.next_message_from_upstream() {
         Some((
             _,
-            AnyMessage::Mining(parsers_sv2::Mining::OpenExtendedMiningChannelSuccess(msg)),
+            AnyMessageOwned::Mining(parsers_sv2::MiningOwned::OpenExtendedMiningChannelSuccess(
+                msg,
+            )),
         )) => (msg.channel_id, msg.group_channel_id),
         msg => panic!(
             "Expected OpenExtendedMiningChannelSuccess message, found: {:?}",
@@ -809,11 +851,19 @@ async fn aggregated_translator_correctly_deals_with_group_channels() {
         )
         .await;
 
-    let share_channel_id = match sniffer.next_message_from_downstream() {
-        Some((_, AnyMessage::Mining(parsers_sv2::Mining::SubmitSharesExtended(msg)))) => {
-            msg.channel_id
+    let share_channel_id = loop {
+        match sniffer.next_message_from_downstream() {
+            Some((
+                _,
+                AnyMessageOwned::Mining(parsers_sv2::MiningOwned::SubmitSharesExtended(msg)),
+            )) => break msg.channel_id,
+            // Opening an aggregated downstream or vardiff may enqueue an UpdateChannel before the
+            // share.
+            Some((_, AnyMessageOwned::Mining(parsers_sv2::MiningOwned::UpdateChannel(_)))) => {
+                continue;
+            }
+            msg => panic!("Expected SubmitSharesExtended message, found: {:?}", msg),
         }
-        msg => panic!("Expected SubmitSharesExtended message, found: {:?}", msg),
     };
 
     assert_eq!(
@@ -844,9 +894,16 @@ async fn aggregated_translator_correctly_deals_with_group_channels() {
             MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB,
         )
         .await;
-    let new_extended_mining_job = match sniffer.next_message_from_upstream() {
-        Some((_, AnyMessage::Mining(parsers_sv2::Mining::NewExtendedMiningJob(msg)))) => msg,
-        msg => panic!("Expected NewExtendedMiningJob message, found: {:?}", msg),
+    let new_extended_mining_job = loop {
+        match sniffer.next_message_from_upstream() {
+            Some((
+                _,
+                AnyMessageOwned::Mining(parsers_sv2::MiningOwned::NewExtendedMiningJob(msg)),
+            )) => break msg,
+            // Every aggregate UpdateChannel is answered with SetTarget on this queue.
+            Some((_, AnyMessageOwned::Mining(parsers_sv2::MiningOwned::SetTarget(_)))) => continue,
+            msg => panic!("Expected NewExtendedMiningJob message, found: {:?}", msg),
+        }
     };
 
     // here we're actually asserting pool behavior, not tProxy
@@ -862,7 +919,15 @@ async fn aggregated_translator_correctly_deals_with_group_channels() {
             )
             .await;
         let submit_shares_extended = match sniffer.next_message_from_downstream() {
-            Some((_, AnyMessage::Mining(parsers_sv2::Mining::SubmitSharesExtended(msg)))) => msg,
+            Some((
+                _,
+                AnyMessageOwned::Mining(parsers_sv2::MiningOwned::SubmitSharesExtended(msg)),
+            )) => msg,
+            // Opening an aggregated downstream or vardiff may enqueue an UpdateChannel before the
+            // share.
+            Some((_, AnyMessageOwned::Mining(parsers_sv2::MiningOwned::UpdateChannel(_)))) => {
+                continue;
+            }
             msg => panic!("Expected SubmitSharesExtended message, found: {:?}", msg),
         };
 
@@ -885,9 +950,16 @@ async fn aggregated_translator_correctly_deals_with_group_channels() {
             MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB,
         )
         .await;
-    let new_extended_mining_job = match sniffer.next_message_from_upstream() {
-        Some((_, AnyMessage::Mining(parsers_sv2::Mining::NewExtendedMiningJob(msg)))) => msg,
-        msg => panic!("Expected NewExtendedMiningJob message, found: {:?}", msg),
+    let new_extended_mining_job = loop {
+        match sniffer.next_message_from_upstream() {
+            Some((
+                _,
+                AnyMessageOwned::Mining(parsers_sv2::MiningOwned::NewExtendedMiningJob(msg)),
+            )) => break msg,
+            // Every aggregate UpdateChannel is answered with SetTarget on this queue.
+            Some((_, AnyMessageOwned::Mining(parsers_sv2::MiningOwned::SetTarget(_)))) => continue,
+            msg => panic!("Expected NewExtendedMiningJob message, found: {:?}", msg),
+        }
     };
 
     // again, asserting pool behavior, not tProxy
@@ -901,9 +973,15 @@ async fn aggregated_translator_correctly_deals_with_group_channels() {
             MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH,
         )
         .await;
-    let set_new_prev_hash = match sniffer.next_message_from_upstream() {
-        Some((_, AnyMessage::Mining(parsers_sv2::Mining::SetNewPrevHash(msg)))) => msg,
-        msg => panic!("Expected SetNewPrevHash message, found: {:?}", msg),
+    let set_new_prev_hash = loop {
+        match sniffer.next_message_from_upstream() {
+            Some((_, AnyMessageOwned::Mining(parsers_sv2::MiningOwned::SetNewPrevHash(msg)))) => {
+                break msg;
+            }
+            // Every aggregate UpdateChannel is answered with SetTarget on this queue.
+            Some((_, AnyMessageOwned::Mining(parsers_sv2::MiningOwned::SetTarget(_)))) => continue,
+            msg => panic!("Expected SetNewPrevHash message, found: {:?}", msg),
+        }
     };
 
     // again, asserting pool behavior, not tProxy
@@ -919,7 +997,15 @@ async fn aggregated_translator_correctly_deals_with_group_channels() {
             )
             .await;
         let submit_shares_extended = match sniffer.next_message_from_downstream() {
-            Some((_, AnyMessage::Mining(parsers_sv2::Mining::SubmitSharesExtended(msg)))) => msg,
+            Some((
+                _,
+                AnyMessageOwned::Mining(parsers_sv2::MiningOwned::SubmitSharesExtended(msg)),
+            )) => msg,
+            // Opening an aggregated downstream or vardiff may enqueue an UpdateChannel before the
+            // share.
+            Some((_, AnyMessageOwned::Mining(parsers_sv2::MiningOwned::UpdateChannel(_)))) => {
+                continue;
+            }
             msg => panic!("Expected SubmitSharesExtended message, found: {:?}", msg),
         };
 
@@ -1013,7 +1099,9 @@ async fn non_aggregated_translator_correctly_deals_with_group_channels() {
         let open_extended_mining_channel_success = match sniffer.next_message_from_upstream() {
             Some((
                 _,
-                AnyMessage::Mining(parsers_sv2::Mining::OpenExtendedMiningChannelSuccess(msg)),
+                AnyMessageOwned::Mining(
+                    parsers_sv2::MiningOwned::OpenExtendedMiningChannelSuccess(msg),
+                ),
             )) => msg,
             msg => panic!(
                 "Expected OpenExtendedMiningChannelSuccess message, found: {:?}",
@@ -1033,7 +1121,10 @@ async fn non_aggregated_translator_correctly_deals_with_group_channels() {
             )
             .await;
         let new_extended_mining_job = match sniffer.next_message_from_upstream() {
-            Some((_, AnyMessage::Mining(parsers_sv2::Mining::NewExtendedMiningJob(msg)))) => msg,
+            Some((
+                _,
+                AnyMessageOwned::Mining(parsers_sv2::MiningOwned::NewExtendedMiningJob(msg)),
+            )) => msg,
             msg => panic!("Expected NewExtendedMiningJob message, found: {:?}", msg),
         };
         assert_eq!(new_extended_mining_job.channel_id, channel_id);
@@ -1052,7 +1143,9 @@ async fn non_aggregated_translator_correctly_deals_with_group_channels() {
             )
             .await;
         let set_new_prev_hash = match sniffer.next_message_from_upstream() {
-            Some((_, AnyMessage::Mining(parsers_sv2::Mining::SetNewPrevHash(msg)))) => msg,
+            Some((_, AnyMessageOwned::Mining(parsers_sv2::MiningOwned::SetNewPrevHash(msg)))) => {
+                msg
+            }
             msg => panic!("Expected SetNewPrevHash message, found: {:?}", msg),
         };
         assert_eq!(set_new_prev_hash.channel_id, channel_id);
@@ -1069,7 +1162,14 @@ async fn non_aggregated_translator_correctly_deals_with_group_channels() {
             )
             .await;
         let submit_shares_extended = match sniffer.next_message_from_downstream() {
-            Some((_, AnyMessage::Mining(parsers_sv2::Mining::SubmitSharesExtended(msg)))) => msg,
+            Some((
+                _,
+                AnyMessageOwned::Mining(parsers_sv2::MiningOwned::SubmitSharesExtended(msg)),
+            )) => msg,
+            // Vardiff may enqueue an UpdateChannel before the share on loaded CI runners.
+            Some((_, AnyMessageOwned::Mining(parsers_sv2::MiningOwned::UpdateChannel(_)))) => {
+                continue;
+            }
             msg => panic!("Expected SubmitSharesExtended message, found: {:?}", msg),
         };
 
@@ -1089,15 +1189,24 @@ async fn non_aggregated_translator_correctly_deals_with_group_channels() {
     // that's actually directed to the group channel ID, and not each individual channel
     tp.create_mempool_transaction().unwrap();
 
-    sniffer
-        .wait_for_message_type(
-            MessageDirection::ToDownstream,
-            MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB,
-        )
-        .await;
-    let new_extended_mining_job = match sniffer.next_message_from_upstream() {
-        Some((_, AnyMessage::Mining(parsers_sv2::Mining::NewExtendedMiningJob(msg)))) => msg,
-        msg => panic!("Expected NewExtendedMiningJob message, found: {:?}", msg),
+    let new_extended_mining_job = loop {
+        sniffer
+            .wait_for_message_type(
+                MessageDirection::ToDownstream,
+                MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB,
+            )
+            .await;
+        match sniffer.next_message_from_upstream() {
+            Some((
+                _,
+                AnyMessageOwned::Mining(parsers_sv2::MiningOwned::NewExtendedMiningJob(msg)),
+            )) => {
+                break msg;
+            }
+            // Every vardiff UpdateChannel is answered with SetTarget on this queue.
+            Some((_, AnyMessageOwned::Mining(parsers_sv2::MiningOwned::SetTarget(_)))) => continue,
+            msg => panic!("Expected NewExtendedMiningJob message, found: {:?}", msg),
+        }
     };
     assert_eq!(
         new_extended_mining_job.channel_id,
@@ -1114,7 +1223,14 @@ async fn non_aggregated_translator_correctly_deals_with_group_channels() {
             )
             .await;
         let submit_shares_extended = match sniffer.next_message_from_downstream() {
-            Some((_, AnyMessage::Mining(parsers_sv2::Mining::SubmitSharesExtended(msg)))) => msg,
+            Some((
+                _,
+                AnyMessageOwned::Mining(parsers_sv2::MiningOwned::SubmitSharesExtended(msg)),
+            )) => msg,
+            // Vardiff may enqueue an UpdateChannel before the share on loaded CI runners.
+            Some((_, AnyMessageOwned::Mining(parsers_sv2::MiningOwned::UpdateChannel(_)))) => {
+                continue;
+            }
             msg => panic!("Expected SubmitSharesExtended message, found: {:?}", msg),
         };
 
@@ -1151,34 +1267,66 @@ async fn non_aggregated_translator_correctly_deals_with_group_channels() {
             .expect("Failed to capture prevhash before chain tip update")
     };
 
+    // Drop the mining.notify messages captured above. The assertion below matches the most recent
+    // mining.notify, and the SV1 translation of the new prevhash reaches each miner asynchronously
+    // after the SV2 SetNewPrevHash — so without clearing, the stale pre-update notify is what gets
+    // matched and the prevhash appears unchanged.
+    for sv1_sniffer in sv1_sniffers.iter() {
+        sv1_sniffer
+            .clean_queue(MessageDirection::ToDownstream)
+            .await;
+    }
+
     // now let's force a chain tip update, so we trigger a NewExtendedMiningJob + SetNewPrevHash
     // message pair
     tp.generate_blocks(1);
 
-    sniffer
-        .wait_for_message_type(
-            MessageDirection::ToDownstream,
-            MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB,
-        )
-        .await;
-    let new_extended_mining_job = match sniffer.next_message_from_upstream() {
-        Some((_, AnyMessage::Mining(parsers_sv2::Mining::NewExtendedMiningJob(msg)))) => msg,
-        msg => panic!("Expected NewExtendedMiningJob message, found: {:?}", msg),
+    let new_extended_mining_job = loop {
+        sniffer
+            .wait_for_message_type(
+                MessageDirection::ToDownstream,
+                MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB,
+            )
+            .await;
+        match sniffer.next_message_from_upstream() {
+            Some((
+                _,
+                AnyMessageOwned::Mining(parsers_sv2::MiningOwned::NewExtendedMiningJob(msg)),
+            )) => {
+                break msg;
+            }
+            // Every vardiff UpdateChannel is answered with SetTarget on this queue.
+            Some((_, AnyMessageOwned::Mining(parsers_sv2::MiningOwned::SetTarget(_)))) => continue,
+            msg => panic!("Expected NewExtendedMiningJob message, found: {:?}", msg),
+        }
     };
     assert_eq!(
         new_extended_mining_job.channel_id,
         EXPECTED_GROUP_CHANNEL_ID
     );
 
-    sniffer
-        .wait_for_message_type(
-            MessageDirection::ToDownstream,
-            MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH,
-        )
-        .await;
-    let set_new_prev_hash = match sniffer.next_message_from_upstream() {
-        Some((_, AnyMessage::Mining(parsers_sv2::Mining::SetNewPrevHash(msg)))) => msg,
-        msg => panic!("Expected SetNewPrevHash message, found: {:?}", msg),
+    let set_new_prev_hash = loop {
+        sniffer
+            .wait_for_message_type(
+                MessageDirection::ToDownstream,
+                MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH,
+            )
+            .await;
+        match sniffer.next_message_from_upstream() {
+            Some((_, AnyMessageOwned::Mining(parsers_sv2::MiningOwned::SetNewPrevHash(msg)))) => {
+                break msg;
+            }
+            // A chain-tip update may enqueue multiple group-channel jobs before SetNewPrevHash.
+            Some((
+                _,
+                AnyMessageOwned::Mining(parsers_sv2::MiningOwned::NewExtendedMiningJob(msg)),
+            )) => {
+                assert_eq!(msg.channel_id, EXPECTED_GROUP_CHANNEL_ID);
+            }
+            // Every vardiff UpdateChannel is answered with SetTarget on this queue.
+            Some((_, AnyMessageOwned::Mining(parsers_sv2::MiningOwned::SetTarget(_)))) => continue,
+            msg => panic!("Expected SetNewPrevHash message, found: {:?}", msg),
+        }
     };
     assert_eq!(set_new_prev_hash.channel_id, EXPECTED_GROUP_CHANNEL_ID);
 
@@ -1220,7 +1368,14 @@ async fn non_aggregated_translator_correctly_deals_with_group_channels() {
             )
             .await;
         let submit_shares_extended = match sniffer.next_message_from_downstream() {
-            Some((_, AnyMessage::Mining(parsers_sv2::Mining::SubmitSharesExtended(msg)))) => msg,
+            Some((
+                _,
+                AnyMessageOwned::Mining(parsers_sv2::MiningOwned::SubmitSharesExtended(msg)),
+            )) => msg,
+            // Vardiff may enqueue an UpdateChannel before the share on loaded CI runners.
+            Some((_, AnyMessageOwned::Mining(parsers_sv2::MiningOwned::UpdateChannel(_)))) => {
+                continue;
+            }
             msg => panic!("Expected SubmitSharesExtended message, found: {:?}", msg),
         };
 
@@ -1266,12 +1421,12 @@ async fn non_aggregated_translator_handles_set_group_channel_message() {
         )
         .await;
 
-    let setup_connection_success = AnyMessage::Common(CommonMessages::SetupConnectionSuccess(
-        SetupConnectionSuccess {
+    let setup_connection_success = AnyMessageOwned::Common(
+        CommonMessagesOwned::SetupConnectionSuccess(SetupConnectionSuccessOwned {
             used_version: 2,
             flags: 0,
-        },
-    ));
+        }),
+    );
     send_to_tproxy.send(setup_connection_success).await.unwrap();
 
     const N_EXTENDED_CHANNELS: u32 = 6;
@@ -1293,11 +1448,13 @@ async fn non_aggregated_translator_handles_set_group_channel_message() {
                 MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL,
             )
             .await;
-        let open_extended_mining_channel: OpenExtendedMiningChannel = loop {
+        let open_extended_mining_channel: OpenExtendedMiningChannelOwned = loop {
             match sniffer.next_message_from_downstream() {
                 Some((
                     _,
-                    AnyMessage::Mining(parsers_sv2::Mining::OpenExtendedMiningChannel(msg)),
+                    AnyMessageOwned::Mining(parsers_sv2::MiningOwned::OpenExtendedMiningChannel(
+                        msg,
+                    )),
                 )) => {
                     break msg;
                 }
@@ -1306,8 +1463,8 @@ async fn non_aggregated_translator_handles_set_group_channel_message() {
         };
 
         let open_extended_mining_channel_success =
-            AnyMessage::Mining(parsers_sv2::Mining::OpenExtendedMiningChannelSuccess(
-                OpenExtendedMiningChannelSuccess {
+            AnyMessageOwned::Mining(parsers_sv2::MiningOwned::OpenExtendedMiningChannelSuccess(
+                OpenExtendedMiningChannelSuccessOwned {
                     request_id: open_extended_mining_channel.request_id,
                     channel_id: i,
                     target: hex::decode(
@@ -1334,13 +1491,13 @@ async fn non_aggregated_translator_handles_set_group_channel_message() {
             )
             .await;
 
-        let new_extended_mining_job = AnyMessage::Mining(parsers_sv2::Mining::NewExtendedMiningJob(NewExtendedMiningJob {
+        let new_extended_mining_job = AnyMessageOwned::Mining(parsers_sv2::MiningOwned::NewExtendedMiningJob(NewExtendedMiningJobOwned {
             channel_id: i,
             job_id: 1,
-            min_ntime: Sv2Option::new(None),
+            min_ntime: Sv2OptionOwned::new(None),
             version: 0x20000000,
             version_rolling_allowed: true,
-            merkle_path: Seq0255::new(vec![]).unwrap(),
+            merkle_path: Seq0255Owned::new(vec![]).unwrap(),
             // scriptSig for a total of 8 bytes of extranonce
             coinbase_tx_prefix: hex::decode("02000000010000000000000000000000000000000000000000000000000000000000000000ffffffff225200162f5374726174756d2056322053524920506f6f6c2f2f08").unwrap().try_into().unwrap(),
             coinbase_tx_suffix: hex::decode("feffffff0200f2052a01000000160014ebe1b7dcc293ccaa0ee743a86f89df8258c208fc0000000000000000266a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf901000000").unwrap().try_into().unwrap(),
@@ -1354,8 +1511,8 @@ async fn non_aggregated_translator_handles_set_group_channel_message() {
             )
             .await;
 
-        let set_new_prev_hash =
-            AnyMessage::Mining(parsers_sv2::Mining::SetNewPrevHash(SetNewPrevHash {
+        let set_new_prev_hash = AnyMessageOwned::Mining(parsers_sv2::MiningOwned::SetNewPrevHash(
+            SetNewPrevHashOwned {
                 channel_id: i,
                 job_id: 1,
                 prev_hash: hex::decode(
@@ -1366,7 +1523,8 @@ async fn non_aggregated_translator_handles_set_group_channel_message() {
                 .unwrap(),
                 min_ntime: 1766782170,
                 nbits: 0x207fffff,
-            }));
+            },
+        ));
 
         send_to_tproxy.send(set_new_prev_hash).await.unwrap();
         sniffer
@@ -1388,21 +1546,22 @@ async fn non_aggregated_translator_handles_set_group_channel_message() {
         .collect::<Vec<_>>();
 
     // send a SetGroupChannel message to set GROUP_CHANNEL_ID_B
-    let set_group_channel =
-        AnyMessage::Mining(parsers_sv2::Mining::SetGroupChannel(SetGroupChannel {
-            channel_ids: group_channel_b_ids.clone().into(),
+    let set_group_channel = AnyMessageOwned::Mining(parsers_sv2::MiningOwned::SetGroupChannel(
+        SetGroupChannelOwned {
+            channel_ids: group_channel_b_ids.clone().try_into().unwrap(),
             group_channel_id: GROUP_CHANNEL_ID_B,
-        }));
+        },
+    ));
     send_to_tproxy.send(set_group_channel).await.unwrap();
 
     // send a NewExtendedMiningJob + SetNewPrevHash message pair ONLY to GROUP_CHANNEL_ID_B
-    let new_extended_mining_job = AnyMessage::Mining(parsers_sv2::Mining::NewExtendedMiningJob(NewExtendedMiningJob {
+    let new_extended_mining_job = AnyMessageOwned::Mining(parsers_sv2::MiningOwned::NewExtendedMiningJob(NewExtendedMiningJobOwned {
         channel_id: GROUP_CHANNEL_ID_B,
         job_id: 2,
-        min_ntime: Sv2Option::new(None),
+        min_ntime: Sv2OptionOwned::new(None),
         version: 0x20000000,
         version_rolling_allowed: true,
-        merkle_path: Seq0255::new(vec![]).unwrap(),
+        merkle_path: Seq0255Owned::new(vec![]).unwrap(),
         // scriptSig for a total of 8 bytes of extranonce
         coinbase_tx_prefix: hex::decode("02000000010000000000000000000000000000000000000000000000000000000000000000ffffffff225300162f5374726174756d2056322053524920506f6f6c2f2f08").unwrap().try_into().unwrap(),
         coinbase_tx_suffix: hex::decode("feffffff0200f2052a01000000160014ebe1b7dcc293ccaa0ee743a86f89df8258c208fc0000000000000000266a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf901000000").unwrap().try_into().unwrap(),
@@ -1416,8 +1575,8 @@ async fn non_aggregated_translator_handles_set_group_channel_message() {
         )
         .await;
 
-    let set_new_prev_hash =
-        AnyMessage::Mining(parsers_sv2::Mining::SetNewPrevHash(SetNewPrevHash {
+    let set_new_prev_hash = AnyMessageOwned::Mining(parsers_sv2::MiningOwned::SetNewPrevHash(
+        SetNewPrevHashOwned {
             channel_id: GROUP_CHANNEL_ID_B,
             job_id: 2,
             prev_hash: hex::decode(
@@ -1428,7 +1587,8 @@ async fn non_aggregated_translator_handles_set_group_channel_message() {
             .unwrap(),
             min_ntime: 1766782171,
             nbits: 0x207fffff,
-        }));
+        },
+    ));
     send_to_tproxy.send(set_new_prev_hash).await.unwrap();
     sniffer
         .wait_for_message_type_and_clean_queue(
@@ -1448,7 +1608,10 @@ async fn non_aggregated_translator_handles_set_group_channel_message() {
             )
             .await;
         let submit_shares_extended = match sniffer.next_message_from_downstream() {
-            Some((_, AnyMessage::Mining(parsers_sv2::Mining::SubmitSharesExtended(msg)))) => msg,
+            Some((
+                _,
+                AnyMessageOwned::Mining(parsers_sv2::MiningOwned::SubmitSharesExtended(msg)),
+            )) => msg,
             msg => panic!("Expected SubmitSharesExtended message, found: {:?}", msg),
         };
 
@@ -1496,12 +1659,12 @@ async fn non_aggregated_translator_correctly_deals_with_close_channel_message() 
         )
         .await;
 
-    let setup_connection_success = AnyMessage::Common(CommonMessages::SetupConnectionSuccess(
-        SetupConnectionSuccess {
+    let setup_connection_success = AnyMessageOwned::Common(
+        CommonMessagesOwned::SetupConnectionSuccess(SetupConnectionSuccessOwned {
             used_version: 2,
             flags: 0,
-        },
-    ));
+        }),
+    );
     send_to_tproxy.send(setup_connection_success).await.unwrap();
 
     const N_EXTENDED_CHANNELS: u32 = 3;
@@ -1522,11 +1685,13 @@ async fn non_aggregated_translator_correctly_deals_with_close_channel_message() 
                 MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL,
             )
             .await;
-        let open_extended_mining_channel: OpenExtendedMiningChannel = loop {
+        let open_extended_mining_channel: OpenExtendedMiningChannelOwned = loop {
             match sniffer.next_message_from_downstream() {
                 Some((
                     _,
-                    AnyMessage::Mining(parsers_sv2::Mining::OpenExtendedMiningChannel(msg)),
+                    AnyMessageOwned::Mining(parsers_sv2::MiningOwned::OpenExtendedMiningChannel(
+                        msg,
+                    )),
                 )) => {
                     break msg;
                 }
@@ -1535,8 +1700,8 @@ async fn non_aggregated_translator_correctly_deals_with_close_channel_message() 
         };
 
         let open_extended_mining_channel_success =
-            AnyMessage::Mining(parsers_sv2::Mining::OpenExtendedMiningChannelSuccess(
-                OpenExtendedMiningChannelSuccess {
+            AnyMessageOwned::Mining(parsers_sv2::MiningOwned::OpenExtendedMiningChannelSuccess(
+                OpenExtendedMiningChannelSuccessOwned {
                     request_id: open_extended_mining_channel.request_id,
                     channel_id: i,
                     target: hex::decode(
@@ -1563,13 +1728,13 @@ async fn non_aggregated_translator_correctly_deals_with_close_channel_message() 
             )
             .await;
 
-        let new_extended_mining_job = AnyMessage::Mining(parsers_sv2::Mining::NewExtendedMiningJob(NewExtendedMiningJob {
+        let new_extended_mining_job = AnyMessageOwned::Mining(parsers_sv2::MiningOwned::NewExtendedMiningJob(NewExtendedMiningJobOwned {
             channel_id: i,
             job_id: 1,
-            min_ntime: Sv2Option::new(None),
+            min_ntime: Sv2OptionOwned::new(None),
             version: 0x20000000,
             version_rolling_allowed: true,
-            merkle_path: Seq0255::new(vec![]).unwrap(),
+            merkle_path: Seq0255Owned::new(vec![]).unwrap(),
             // scriptSig for a total of 8 bytes of extranonce
             coinbase_tx_prefix: hex::decode("02000000010000000000000000000000000000000000000000000000000000000000000000ffffffff225200162f5374726174756d2056322053524920506f6f6c2f2f08").unwrap().try_into().unwrap(),
             coinbase_tx_suffix: hex::decode("feffffff0200f2052a01000000160014ebe1b7dcc293ccaa0ee743a86f89df8258c208fc0000000000000000266a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf901000000").unwrap().try_into().unwrap(),
@@ -1583,8 +1748,8 @@ async fn non_aggregated_translator_correctly_deals_with_close_channel_message() 
             )
             .await;
 
-        let set_new_prev_hash =
-            AnyMessage::Mining(parsers_sv2::Mining::SetNewPrevHash(SetNewPrevHash {
+        let set_new_prev_hash = AnyMessageOwned::Mining(parsers_sv2::MiningOwned::SetNewPrevHash(
+            SetNewPrevHashOwned {
                 channel_id: i,
                 job_id: 1,
                 prev_hash: hex::decode(
@@ -1595,7 +1760,8 @@ async fn non_aggregated_translator_correctly_deals_with_close_channel_message() 
                 .unwrap(),
                 min_ntime: 1766782170,
                 nbits: 0x207fffff,
-            }));
+            },
+        ));
 
         send_to_tproxy.send(set_new_prev_hash).await.unwrap();
         sniffer
@@ -1607,7 +1773,7 @@ async fn non_aggregated_translator_correctly_deals_with_close_channel_message() 
     }
 
     // let's wait until all channels send at least one share
-    let mut channels_submitted_to: HashSet<u32> = (0..N_EXTENDED_CHANNELS).into_iter().collect();
+    let mut channels_submitted_to: HashSet<u32> = (0..N_EXTENDED_CHANNELS).collect();
     loop {
         sniffer
             .wait_for_message_type(
@@ -1616,7 +1782,10 @@ async fn non_aggregated_translator_correctly_deals_with_close_channel_message() 
             )
             .await;
         let submit_shares_extended = match sniffer.next_message_from_downstream() {
-            Some((_, AnyMessage::Mining(parsers_sv2::Mining::SubmitSharesExtended(msg)))) => msg,
+            Some((
+                _,
+                AnyMessageOwned::Mining(parsers_sv2::MiningOwned::SubmitSharesExtended(msg)),
+            )) => msg,
             msg => panic!("Expected SubmitSharesExtended message, found: {:?}", msg),
         };
 
@@ -1628,10 +1797,11 @@ async fn non_aggregated_translator_correctly_deals_with_close_channel_message() 
 
     // let's close one of the channels
     const CLOSED_CHANNEL_ID: u32 = 0;
-    let close_channel = AnyMessage::Mining(parsers_sv2::Mining::CloseChannel(CloseChannel {
-        channel_id: CLOSED_CHANNEL_ID,
-        reason_code: "".to_string().try_into().unwrap(),
-    }));
+    let close_channel =
+        AnyMessageOwned::Mining(parsers_sv2::MiningOwned::CloseChannel(CloseChannelOwned {
+            channel_id: CLOSED_CHANNEL_ID,
+            reason_code: "".try_into().unwrap(),
+        }));
     send_to_tproxy.send(close_channel).await.unwrap();
     sniffer
         .wait_for_message_type_and_clean_queue(
@@ -1659,7 +1829,10 @@ async fn non_aggregated_translator_correctly_deals_with_close_channel_message() 
             )
             .await;
         let submit_shares_extended = match sniffer.next_message_from_downstream() {
-            Some((_, AnyMessage::Mining(parsers_sv2::Mining::SubmitSharesExtended(msg)))) => msg,
+            Some((
+                _,
+                AnyMessageOwned::Mining(parsers_sv2::MiningOwned::SubmitSharesExtended(msg)),
+            )) => msg,
             msg => panic!("Expected SubmitSharesExtended message, found: {:?}", msg),
         };
 
@@ -1688,10 +1861,11 @@ async fn non_aggregated_translator_correctly_deals_with_close_channel_message() 
     }
 
     // now let's send a CloseChannel for the group channel
-    let close_channel = AnyMessage::Mining(parsers_sv2::Mining::CloseChannel(CloseChannel {
-        channel_id: GROUP_CHANNEL_ID,
-        reason_code: "".to_string().try_into().unwrap(),
-    }));
+    let close_channel =
+        AnyMessageOwned::Mining(parsers_sv2::MiningOwned::CloseChannel(CloseChannelOwned {
+            channel_id: GROUP_CHANNEL_ID,
+            reason_code: "".try_into().unwrap(),
+        }));
     send_to_tproxy.send(close_channel).await.unwrap();
     sniffer
         .wait_for_message_type_and_clean_queue(
@@ -1756,12 +1930,12 @@ async fn aggregated_translator_triggers_fallback_on_close_channel_message() {
         )
         .await;
 
-    let setup_connection_success = AnyMessage::Common(CommonMessages::SetupConnectionSuccess(
-        SetupConnectionSuccess {
+    let setup_connection_success = AnyMessageOwned::Common(
+        CommonMessagesOwned::SetupConnectionSuccess(SetupConnectionSuccessOwned {
             used_version: 2,
             flags: 0,
-        },
-    ));
+        }),
+    );
     send_to_tproxy_a
         .send(setup_connection_success)
         .await
@@ -1780,29 +1954,35 @@ async fn aggregated_translator_triggers_fallback_on_close_channel_message() {
             MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL,
         )
         .await;
-    let open_extended_mining_channel: OpenExtendedMiningChannel = loop {
+    let open_extended_mining_channel: OpenExtendedMiningChannelOwned = loop {
         match sniffer_a.next_message_from_downstream() {
-            Some((_, AnyMessage::Mining(parsers_sv2::Mining::OpenExtendedMiningChannel(msg)))) => {
+            Some((
+                _,
+                AnyMessageOwned::Mining(parsers_sv2::MiningOwned::OpenExtendedMiningChannel(msg)),
+            )) => {
                 break msg;
             }
             _ => continue,
         };
     };
 
-    let open_extended_mining_channel_success = AnyMessage::Mining(
-        parsers_sv2::Mining::OpenExtendedMiningChannelSuccess(OpenExtendedMiningChannelSuccess {
-            request_id: open_extended_mining_channel.request_id,
-            channel_id: 0,
-            target: hex::decode("0000137c578190689425e3ecf8449a1af39db0aed305d9206f45ac32fe8330fc")
+    let open_extended_mining_channel_success =
+        AnyMessageOwned::Mining(parsers_sv2::MiningOwned::OpenExtendedMiningChannelSuccess(
+            OpenExtendedMiningChannelSuccessOwned {
+                request_id: open_extended_mining_channel.request_id,
+                channel_id: 0,
+                target: hex::decode(
+                    "0000137c578190689425e3ecf8449a1af39db0aed305d9206f45ac32fe8330fc",
+                )
                 .unwrap()
                 .try_into()
                 .unwrap(),
-            // full extranonce has a total of 12 bytes
-            extranonce_size: 8,
-            extranonce_prefix: vec![0x00, 0x01, 0x00, 0x00].try_into().unwrap(),
-            group_channel_id: 100,
-        }),
-    );
+                // full extranonce has a total of 12 bytes
+                extranonce_size: 8,
+                extranonce_prefix: vec![0x00, 0x01, 0x00, 0x00].try_into().unwrap(),
+                group_channel_id: 100,
+            },
+        ));
     send_to_tproxy_a
         .send(open_extended_mining_channel_success)
         .await
@@ -1815,13 +1995,13 @@ async fn aggregated_translator_triggers_fallback_on_close_channel_message() {
         )
         .await;
 
-    let new_extended_mining_job = AnyMessage::Mining(parsers_sv2::Mining::NewExtendedMiningJob(NewExtendedMiningJob {
+    let new_extended_mining_job = AnyMessageOwned::Mining(parsers_sv2::MiningOwned::NewExtendedMiningJob(NewExtendedMiningJobOwned {
             channel_id: 0,
             job_id: 1,
-            min_ntime: Sv2Option::new(None),
+            min_ntime: Sv2OptionOwned::new(None),
             version: 0x20000000,
             version_rolling_allowed: true,
-            merkle_path: Seq0255::new(vec![]).unwrap(),
+            merkle_path: Seq0255Owned::new(vec![]).unwrap(),
             // scriptSig for a total of 8 bytes of extranonce
             coinbase_tx_prefix: hex::decode("02000000010000000000000000000000000000000000000000000000000000000000000000ffffffff265200162f5374726174756d2056322053524920506f6f6c2f2f08").unwrap().try_into().unwrap(),
             coinbase_tx_suffix: hex::decode("feffffff0200f2052a01000000160014ebe1b7dcc293ccaa0ee743a86f89df8258c208fc0000000000000000266a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf901000000").unwrap().try_into().unwrap(),
@@ -1838,8 +2018,8 @@ async fn aggregated_translator_triggers_fallback_on_close_channel_message() {
         )
         .await;
 
-    let set_new_prev_hash =
-        AnyMessage::Mining(parsers_sv2::Mining::SetNewPrevHash(SetNewPrevHash {
+    let set_new_prev_hash = AnyMessageOwned::Mining(parsers_sv2::MiningOwned::SetNewPrevHash(
+        SetNewPrevHashOwned {
             channel_id: 0,
             job_id: 1,
             prev_hash: hex::decode(
@@ -1850,7 +2030,8 @@ async fn aggregated_translator_triggers_fallback_on_close_channel_message() {
             .unwrap(),
             min_ntime: 1766782170,
             nbits: 0x207fffff,
-        }));
+        },
+    ));
 
     send_to_tproxy_a.send(set_new_prev_hash).await.unwrap();
     sniffer_a
@@ -1862,10 +2043,11 @@ async fn aggregated_translator_triggers_fallback_on_close_channel_message() {
 
     // up until now, we have done the usual channel initialization process
     // now, lets send a CloseChannel message for the channel
-    let close_channel = AnyMessage::Mining(parsers_sv2::Mining::CloseChannel(CloseChannel {
-        channel_id: 0,
-        reason_code: "".to_string().try_into().unwrap(),
-    }));
+    let close_channel =
+        AnyMessageOwned::Mining(parsers_sv2::MiningOwned::CloseChannel(CloseChannelOwned {
+            channel_id: 0,
+            reason_code: "".try_into().unwrap(),
+        }));
     send_to_tproxy_a.send(close_channel).await.unwrap();
 
     // this should trigger fallback
@@ -1899,19 +2081,18 @@ async fn translator_does_not_shutdown_on_missing_downstream_channel() {
         )
         .await;
 
-    let setup_connection_success = AnyMessage::Common(CommonMessages::SetupConnectionSuccess(
-        SetupConnectionSuccess {
+    let setup_connection_success = AnyMessageOwned::Common(
+        CommonMessagesOwned::SetupConnectionSuccess(SetupConnectionSuccessOwned {
             used_version: 2,
             flags: 0,
-        },
-    ));
+        }),
+    );
     send_to_tproxy_a
         .send(setup_connection_success)
         .await
         .unwrap();
 
-    let (_minerd_process, _minerd_addr) =
-        start_minerd(tproxy_addr.clone(), None, None, false).await;
+    let (_minerd_process, _minerd_addr) = start_minerd(tproxy_addr, None, None, false).await;
 
     sniffer_a
         .wait_for_message_type(
@@ -1919,29 +2100,35 @@ async fn translator_does_not_shutdown_on_missing_downstream_channel() {
             MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL,
         )
         .await;
-    let open_extended_mining_channel: OpenExtendedMiningChannel = loop {
+    let open_extended_mining_channel: OpenExtendedMiningChannelOwned = loop {
         match sniffer_a.next_message_from_downstream() {
-            Some((_, AnyMessage::Mining(parsers_sv2::Mining::OpenExtendedMiningChannel(msg)))) => {
+            Some((
+                _,
+                AnyMessageOwned::Mining(parsers_sv2::MiningOwned::OpenExtendedMiningChannel(msg)),
+            )) => {
                 break msg;
             }
             _ => continue,
         };
     };
 
-    let open_extended_mining_channel_success = AnyMessage::Mining(
-        parsers_sv2::Mining::OpenExtendedMiningChannelSuccess(OpenExtendedMiningChannelSuccess {
-            request_id: open_extended_mining_channel.request_id,
-            channel_id: 0,
-            target: hex::decode("0000137c578190689425e3ecf8449a1af39db0aed305d9206f45ac32fe8330fc")
+    let open_extended_mining_channel_success =
+        AnyMessageOwned::Mining(parsers_sv2::MiningOwned::OpenExtendedMiningChannelSuccess(
+            OpenExtendedMiningChannelSuccessOwned {
+                request_id: open_extended_mining_channel.request_id,
+                channel_id: 0,
+                target: hex::decode(
+                    "0000137c578190689425e3ecf8449a1af39db0aed305d9206f45ac32fe8330fc",
+                )
                 .unwrap()
                 .try_into()
                 .unwrap(),
-            // full extranonce has a total of 12 bytes
-            extranonce_size: 8,
-            extranonce_prefix: vec![0x00, 0x01, 0x00, 0x00].try_into().unwrap(),
-            group_channel_id: 100,
-        }),
-    );
+                // full extranonce has a total of 12 bytes
+                extranonce_size: 8,
+                extranonce_prefix: vec![0x00, 0x01, 0x00, 0x00].try_into().unwrap(),
+                group_channel_id: 100,
+            },
+        ));
     send_to_tproxy_a
         .send(open_extended_mining_channel_success)
         .await
@@ -1954,13 +2141,13 @@ async fn translator_does_not_shutdown_on_missing_downstream_channel() {
         )
         .await;
 
-    let new_extended_mining_job = AnyMessage::Mining(parsers_sv2::Mining::NewExtendedMiningJob(NewExtendedMiningJob {
+    let new_extended_mining_job = AnyMessageOwned::Mining(parsers_sv2::MiningOwned::NewExtendedMiningJob(NewExtendedMiningJobOwned {
             channel_id: 0,
             job_id: 1,
-            min_ntime: Sv2Option::new(None),
+            min_ntime: Sv2OptionOwned::new(None),
             version: 0x20000000,
             version_rolling_allowed: true,
-            merkle_path: Seq0255::new(vec![]).unwrap(),
+            merkle_path: Seq0255Owned::new(vec![]).unwrap(),
             // scriptSig for a total of 8 bytes of extranonce
             coinbase_tx_prefix: hex::decode("02000000010000000000000000000000000000000000000000000000000000000000000000ffffffff265200162f5374726174756d2056322053524920506f6f6c2f2f08").unwrap().try_into().unwrap(),
             coinbase_tx_suffix: hex::decode("feffffff0200f2052a01000000160014ebe1b7dcc293ccaa0ee743a86f89df8258c208fc0000000000000000266a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf901000000").unwrap().try_into().unwrap(),
@@ -1977,8 +2164,8 @@ async fn translator_does_not_shutdown_on_missing_downstream_channel() {
         )
         .await;
 
-    let set_new_prev_hash =
-        AnyMessage::Mining(parsers_sv2::Mining::SetNewPrevHash(SetNewPrevHash {
+    let set_new_prev_hash = AnyMessageOwned::Mining(parsers_sv2::MiningOwned::SetNewPrevHash(
+        SetNewPrevHashOwned {
             channel_id: 0,
             job_id: 1,
             prev_hash: hex::decode(
@@ -1989,7 +2176,8 @@ async fn translator_does_not_shutdown_on_missing_downstream_channel() {
             .unwrap(),
             min_ntime: 1766782170,
             nbits: 0x207fffff,
-        }));
+        },
+    ));
 
     send_to_tproxy_a.send(set_new_prev_hash).await.unwrap();
     sniffer_a
@@ -2000,7 +2188,7 @@ async fn translator_does_not_shutdown_on_missing_downstream_channel() {
         .await;
 
     // SetTarget message with channel id not present in downstream
-    let set_target = AnyMessage::Mining(parsers_sv2::Mining::SetTarget(SetTarget {
+    let set_target = AnyMessageOwned::Mining(parsers_sv2::MiningOwned::SetTarget(SetTargetOwned {
         channel_id: 5,
         maximum_target: [0; 32].into(),
     }));
@@ -2052,12 +2240,12 @@ async fn aggregated_translator_handles_downstream_connecting_during_future_job()
         )
         .await;
 
-    let setup_connection_success = AnyMessage::Common(CommonMessages::SetupConnectionSuccess(
-        SetupConnectionSuccess {
+    let setup_connection_success = AnyMessageOwned::Common(
+        CommonMessagesOwned::SetupConnectionSuccess(SetupConnectionSuccessOwned {
             used_version: 2,
             flags: 0,
-        },
-    ));
+        }),
+    );
     send_to_tproxy.send(setup_connection_success).await.unwrap();
 
     // Keep references to minerd processes and SV1 sniffers so they don't get dropped
@@ -2078,9 +2266,12 @@ async fn aggregated_translator_handles_downstream_connecting_during_future_job()
         )
         .await;
 
-    let open_extended_mining_channel: OpenExtendedMiningChannel = loop {
+    let open_extended_mining_channel: OpenExtendedMiningChannelOwned = loop {
         match sniffer.next_message_from_downstream() {
-            Some((_, AnyMessage::Mining(parsers_sv2::Mining::OpenExtendedMiningChannel(msg)))) => {
+            Some((
+                _,
+                AnyMessageOwned::Mining(parsers_sv2::MiningOwned::OpenExtendedMiningChannel(msg)),
+            )) => {
                 break msg;
             }
             _ => continue,
@@ -2088,20 +2279,23 @@ async fn aggregated_translator_handles_downstream_connecting_during_future_job()
     };
 
     // Send OpenExtendedMiningChannelSuccess for the aggregated channel
-    let open_extended_mining_channel_success = AnyMessage::Mining(
-        parsers_sv2::Mining::OpenExtendedMiningChannelSuccess(OpenExtendedMiningChannelSuccess {
-            request_id: open_extended_mining_channel.request_id,
-            channel_id: 2, // aggregated channel ID
-            target: hex::decode("0000137c578190689425e3ecf8449a1af39db0aed305d9206f45ac32fe8330fc")
+    let open_extended_mining_channel_success =
+        AnyMessageOwned::Mining(parsers_sv2::MiningOwned::OpenExtendedMiningChannelSuccess(
+            OpenExtendedMiningChannelSuccessOwned {
+                request_id: open_extended_mining_channel.request_id,
+                channel_id: 2, // aggregated channel ID
+                target: hex::decode(
+                    "0000137c578190689425e3ecf8449a1af39db0aed305d9206f45ac32fe8330fc",
+                )
                 .unwrap()
                 .try_into()
                 .unwrap(),
-            // full extranonce has a total of 12 bytes
-            extranonce_size: 8,
-            extranonce_prefix: vec![0x00, 0x01, 0x00, 0x00].try_into().unwrap(),
-            group_channel_id: 1,
-        }),
-    );
+                // full extranonce has a total of 12 bytes
+                extranonce_size: 8,
+                extranonce_prefix: vec![0x00, 0x01, 0x00, 0x00].try_into().unwrap(),
+                group_channel_id: 1,
+            },
+        ));
     send_to_tproxy
         .send(open_extended_mining_channel_success)
         .await
@@ -2115,14 +2309,14 @@ async fn aggregated_translator_handles_downstream_connecting_during_future_job()
         .await;
 
     // Send a FUTURE job (min_ntime: None) - this job is not active yet!
-    let future_job = AnyMessage::Mining(parsers_sv2::Mining::NewExtendedMiningJob(
-        NewExtendedMiningJob {
+    let future_job = AnyMessageOwned::Mining(parsers_sv2::MiningOwned::NewExtendedMiningJob(
+        NewExtendedMiningJobOwned {
             channel_id: 2,
             job_id: 1,
-            min_ntime: Sv2Option::new(None), // This makes it a future job!
+            min_ntime: Sv2OptionOwned::new(None), // This makes it a future job!
             version: 0x20000000,
             version_rolling_allowed: true,
-            merkle_path: Seq0255::new(vec![]).unwrap(),
+            merkle_path: Seq0255Owned::new(vec![]).unwrap(),
             coinbase_tx_prefix: hex::decode("02000000010000000000000000000000000000000000000000000000000000000000000000ffffffff265200162f5374726174756d2056322053524920506f6f6c2f2f0c").unwrap().try_into().unwrap(),
             coinbase_tx_suffix: hex::decode("feffffff0200f2052a01000000160014ebe1b7dcc293ccaa0ee743a86f89df8258c208fc0000000000000000266a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf901000000").unwrap().try_into().unwrap(),
         },
@@ -2153,8 +2347,8 @@ async fn aggregated_translator_handles_downstream_connecting_during_future_job()
     // Now send SetNewPrevHash to activate the future job
     // Without the fix, this would cause "Failed to set new prev hash: JobIdNotFound"
     // because the second downstream's channel wouldn't have the future job
-    let set_new_prev_hash =
-        AnyMessage::Mining(parsers_sv2::Mining::SetNewPrevHash(SetNewPrevHash {
+    let set_new_prev_hash = AnyMessageOwned::Mining(parsers_sv2::MiningOwned::SetNewPrevHash(
+        SetNewPrevHashOwned {
             channel_id: 2,
             job_id: 1,
             prev_hash: hex::decode(
@@ -2165,7 +2359,8 @@ async fn aggregated_translator_handles_downstream_connecting_during_future_job()
             .unwrap(),
             min_ntime: 1766782170,
             nbits: 0x207fffff,
-        }));
+        },
+    ));
 
     send_to_tproxy.send(set_new_prev_hash).await.unwrap();
     sniffer
@@ -2478,12 +2673,12 @@ async fn tproxy_sends_per_upstream_user_identity() {
         .await;
 
     send_to_tproxy
-        .send(AnyMessage::Common(CommonMessages::SetupConnectionSuccess(
-            SetupConnectionSuccess {
+        .send(AnyMessageOwned::Common(
+            CommonMessagesOwned::SetupConnectionSuccess(SetupConnectionSuccessOwned {
                 used_version: 2,
                 flags: 0,
-            },
-        )))
+            }),
+        ))
         .await
         .unwrap();
 
@@ -2498,9 +2693,10 @@ async fn tproxy_sends_per_upstream_user_identity() {
 
     let oemc = loop {
         match sniffer.next_message_from_downstream() {
-            Some((_, AnyMessage::Mining(parsers_sv2::Mining::OpenExtendedMiningChannel(msg)))) => {
-                break msg
-            }
+            Some((
+                _,
+                AnyMessageOwned::Mining(parsers_sv2::MiningOwned::OpenExtendedMiningChannel(msg)),
+            )) => break msg,
             _ => continue,
         }
     };
@@ -2562,10 +2758,10 @@ async fn tproxy_per_upstream_user_identity_switches_on_fallback() {
         .wait_for_message_type(MessageDirection::ToUpstream, MESSAGE_TYPE_SETUP_CONNECTION)
         .await;
     send_to_tproxy
-        .send(AnyMessage::Common(
-            parsers_sv2::CommonMessages::SetupConnectionError(SetupConnectionError {
+        .send(AnyMessageOwned::Common(
+            parsers_sv2::CommonMessagesOwned::SetupConnectionError(SetupConnectionErrorOwned {
                 flags: 0,
-                error_code: "test-identity-fallback".to_string().try_into().unwrap(),
+                error_code: "test-identity-fallback".try_into().unwrap(),
             }),
         ))
         .await
@@ -2596,9 +2792,10 @@ async fn tproxy_per_upstream_user_identity_switches_on_fallback() {
 
     let oemc = loop {
         match sniffer_2.next_message_from_downstream() {
-            Some((_, AnyMessage::Mining(parsers_sv2::Mining::OpenExtendedMiningChannel(msg)))) => {
-                break msg
-            }
+            Some((
+                _,
+                AnyMessageOwned::Mining(parsers_sv2::MiningOwned::OpenExtendedMiningChannel(msg)),
+            )) => break msg,
             _ => continue,
         }
     };

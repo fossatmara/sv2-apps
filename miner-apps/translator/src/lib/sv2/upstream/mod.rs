@@ -5,22 +5,25 @@ use crate::{
     io_task::spawn_io_tasks,
     utils::UpstreamEntry,
 };
-use async_channel::{unbounded, Receiver, Sender};
+use async_channel::{Receiver, Sender, unbounded};
 use std::{net::SocketAddr, sync::Arc};
 use stratum_apps::{
     channel_utils::ReceiverCleanup,
     fallback_coordinator::FallbackCoordinator,
-    network_helpers::{self, connect_with_noise, resolve_host, TCP_CONNECT_TIMEOUT},
+    network_helpers::{self, TCP_CONNECT_TIMEOUT, connect_with_noise, resolve_host},
     stratum_core::{
-        binary_sv2::Seq064K,
-        common_messages_sv2::{Protocol, SetupConnection},
-        extensions_sv2::RequestExtensions,
-        handlers_sv2::HandleCommonMessagesFromServerAsync,
-        parsers_sv2::AnyMessage,
+        binary_sv2::Seq064KOwned,
+        common_messages_sv2::{
+            MESSAGE_TYPE_SETUP_CONNECTION_ERROR, MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS, Protocol,
+            SetupConnectionOwned,
+        },
+        extensions_sv2::RequestExtensionsOwned,
+        handlers_sv2::HandleCommonMessagesFromServerOwnedAsync,
+        parsers_sv2::AnyMessageOwned,
     },
     task_manager::TaskManager,
     utils::{
-        protocol_message_type::{protocol_message_type, MessageType},
+        protocol_message_type::{MessageType, protocol_message_type},
         types::{Message, Sv2Frame},
     },
 };
@@ -362,6 +365,18 @@ impl Upstream {
             TproxyError::fallback(TproxyErrorKind::UnexpectedMessage(0, 0))
         })?;
 
+        if header.ext_type() != 0
+            || !matches!(
+                header.msg_type(),
+                MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS | MESSAGE_TYPE_SETUP_CONNECTION_ERROR
+            )
+        {
+            return Err(TproxyError::fallback(TproxyErrorKind::UnexpectedMessage(
+                header.ext_type(),
+                header.msg_type(),
+            )));
+        }
+
         let payload = incoming.payload();
 
         self.handle_common_message_frame_from_server(None, header, payload)
@@ -370,21 +385,20 @@ impl Upstream {
 
         // Send RequestExtensions message if there are any required extensions
         if !self.required_extensions.is_empty() {
-            let require_extensions = RequestExtensions {
+            let require_extensions = RequestExtensionsOwned {
                 request_id: 1,
-                requested_extensions: Seq064K::new(self.required_extensions.clone())
+                requested_extensions: Seq064KOwned::new(self.required_extensions.clone())
                     .map_err(TproxyError::shutdown)?,
             };
 
             info!(
-                "Sending RequestExtensions message to upstream: {}",
+                "Sending RequestExtensions message to upstream: {:?}",
                 require_extensions
             );
 
-            let sv2_frame: Sv2Frame =
-                AnyMessage::Extensions(require_extensions.into_static().into())
-                    .try_into()
-                    .map_err(TproxyError::shutdown)?;
+            let sv2_frame: Sv2Frame = AnyMessageOwned::Extensions(require_extensions.into())
+                .try_into()
+                .map_err(TproxyError::shutdown)?;
 
             self.upstream_io
                 .upstream_sender
@@ -551,19 +565,19 @@ impl Upstream {
         max_version: u16,
         address: &SocketAddr,
         is_work_selection_enabled: bool,
-    ) -> Result<SetupConnection<'static>, TproxyErrorKind> {
-        let endpoint_host = address.ip().to_string().into_bytes().try_into()?;
-        let vendor = "SRI".to_string().try_into()?;
-        let hardware_version = "Translator Proxy".to_string().try_into()?;
-        let firmware = String::new().try_into()?;
-        let device_id = String::new().try_into()?;
+    ) -> Result<SetupConnectionOwned, TproxyErrorKind> {
+        let endpoint_host = address.ip().to_string().try_into()?;
+        let vendor = "SRI".try_into()?;
+        let hardware_version = "Translator Proxy".try_into()?;
+        let firmware = "".try_into()?;
+        let device_id = "".try_into()?;
         let flags = if is_work_selection_enabled {
             0b110
         } else {
             0b100
         };
 
-        Ok(SetupConnection {
+        Ok(SetupConnectionOwned {
             protocol: Protocol::MiningProtocol,
             min_version,
             max_version,

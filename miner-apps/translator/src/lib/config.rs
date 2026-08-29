@@ -6,8 +6,9 @@
 //! managing connections and settings for both upstream and downstream interfaces.
 //!
 //! This module handles:
-//! - Upstream server address, port, and authentication key ([`UpstreamConfig`])
-//! - Downstream interface address and port ([`DownstreamConfig`])
+//! - Upstream server address, port, and authentication key ([`Upstream`])
+//! - Downstream interface address and port ([`TranslatorConfig::downstream_address`],
+//!   [`TranslatorConfig::downstream_port`])
 //! - Supported protocol versions
 //! - Downstream difficulty adjustment parameters ([`DownstreamDifficultyConfig`])
 use std::path::{Path, PathBuf};
@@ -60,6 +61,15 @@ pub struct TranslatorConfig {
     monitoring_address: Option<SocketAddr>,
     #[serde(default)]
     monitoring_cache_refresh_secs: Option<u64>,
+    #[serde(default)]
+    miner_telemetry: MinerTelemetryConfig,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct MinerTelemetryConfig {
+    /// Private IPv4 CIDRs to scan for miner management interfaces.
+    #[serde(default)]
+    pub cidrs: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -127,6 +137,7 @@ impl TranslatorConfig {
             log_file: None,
             monitoring_address,
             monitoring_cache_refresh_secs,
+            miner_telemetry: MinerTelemetryConfig::default(),
         }
     }
 
@@ -140,6 +151,11 @@ impl TranslatorConfig {
         self.monitoring_cache_refresh_secs
     }
 
+    /// Returns the miner management CIDRs used for telemetry discovery.
+    pub fn miner_telemetry_cidrs(&self) -> &[String] {
+        &self.miner_telemetry.cidrs
+    }
+
     pub(crate) fn expected_payout_distribution(
         &self,
         user_identity: &str,
@@ -149,9 +165,11 @@ impl TranslatorConfig {
         }
 
         match PayoutMode::try_from(user_identity) {
-            Ok(payout_mode @ (PayoutMode::Solo { .. } | PayoutMode::Donate { .. })) => {
-                Ok(Some(payout_mode))
-            }
+            Ok(
+                payout_mode @ (PayoutMode::Solo { .. }
+                | PayoutMode::LegacySolo { .. }
+                | PayoutMode::Donate { .. }),
+            ) => Ok(Some(payout_mode)),
             Ok(PayoutMode::FullDonation) => Err(PayoutModeError::MissingMinerPayout {
                 user_identity: user_identity.to_string(),
                 mode: MissingMinerPayoutMode::FullDonation,
@@ -296,10 +314,12 @@ mod tests {
             None,
         );
 
-        assert!(disabled_config
-            .expected_payout_distribution(payout_address)
-            .unwrap()
-            .is_none());
+        assert!(
+            disabled_config
+                .expected_payout_distribution(payout_address)
+                .unwrap()
+                .is_none()
+        );
 
         let enabled_config = TranslatorConfig::new(
             upstreams,
@@ -321,7 +341,7 @@ mod tests {
             enabled_config
                 .expected_payout_distribution(payout_address)
                 .unwrap(),
-            Some(PayoutMode::Solo { .. })
+            Some(PayoutMode::LegacySolo { .. })
         ));
     }
 

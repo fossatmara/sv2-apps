@@ -1,27 +1,27 @@
 use std::sync::{
-    atomic::{AtomicU8, Ordering},
     Arc,
+    atomic::{AtomicU8, Ordering},
 };
-
 use stratum_apps::{
     key_utils::Secp256k1PublicKey,
     stratum_core::{
-        binary_sv2::{Sv2DataType, U256},
+        binary_sv2::U256Owned,
         bitcoin::{
+            CompactTarget, Target, TxMerkleNode,
             block::{Header, Version},
             hashes::Hash,
-            CompactTarget, Target, TxMerkleNode,
         },
         channels_sv2::{
             merkle_root::merkle_root_from_path,
             target::{bytes_to_hex, u256_to_block_hash},
         },
+        extensions_sv2::{MAX_USER_IDENTITY_LENGTH, UserIdentity},
         sv1_api::{
+            Message,
             client_to_server::{self, Submit},
             json_rpc,
             server_to_client::Notify,
-            utils::HexU32Be,
-            Message,
+            utils::{HexU32Be, VERSION_ROLLING_MASK},
         },
     },
     utils::types::{ChannelId, DownstreamId},
@@ -57,11 +57,11 @@ pub const AGGREGATED_CHANNEL_ID: ChannelId = u32::MAX;
 /// * `Ok(false)` if the share is valid but doesn't meet the target
 /// * `Err(TproxyError)` if validation fails due to missing job or invalid data
 pub fn validate_sv1_share(
-    share: &client_to_server::Submit<'static>,
+    share: &client_to_server::Submit,
     target: Target,
     extranonce1: Vec<u8>,
     version_rolling_mask: Option<HexU32Be>,
-    job: Notify<'static>,
+    job: Notify,
 ) -> Result<bool, TproxyErrorKind> {
     let mut full_extranonce = vec![];
     full_extranonce.extend_from_slice(extranonce1.as_slice());
@@ -72,11 +72,14 @@ pub fn validate_sv1_share(
         .clone()
         .map(|vb| vb.0)
         .unwrap_or(job.version.0);
-    let mask = version_rolling_mask.unwrap_or(HexU32Be(0x1FFFE000_u32)).0;
+    let mask = version_rolling_mask
+        .unwrap_or(HexU32Be(VERSION_ROLLING_MASK))
+        .0;
     let version = (job.version.0 & !mask) | (share_version & mask);
 
-    let prev_hash_vec: Vec<u8> = job.prev_hash.clone().into();
-    let prev_hash = U256::from_vec_(prev_hash_vec).map_err(TproxyErrorKind::BinarySv2)?;
+    let prev_hash: U256Owned = Vec::<u8>::from(job.prev_hash.clone())
+        .try_into()
+        .map_err(TproxyErrorKind::BinarySv2)?;
 
     // calculate the merkle root from:
     // - job coinbase_tx_prefix
@@ -89,9 +92,7 @@ pub fn validate_sv1_share(
         full_extranonce.as_ref(),
         job.merkle_branch.as_ref(),
     )
-    .ok_or(TproxyErrorKind::InvalidMerkleRoot)?
-    .try_into()
-    .map_err(|_| TproxyErrorKind::InvalidMerkleRoot)?;
+    .ok_or(TproxyErrorKind::InvalidMerkleRoot)?;
 
     // create the header for validation
     let header = Header {
@@ -240,7 +241,7 @@ pub struct SubmitShareWithChannelId {
     /// The downstream connection ID that submitted this share
     pub downstream_id: DownstreamId,
     /// The actual SV1 share submission data
-    pub share: Submit<'static>,
+    pub share: Submit,
     /// The complete extranonce used for this share
     pub extranonce: Vec<u8>,
     /// The length of the extranonce2 field
@@ -264,27 +265,94 @@ pub(crate) fn is_mining_authorize(msg: &Message) -> bool {
     }
 }
 
-/// Truncates a string to [`MAX_USER_IDENTITY_BYTES`], respecting UTF-8 character boundaries.
-///
-/// If the input string exceeds the limit, it is truncated at the last valid UTF-8 character
-/// boundary before or at [`MAX_USER_IDENTITY_BYTES`] and a warning is logged.
-pub(crate) fn tlv_compatible_username(s: &str) -> &str {
-    const MAX_USER_IDENTITY_BYTES: usize = 32;
-    let len = s.len();
+/// Derives the SV1 worker name from the full `mining.authorize` username.
+pub(crate) fn sv1_worker_name_from_sv1_username(sv1_username: &str) -> &str {
+    sv1_username
+        .split_once('.')
+        .map(|(_, worker_name)| worker_name)
+        .filter(|worker_name| !worker_name.is_empty())
+        .unwrap_or(sv1_username)
+}
 
-    if len <= MAX_USER_IDENTITY_BYTES {
-        return s;
+/// Formats the user identity used by the single upstream channel in aggregated mode.
+pub(crate) fn aggregated_upstream_user_identity(user_identity: &str) -> String {
+    if user_identity.starts_with("sri/") {
+        user_identity.to_string()
+    } else if let Some((account, _)) = user_identity.split_once('.') {
+        format!("{account}.translator-proxy")
+    } else {
+        format!("{user_identity}.translator-proxy")
     }
-    // Find the last valid UTF-8 char boundary at or before MAX_USER_IDENTITY_BYTES
-    let mut end = MAX_USER_IDENTITY_BYTES;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
+}
+
+/// Builds the TLV `UserIdentity` used by extension 0x0002 from an SV1 worker name.
+///
+/// This is intentionally TLV-specific: the full SV1 username and derived worker
+/// name stay unmodified in translator state, and truncation only happens when
+/// extension 0x0002 has been negotiated and the wire TLV is being built.
+pub(crate) fn tlv_user_identity_from_sv1_worker_name(
+    sv1_worker_name: &str,
+) -> Result<UserIdentity, TproxyErrorKind> {
+    let len = sv1_worker_name.len();
+    let tlv_user_identity = if len <= MAX_USER_IDENTITY_LENGTH {
+        sv1_worker_name
+    } else {
+        let mut end = MAX_USER_IDENTITY_LENGTH;
+        while end > 0 && !sv1_worker_name.is_char_boundary(end) {
+            end -= 1;
+        }
+        let tlv_user_identity = &sv1_worker_name[..end];
+        warn!(
+            "extension 0x0002 negotiated; sv1_worker_name '{}' exceeds {} bytes ({} bytes), \
+             truncating TLV user_identity to '{}'",
+            sv1_worker_name, MAX_USER_IDENTITY_LENGTH, len, tlv_user_identity
+        );
+        tlv_user_identity
+    };
+
+    UserIdentity::new(tlv_user_identity)
+        .map_err(|_| TproxyErrorKind::InvalidUserIdentity(tlv_user_identity.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn derives_sv1_worker_name_from_first_dot() {
+        assert_eq!(
+            sv1_worker_name_from_sv1_username("account.worker1"),
+            "worker1"
+        );
+        assert_eq!(sv1_worker_name_from_sv1_username("worker1"), "worker1");
+        assert_eq!(sv1_worker_name_from_sv1_username("addr.rig.01"), "rig.01");
+        assert_eq!(sv1_worker_name_from_sv1_username("account."), "account.");
     }
-    let truncated = &s[..end];
-    warn!(
-        "Username '{}' exceeds {} bytes ({} bytes), truncating to '{}'. \
-         Consider using a shorter username for full visibility on the pool dashboard.",
-        s, MAX_USER_IDENTITY_BYTES, len, truncated
-    );
-    truncated
+
+    #[test]
+    fn formats_aggregated_upstream_user_identity() {
+        assert_eq!(
+            aggregated_upstream_user_identity("account.miner1"),
+            "account.translator-proxy"
+        );
+        assert_eq!(
+            aggregated_upstream_user_identity("account"),
+            "account.translator-proxy"
+        );
+        assert_eq!(
+            aggregated_upstream_user_identity("sri/solo/addr/worker"),
+            "sri/solo/addr/worker"
+        );
+    }
+
+    #[test]
+    fn truncates_tlv_user_identity_without_splitting_utf8() {
+        let worker_name = format!("{}é", "a".repeat(MAX_USER_IDENTITY_LENGTH - 1));
+        let tlv_user_identity = tlv_user_identity_from_sv1_worker_name(&worker_name)
+            .expect("truncated worker name should build a valid TLV UserIdentity");
+        let expected = "a".repeat(MAX_USER_IDENTITY_LENGTH - 1);
+
+        assert_eq!(tlv_user_identity.len(), MAX_USER_IDENTITY_LENGTH - 1);
+        assert_eq!(tlv_user_identity.as_str(), Some(expected.as_str()));
+    }
 }

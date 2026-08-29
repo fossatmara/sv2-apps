@@ -6,50 +6,38 @@ on:
     branches:
       - mara
 
-name: MSRV 1.85 Check
+name: MSRV 1.88 Check
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      RUSTFLAGS: -C debuginfo=0
 
     steps:
       - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v1.2.0
-      - uses: dtolnay/rust-toolchain@1.85
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: "false"
+          # Hash every Cargo workspace without registering the shared target more than once.
+          key: cargo-inputs-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
+          workspaces: integration-tests -> ../target
 
       - name: Install capnp dependencies
         run: sudo apt-get install -y capnproto libcapnp-dev
 
-      - name: Build stratum-apps workspace
-        run: cargo build --manifest-path=stratum-apps/Cargo.toml --all-features
-
-      - name: Build pool
-        run: cargo build --manifest-path=pool-apps/Cargo.toml --all-features
-
-      - name: Build jd-server (separate workspace)
-        run: cargo build --manifest-path=pool-apps/jd-server/Cargo.toml --all-features
-
-      - name: Build miner applications workspace
-        run: cargo build --manifest-path=miner-apps/Cargo.toml --all-features
-
-      - name: Build integration tests workspace
-        run: cargo build --manifest-path=integration-tests/Cargo.toml
-
-      - name: Build bitcoin-core-sv2 crate
-        run: cargo build --manifest-path=bitcoin-core-sv2/Cargo.toml
-
-      # Also check test compilation without running tests
+      # Check test compilation without running tests
       - name: Check test compilation for stratum-apps workspace
         run: cargo test --manifest-path=stratum-apps/Cargo.toml --all-features --no-run
 
       - name: Check test compilation for pool
-        run: cargo test --manifest-path=pool-apps/Cargo.toml --no-run
-
-      - name: Check test compilation for jd-server
-        run: cargo test --manifest-path=pool-apps/jd-server/Cargo.toml --no-run
+        run: cargo test --manifest-path=pool-apps/Cargo.toml --all-features --no-run
 
       - name: Check test compilation for miner applications workspace
-        run: cargo test --manifest-path=miner-apps/Cargo.toml --no-run
+        run: cargo test --manifest-path=miner-apps/Cargo.toml --all-features --no-run
 
       - name: Check test compilation for integration tests workspace
         run: cargo test --manifest-path=integration-tests/Cargo.toml --no-run

@@ -1,9 +1,13 @@
-use crate::template_distribution_protocol::error::TemplateDataError;
+//! Template-data helpers for Bitcoin Core v31.x Sv2 Template Distribution Protocol via capnp over
+//! UNIX socket.
+
+use crate::unix_capnp::v31x::template_distribution_protocol::error::TemplateDataError;
 
 use bitcoin_capnp_types::{
     mining_capnp::block_template::Client as BlockTemplateIpcClient,
     proxy_capnp::{thread::Client as ThreadIpcClient, thread_map::Client as ThreadMapIpcClient},
 };
+use bitcoin_capnp_types_v31 as bitcoin_capnp_types;
 use std::{fs::File, io::Write, path::Path};
 use stratum_core::bitcoin::{
     Target, Transaction, TxOut,
@@ -13,11 +17,13 @@ use stratum_core::bitcoin::{
 };
 
 use stratum_core::{
-    binary_sv2::{B016M, B064K, B0255, Seq064K, Seq0255, U256},
+    binary_sv2::{B016MOwned, B064KOwned, B0255Owned, Seq064KOwned, Seq0255Owned, U256Owned},
     template_distribution_sv2::{
-        NewTemplate, RequestTransactionDataSuccess, SetNewPrevHash, SubmitSolution,
+        NewTemplateOwned, RequestTransactionDataSuccessOwned, SetNewPrevHashOwned,
+        SubmitSolutionOwned,
     },
 };
+use tracing::{debug, error, info};
 
 #[derive(Clone)]
 pub struct TemplateData {
@@ -54,7 +60,7 @@ impl TemplateData {
         &self,
         thread_ipc_client: ThreadIpcClient,
     ) -> Result<(), TemplateDataError> {
-        tracing::debug!("Destroying template IPC client: {}", self.template_id);
+        debug!("Destroying template IPC client: {}", self.template_id);
         let mut destroy_ipc_client_request = self.template_ipc_client.destroy_request();
         let destroy_ipc_client_request_params = destroy_ipc_client_request.get();
 
@@ -74,8 +80,8 @@ impl TemplateData {
     pub fn get_new_template_message(
         &self,
         future_template: bool,
-    ) -> Result<NewTemplate<'static>, TemplateDataError> {
-        let new_template = NewTemplate {
+    ) -> Result<NewTemplateOwned, TemplateDataError> {
+        let new_template = NewTemplateOwned {
             template_id: self.template_id,
             future_template,
             version: self.get_version()?,
@@ -88,37 +94,36 @@ impl TemplateData {
             coinbase_tx_locktime: self.get_coinbase_tx_lock_time(),
             merkle_path: self.get_merkle_path()?,
         };
-        Ok(new_template.into_static())
+        Ok(new_template)
     }
 
     // please note that `SetNewPrevHash.target` is consensus and not weak-block
     // so it's essentially redundant with `SetNewPrevHash.n_bits`
-    pub fn get_set_new_prev_hash_message(&self) -> SetNewPrevHash<'static> {
-        let set_new_prev_hash = SetNewPrevHash {
+    pub fn get_set_new_prev_hash_message(&self) -> SetNewPrevHashOwned {
+        SetNewPrevHashOwned {
             template_id: self.template_id,
             prev_hash: self.get_prev_hash(),
             header_timestamp: self.get_ntime(),
             n_bits: self.get_nbits(),
             target: self.get_target(),
-        };
-        set_new_prev_hash.into_static()
+        }
     }
 
     pub async fn get_request_transaction_data_success_message(
         &self,
         thread_map: ThreadMapIpcClient,
-    ) -> Result<RequestTransactionDataSuccess<'static>, TemplateDataError> {
-        let request_transaction_data_success = RequestTransactionDataSuccess {
+    ) -> Result<RequestTransactionDataSuccessOwned, TemplateDataError> {
+        let request_transaction_data_success = RequestTransactionDataSuccessOwned {
             template_id: self.template_id,
             transaction_list: self.get_tx_data(thread_map).await?,
             excess_data: vec![]
                 .try_into()
                 .expect("empty vec should always be valid for B064K"),
         };
-        Ok(request_transaction_data_success.into_static())
+        Ok(request_transaction_data_success)
     }
 
-    pub fn get_prev_hash(&self) -> U256<'static> {
+    pub fn get_prev_hash(&self) -> U256Owned {
         self.header.prev_blockhash.to_byte_array().into()
     }
 
@@ -134,7 +139,7 @@ impl TemplateData {
         let self_clone = self.clone();
         let path_dir = path_dir.to_path_buf();
         tokio::task::spawn_local(async move {
-            tracing::debug!("Creating a dedicated thread IPC client for getBlock request");
+            debug!("Creating a dedicated thread IPC client for getBlock request");
 
             // validate the solution
             let solution_header = {
@@ -148,9 +153,7 @@ impl TemplateData {
                     || solution_coinbase_tx.input[0].previous_output
                         != self_clone.coinbase_tx.input[0].previous_output
                 {
-                    tracing::error!(
-                        "Solution coinbase tx is not congruent with original coinbase tx"
-                    );
+                    error!("Solution coinbase tx is not congruent with original coinbase tx");
                     return;
                 }
 
@@ -177,7 +180,7 @@ impl TemplateData {
                 };
 
                 if let Err(e) = solution_header.validate_pow(solution_header.target()) {
-                    tracing::error!("Solution header is not valid: {}", e);
+                    error!("Solution header is not valid: {}", e);
                     return;
                 }
 
@@ -223,13 +226,13 @@ impl TemplateData {
 
             let solution_block_bytes = serialize(&solution_block);
             let solution_block_hash = solution_block.block_hash().to_string();
-            let solution_block_path = path_dir.join(format!("{}.dat", solution_block_hash));
+            let solution_block_path = path_dir.join(format!("{solution_block_hash}.dat"));
 
             let mut file =
                 File::create(&solution_block_path).expect("Failed to create solution block file");
             file.write_all(&solution_block_bytes)
                 .expect("Failed to write solution block to file");
-            tracing::info!(
+            info!(
                 "Solution block dumped to: {}",
                 solution_block_path.display()
             );
@@ -238,16 +241,16 @@ impl TemplateData {
 
     pub async fn submit_solution(
         &self,
-        submit_solution: SubmitSolution<'static>,
+        submit_solution: SubmitSolutionOwned,
         thread_ipc_client: ThreadIpcClient,
         thread_map: ThreadMapIpcClient,
         path_dir: &Path,
     ) -> Result<(), TemplateDataError> {
-        let solution_coinbase_tx_bytes: Vec<u8> = submit_solution.coinbase_tx.to_vec();
+        let solution_coinbase_tx_bytes = submit_solution.coinbase_tx.to_owned_bytes();
 
         let solution_coinbase_tx: Transaction =
             deserialize(&solution_coinbase_tx_bytes).map_err(|e| {
-                tracing::error!("SubmitSolution.coinbase_tx is invalid: {}", e);
+                error!("SubmitSolution.coinbase_tx is invalid: {}", e);
                 TemplateDataError::InvalidCoinbaseTx(e)
             })?;
 
@@ -290,10 +293,10 @@ impl TemplateData {
         self.header.bits.to_consensus()
     }
 
-    fn get_target(&self) -> U256<'_> {
+    fn get_target(&self) -> U256Owned {
         let target = Target::from(self.header.bits);
         let target_bytes: [u8; 32] = target.to_le_bytes();
-        U256::from(target_bytes)
+        U256Owned::from(target_bytes)
     }
 
     fn get_ntime(&self) -> u32 {
@@ -316,8 +319,8 @@ impl TemplateData {
             .map_err(|_| TemplateDataError::InvalidCoinbaseTxVersion)
     }
 
-    fn get_coinbase_script_sig(&self) -> Result<B0255<'_>, TemplateDataError> {
-        let coinbase_script_sig: B0255 = self.coinbase_tx.input[0]
+    fn get_coinbase_script_sig(&self) -> Result<B0255Owned, TemplateDataError> {
+        let coinbase_script_sig: B0255Owned = self.coinbase_tx.input[0]
             .script_sig
             .to_bytes()
             .try_into()
@@ -333,12 +336,12 @@ impl TemplateData {
         &self.coinbase_tx.output
     }
 
-    fn get_serialized_required_coinbase_outputs(&self) -> Result<B064K<'_>, TemplateDataError> {
+    fn get_serialized_required_coinbase_outputs(&self) -> Result<B064KOwned, TemplateDataError> {
         let mut serialized_required_coinbase_outputs = Vec::new();
         for output in self.get_required_coinbase_outputs() {
             serialized_required_coinbase_outputs.extend_from_slice(&serialize(output));
         }
-        let serialized_required_coinbase_outputs: B064K = serialized_required_coinbase_outputs
+        let serialized_required_coinbase_outputs: B064KOwned = serialized_required_coinbase_outputs
             .try_into()
             .map_err(|_| TemplateDataError::FailedToSerializeCoinbaseOutputs)?;
         Ok(serialized_required_coinbase_outputs)
@@ -351,8 +354,8 @@ impl TemplateData {
     async fn get_tx_data(
         &self,
         thread_map: ThreadMapIpcClient,
-    ) -> Result<Seq064K<'_, B016M<'static>>, TemplateDataError> {
-        tracing::debug!("Creating a dedicated thread IPC client for get_tx_data");
+    ) -> Result<Seq064KOwned<B016MOwned>, TemplateDataError> {
+        debug!("Creating a dedicated thread IPC client for get_tx_data");
         let thread_ipc_client_request = thread_map.make_thread_request();
         let thread_ipc_client_response = thread_ipc_client_request.send().promise.await?;
         let thread_ipc_client = thread_ipc_client_response.get()?.get_result()?;
@@ -367,17 +370,17 @@ impl TemplateData {
         let template_block_bytes = template_block_response.get()?.get_result()?;
 
         // Deserialize the complete block template from Bitcoin Core's serialization format
-        tracing::debug!(
+        debug!(
             "Deserializing block template ({} bytes)",
             template_block_bytes.len()
         );
         let block: Block = deserialize(template_block_bytes)?;
-        tracing::debug!(
+        debug!(
             "Block deserialized - prev_hash from header: {:?}",
             block.header.prev_blockhash
         );
 
-        let tx_data: Vec<B016M<'static>> = block
+        let tx_data: Vec<B016MOwned> = block
             .txdata
             .iter()
             .skip(1) // skip coinbase tx
@@ -387,21 +390,22 @@ impl TemplateData {
                     .expect("tx data should always be valid for B016M")
             })
             .collect();
-        Ok(Seq064K::new(tx_data).expect("tx data should always be valid for Seq064K"))
+        Ok(Seq064KOwned::new(tx_data).expect("tx data should always be valid for Seq064K"))
     }
 
-    fn get_merkle_path(&self) -> Result<Seq0255<'_, U256<'_>>, TemplateDataError> {
+    fn get_merkle_path(&self) -> Result<Seq0255Owned<U256Owned>, TemplateDataError> {
         // Convert each Vec<u8> in the merkle path to U256
-        let merkle_path_u256: Vec<U256<'_>> = self
+        let merkle_path_u256: Vec<U256Owned> = self
             .merkle_path
             .iter()
             .map(|hash_bytes| {
                 // Convert Vec<u8> to U256
-                U256::try_from(hash_bytes.clone())
+                U256Owned::try_from(hash_bytes.clone())
                     .map_err(|_| TemplateDataError::FailedToConvertMerklePathHashToU256)
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        Seq0255::new(merkle_path_u256).map_err(|_| TemplateDataError::FailedToCreateMerklePathSeq)
+        Seq0255Owned::new(merkle_path_u256)
+            .map_err(|_| TemplateDataError::FailedToCreateMerklePathSeq)
     }
 }

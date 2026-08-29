@@ -3,17 +3,18 @@ use crate::{
     utils::SubmitShareWithChannelId,
 };
 use async_channel::{Receiver, Sender};
+#[cfg(feature = "monitoring")]
+use std::net::IpAddr;
 use std::{
     future::Future,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
     time::Instant,
 };
 use stratum_apps::{
     channel_utils::ReceiverCleanup,
-    custom_mutex::Mutex,
     fallback_coordinator::FallbackCoordinator,
     stratum_core::{
         bitcoin::Target,
@@ -23,6 +24,7 @@ use stratum_apps::{
             utils::{Extranonce, HexU32Be},
         },
     },
+    sync::SharedLock,
     task_manager::TaskManager,
     utils::types::{ChannelId, DownstreamId, Hashrate},
 };
@@ -64,17 +66,23 @@ impl DownstreamIo {
 #[derive(Debug)]
 pub struct DownstreamData {
     pub channel_id: Option<ChannelId>,
-    pub extranonce1: Extranonce<'static>,
+    pub extranonce1: Extranonce,
     pub extranonce2_len: usize,
+    // Current SV1 share-validation target. This follows the advertised
+    // difficulty sent to the miner, including any SV1 pow2 rounding.
     pub target: Target,
     pub hashrate: Option<Hashrate>,
+    #[cfg(feature = "monitoring")]
+    pub connection_ip: IpAddr,
     pub version_rolling_mask: Option<HexU32Be>,
     pub version_rolling_min_bit: Option<HexU32Be>,
     pub last_job_version_field: Option<u32>,
-    pub authorized_worker_name: String,
-    pub user_identity: String,
+    pub sv1_username: String,
+    pub sv1_worker_name: String,
     pub cached_set_difficulty: Option<json_rpc::Message>,
     pub cached_notify: Option<json_rpc::Message>,
+    // Next advertised SV1 target, applied when the corresponding
+    // mining.set_difficulty is sent with a new mining.notify.
     pub pending_target: Option<Target>,
     pub pending_hashrate: Option<Hashrate>,
     pub stable_hashrate: bool,
@@ -82,14 +90,19 @@ pub struct DownstreamData {
     pub queued_sv1_handshake_messages: Vec<json_rpc::Message>,
     // Stores pending shares to be sent to the sv1_server
     pub pending_share: Option<SubmitShareWithChannelId>,
-    // Tracks the upstream target for this downstream, used for vardiff target comparison
+    // Exact target currently accepted upstream, used to decide whether a
+    // stricter downstream difficulty must wait for a SetTarget response.
     pub upstream_target: Option<Target>,
     // Timestamp of when the last job was received by this downstream, used for keepalive check
     pub last_job_received_time: Option<Instant>,
 }
 
 impl DownstreamData {
-    pub fn new(hashrate: Option<Hashrate>, target: Target) -> Self {
+    pub fn new(
+        hashrate: Option<Hashrate>,
+        target: Target,
+        #[cfg(feature = "monitoring")] connection_ip: IpAddr,
+    ) -> Self {
         DownstreamData {
             channel_id: None,
             extranonce1: vec![0; 8]
@@ -98,11 +111,13 @@ impl DownstreamData {
             extranonce2_len: 4,
             target,
             hashrate,
+            #[cfg(feature = "monitoring")]
+            connection_ip,
             version_rolling_mask: None,
             version_rolling_min_bit: None,
             last_job_version_field: None,
-            authorized_worker_name: String::new(),
-            user_identity: String::new(),
+            sv1_username: String::new(),
+            sv1_worker_name: String::new(),
             cached_set_difficulty: None,
             cached_notify: None,
             pending_target: None,
@@ -154,7 +169,7 @@ impl DownstreamData {
 #[derive(Clone, Debug)]
 pub struct Downstream {
     pub downstream_id: DownstreamId,
-    pub downstream_data: Arc<Mutex<DownstreamData>>,
+    pub downstream_data: SharedLock<DownstreamData>,
     pub downstream_io: DownstreamIo,
     // Flag to track if SV1 handshake is complete (subscribe + authorize)
     pub sv1_handshake_complete: Arc<AtomicBool>,
@@ -240,9 +255,15 @@ impl Downstream {
         sv1_server_receiver: Receiver<json_rpc::Message>,
         target: Target,
         hashrate: Option<Hashrate>,
+        #[cfg(feature = "monitoring")] connection_ip: IpAddr,
         downstream_cancellation_token: CancellationToken,
     ) -> Self {
-        let downstream_data = Arc::new(Mutex::new(DownstreamData::new(hashrate, target)));
+        let downstream_data = SharedLock::new(DownstreamData::new(
+            hashrate,
+            target,
+            #[cfg(feature = "monitoring")]
+            connection_ip,
+        ));
         let downstream_channel_io = DownstreamIo::new(
             downstream_sv1_sender,
             downstream_sv1_receiver,
@@ -377,15 +398,18 @@ impl Downstream {
                             "mining.set_difficulty" => {
                                 // Cache the Sv1 set_difficulty message to be sent before the next
                                 // notify
-                                debug!("Down: Caching mining.set_difficulty to send before next mining.notify");
-                                self.downstream_data.super_safe_lock(|d| {
-                                    d.cached_set_difficulty = Some(message);
-                                });
+                                debug!(
+                                    "Down: Caching mining.set_difficulty to send before next mining.notify"
+                                );
+                                self.downstream_data
+                                    .with(|d| d.cached_set_difficulty = Some(message))
+                                    .map_err(TproxyError::shutdown)?;
                                 return Ok(());
                             }
                             "mining.notify" => {
-                                let (pending_set_difficulty, notify_opt) =
-                                    self.downstream_data.super_safe_lock(|d| {
+                                let (pending_set_difficulty, notify_opt) = self
+                                    .downstream_data
+                                    .with(|d| {
                                         let cached_set_difficulty = d.cached_set_difficulty.take();
 
                                         // Prepare the notify message and update state
@@ -416,10 +440,13 @@ impl Downstream {
                                         } else {
                                             (cached_set_difficulty, None)
                                         }
-                                    });
+                                    })
+                                    .map_err(TproxyError::shutdown)?;
 
                                 if let Some(set_difficulty_msg) = &pending_set_difficulty {
-                                    debug!("Down: Sending pending mining.set_difficulty before mining.notify");
+                                    debug!(
+                                        "Down: Sending pending mining.set_difficulty before mining.notify"
+                                    );
                                     self.downstream_io
                                         .downstream_sv1_sender
                                         .send(set_difficulty_msg.clone())
@@ -468,20 +495,25 @@ impl Downstream {
                         // Handshake not complete - cache mining notifications but skip others
                         match notification.method.as_str() {
                             "mining.set_difficulty" => {
-                                debug!("Down: SV1 handshake not complete, caching mining.set_difficulty");
-                                self.downstream_data.super_safe_lock(|d| {
-                                    d.cached_set_difficulty = Some(message);
-                                });
+                                debug!(
+                                    "Down: SV1 handshake not complete, caching mining.set_difficulty"
+                                );
+                                self.downstream_data
+                                    .with(|d| d.cached_set_difficulty = Some(message))
+                                    .map_err(TproxyError::shutdown)?;
                             }
                             "mining.notify" => {
                                 debug!("Down: SV1 handshake not complete, caching mining.notify");
-                                self.downstream_data.super_safe_lock(|d| {
-                                    d.cached_notify = Some(message.clone());
-                                    let notify =
-                                        server_to_client::Notify::try_from(notification.clone())
-                                            .expect("this must be a mining.notify");
-                                    d.last_job_version_field = Some(notify.version.0);
-                                });
+                                self.downstream_data
+                                    .with(|d| {
+                                        d.cached_notify = Some(message.clone());
+                                        let notify = server_to_client::Notify::try_from(
+                                            notification.clone(),
+                                        )
+                                        .expect("this must be a mining.notify");
+                                        d.last_job_version_field = Some(notify.version.0);
+                                    })
+                                    .map_err(TproxyError::shutdown)?;
                             }
                             _ => {
                                 debug!(
@@ -546,8 +578,9 @@ impl Downstream {
     pub(super) async fn handle_sv1_handshake_completion(
         &self,
     ) -> TproxyResult<(), error::Downstream> {
-        let (cached_set_difficulty, cached_notify, downstream_id) =
-            self.downstream_data.super_safe_lock(|d| {
+        let (cached_set_difficulty, cached_notify, downstream_id) = self
+            .downstream_data
+            .with(|d| {
                 self.sv1_handshake_complete
                     .store(true, std::sync::atomic::Ordering::SeqCst);
                 (
@@ -555,7 +588,8 @@ impl Downstream {
                     d.cached_notify.take(),
                     self.downstream_id,
                 )
-            });
+            })
+            .map_err(TproxyError::shutdown)?;
         debug!("Down: SV1 handshake completed for downstream");
 
         // Send cached messages in correct order: set_difficulty first, then notify
@@ -574,14 +608,16 @@ impl Downstream {
                 })?;
 
             // Update target and hashrate after sending set_difficulty
-            self.downstream_data.super_safe_lock(|d| {
-                if let Some(new_target) = d.pending_target.take() {
-                    d.target = new_target;
-                }
-                if let Some(new_hashrate) = d.pending_hashrate.take() {
-                    d.hashrate = Some(new_hashrate);
-                }
-            });
+            self.downstream_data
+                .with(|d| {
+                    if let Some(new_target) = d.pending_target.take() {
+                        d.target = new_target;
+                    }
+                    if let Some(new_hashrate) = d.pending_hashrate.take() {
+                        d.hashrate = Some(new_hashrate);
+                    }
+                })
+                .map_err(TproxyError::shutdown)?;
         }
 
         if let Some(notify_msg) = cached_notify {
@@ -598,9 +634,11 @@ impl Downstream {
                     TproxyError::disconnect(TproxyErrorKind::ChannelErrorSender, downstream_id)
                 })?;
             // Update last job received time for keepalive tracking
-            self.downstream_data.super_safe_lock(|d| {
-                d.last_job_received_time = Some(Instant::now());
-            });
+            self.downstream_data
+                .with(|d| {
+                    d.last_job_received_time = Some(Instant::now());
+                })
+                .map_err(TproxyError::shutdown)?;
         }
 
         Ok(())
