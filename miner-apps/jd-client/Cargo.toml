@@ -1,8 +1,9 @@
 [package]
 name = "jd_client_sv2"
-version = "0.3.0"
+version = "0.6.0"
 authors = ["The Stratum V2 Developers"]
-edition = "2021"
+edition = "2024"
+rust-version = "1.88"
 description = "Job Declarator Client (JDC) role"
 documentation = "https://docs.rs/jd_client_sv2"
 readme = "README.md"
@@ -16,14 +17,13 @@ name = "jd_client_sv2"
 path = "src/lib/mod.rs"
 
 [dependencies]
-stratum-apps = { version = "0.5.0", path = "../../stratum-apps", features = ["jd_client"] }
+stratum-apps = { version = "0.8.0", path = "../../stratum-apps", features = ["jd_client"] }
 async-channel = "1.5.1"
 serde = { version = "1.0.89", default-features = false, features = ["derive", "alloc"] }
 tokio = { version = "1.44.1", features = ["full"] }
 ext-config = { version = "0.14.0", features = ["toml"], package = "config" }
 tracing = { version = "0.1" }
 clap = { version = "4.5.39", features = ["derive"] }
-bitcoin_core_sv2 = { version = "0.3.0", path = "../../bitcoin-core-sv2" }
 hex = "0.4.3"
 hotpath = "0.14.0"
 
@@ -32,6 +32,6 @@ toml = "1.1.2"
 
 [features]
 default = ["monitoring"]
-monitoring = ["stratum-apps/monitoring"]
+monitoring = ["stratum-apps/asic-rs-telemetry"]
 hotpath = ["hotpath/hotpath"]
 hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]

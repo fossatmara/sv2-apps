@@ -6,53 +6,54 @@ use std::convert::TryInto;
 use stratum_apps::{
     stratum_core::{
         common_messages_sv2::{
-            Protocol, SetupConnection, SetupConnectionError, SetupConnectionSuccess,
             ERROR_CODE_SETUP_CONNECTION_MISSING_DECLARE_TX_DATA_FLAG,
-            ERROR_CODE_SETUP_CONNECTION_UNSUPPORTED_PROTOCOL,
+            ERROR_CODE_SETUP_CONNECTION_PROTOCOL_VERSION_MISMATCH,
+            ERROR_CODE_SETUP_CONNECTION_UNSUPPORTED_PROTOCOL, Protocol, SetupConnectionErrorOwned,
+            SetupConnectionOwned, SetupConnectionSuccess,
         },
-        handlers_sv2::HandleCommonMessagesFromClientAsync,
-        parsers_sv2::{AnyMessage, Tlv},
+        handlers_sv2::HandleCommonMessagesFromClientOwnedAsync,
+        parsers_sv2::{AnyMessageOwned, Tlv},
     },
-    utils::types::Sv2Frame,
+    utils::types::{SUPPORTED_PROTOCOL_VERSION, Sv2Frame},
 };
 use tracing::info;
 
 #[cfg_attr(not(test), hotpath::measure_all)]
-impl HandleCommonMessagesFromClientAsync for Downstream {
+impl HandleCommonMessagesFromClientOwnedAsync for Downstream {
     type Error = JDSError<error::Downstream>;
 
     fn get_negotiated_extensions_with_client(
         &self,
         _client_id: Option<usize>,
     ) -> Result<Vec<u16>, Self::Error> {
-        Ok(self
-            .negotiated_extensions
-            .super_safe_lock(|extensions| extensions.clone()))
+        self.negotiated_extensions.get().map_err(JDSError::shutdown)
     }
 
     async fn handle_setup_connection(
         &mut self,
         client_id: Option<usize>,
-        msg: SetupConnection<'_>,
+        msg: SetupConnectionOwned,
         _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         info!(
-            "Received `SetupConnection`: version={}, flags={:b}",
-            msg.min_version, msg.flags
+            "Received `SetupConnection`: min_version={}, max_version={}, flags={:b}",
+            msg.min_version, msg.max_version, msg.flags
         );
 
         let downstream_id = client_id.expect("downstream id should be present");
 
         if msg.protocol != Protocol::JobDeclarationProtocol {
-            info!("Rejecting connection from {downstream_id}: SetupConnection asking for other protocols than mining protocol.");
-            let response = SetupConnectionError {
+            info!(
+                "Rejecting connection from {downstream_id}: SetupConnection asking for other protocols than mining protocol."
+            );
+            let response = SetupConnectionErrorOwned {
                 flags: 0,
                 error_code: ERROR_CODE_SETUP_CONNECTION_UNSUPPORTED_PROTOCOL
                     .to_string()
                     .try_into()
                     .expect("error code must be valid string"),
             };
-            let frame: Sv2Frame = AnyMessage::Common(response.into_static().into())
+            let frame: Sv2Frame = AnyMessageOwned::Common(response.into())
                 .try_into()
                 .map_err(JDSError::shutdown)?;
             self.downstream_io
@@ -67,6 +68,35 @@ impl HandleCommonMessagesFromClientAsync for Downstream {
             ));
         }
 
+        if SUPPORTED_PROTOCOL_VERSION < msg.min_version
+            || SUPPORTED_PROTOCOL_VERSION > msg.max_version
+        {
+            info!(
+                "Rejecting connection from {downstream_id}: no supported protocol version in requested range [{}, {}] (supported: {SUPPORTED_PROTOCOL_VERSION}).",
+                msg.min_version, msg.max_version
+            );
+            let response = SetupConnectionErrorOwned {
+                flags: 0,
+                error_code: ERROR_CODE_SETUP_CONNECTION_PROTOCOL_VERSION_MISMATCH
+                    .to_string()
+                    .try_into()
+                    .map_err(JDSError::shutdown)?,
+            };
+            let frame: Sv2Frame = AnyMessageOwned::Common(response.into())
+                .try_into()
+                .map_err(JDSError::shutdown)?;
+            self.downstream_io
+                .to_downstream_sender
+                .send(frame)
+                .await
+                .map_err(|e| JDSError::disconnect(e, downstream_id))?;
+
+            return Err(JDSError::disconnect(
+                JDSErrorKind::ProtocolVersionMismatch,
+                downstream_id,
+            ));
+        }
+
         // todo: add this to `common_messages_sv2`
         // see https://github.com/stratum-mining/stratum/issues/2117
         let has_declare_tx_data = {
@@ -76,15 +106,17 @@ impl HandleCommonMessagesFromClientAsync for Downstream {
         };
 
         if !has_declare_tx_data {
-            info!("Rejecting connection from {downstream_id}: SetupConnection missing DECLARE_TX_DATA flag.");
-            let response = SetupConnectionError {
+            info!(
+                "Rejecting connection from {downstream_id}: SetupConnection missing DECLARE_TX_DATA flag."
+            );
+            let response = SetupConnectionErrorOwned {
                 flags: 0,
                 error_code: ERROR_CODE_SETUP_CONNECTION_MISSING_DECLARE_TX_DATA_FLAG
                     .to_string()
                     .try_into()
                     .expect("error code must be valid string"),
             };
-            let frame: Sv2Frame = AnyMessage::Common(response.into_static().into())
+            let frame: Sv2Frame = AnyMessageOwned::Common(response.into())
                 .try_into()
                 .map_err(JDSError::shutdown)?;
             self.downstream_io
@@ -100,10 +132,10 @@ impl HandleCommonMessagesFromClientAsync for Downstream {
         }
 
         let response = SetupConnectionSuccess {
-            used_version: 2,
+            used_version: SUPPORTED_PROTOCOL_VERSION,
             flags: 0,
         };
-        let frame: Sv2Frame = AnyMessage::Common(response.into_static().into())
+        let frame: Sv2Frame = AnyMessageOwned::Common(response.into())
             .try_into()
             .map_err(JDSError::shutdown)?;
         self.downstream_io

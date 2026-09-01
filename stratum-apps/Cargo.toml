@@ -1,8 +1,9 @@
 [package]
 name = "stratum-apps"
-version = "0.5.0"
+version = "0.8.0"
 authors = ["The Stratum V2 Developers"]
-edition = "2021"
+edition = "2024"
+rust-version = "1.88"
 readme = "README.md"
 description = "Complete Stratum V2 application development kit - all utilities in one crate"
 documentation = "https://docs.rs/stratum-apps"
@@ -17,6 +18,7 @@ keywords = ["stratum", "mining", "bitcoin", "protocol", "sv2"]
 # it MUST be changed before stratum-apps is published to crates.io
 # with the proper version of stratum-core being fetched from crates.io as well
 stratum-core = { git = "https://github.com/stratum-mining/stratum", branch = "main", optional = true }
+bitcoin-core-sv2 = { package = "bitcoin_core_sv2", version = "0.5.0", path = "../bitcoin-core-sv2", optional = true }
 
 # External dependencies needed by the modules
 # Network helpers dependencies
@@ -43,6 +45,7 @@ rustversion = "1.0"
 serde_json = { version = "1.0", default-features = false, features = ["alloc", "raw_value"], optional = true }
 
 # Monitoring optional dependencies
+asic-rs = { version = "0.6.2", optional = true }
 axum = { version = "0.8.7", optional = true }
 prometheus = { version = "0.13", optional = true }
 utoipa = { version = "5.4.0", features = ["axum_extras"], optional = true }
@@ -62,6 +65,7 @@ fallback-coordinator = ["tokio-util"]
 config = []
 payout = ["config", "core"]
 monitoring = ["serde_json", "axum", "prometheus", "utoipa", "utoipa-swagger-ui"]
+asic-rs-telemetry = ["monitoring", "dep:asic-rs"]
 std = ["bs58/std", "secp256k1/rand-std", "rand/std", "rand/std_rng"]
 core = ["stratum-core"]
 
@@ -70,10 +74,10 @@ sv1 = ["stratum-core/sv1", "stratum-core/translation", "tokio-util", "serde_json
 with_buffer_pool = ["stratum-core/with_buffer_pool"]
 
 # Convenience feature bundles for different role types
-pool = ["network", "config", "with_buffer_pool", "core", "payout"]
-jd_client = ["network", "fallback-coordinator", "config", "with_buffer_pool", "core"]
-# Note: jd_server intentionally excludes 'core' and 'network' - it uses crates.io crates directly
-jd_server = ["config"]
+pool = ["network", "config", "with_buffer_pool", "core", "payout", "bitcoin-core-sv2"]
+jd_client = ["network", "fallback-coordinator", "config", "with_buffer_pool", "core", "bitcoin-core-sv2"]
+# Note: jd_server intentionally excludes 'core' and 'network'
+jd_server = ["config", "bitcoin-core-sv2"]
 translator = ["network", "fallback-coordinator", "config", "sv1", "with_buffer_pool", "core", "payout"]
 # Note: mining_device intentionally excludes 'core' and 'network' - it uses crates.io crates directly
 mining_device = ["config"]
@@ -89,4 +93,4 @@ path = "src/bin/generate-openapi.rs"
 required-features = ["monitoring"]
 
 [package.metadata.docs.rs]
-features = ["pool", "jd_client", "jd_server", "translator", "sv1", "monitoring"]
+features = ["pool", "jd_client", "jd_server", "translator", "sv1", "monitoring", "asic-rs-telemetry"]

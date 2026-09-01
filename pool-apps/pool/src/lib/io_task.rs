@@ -1,15 +1,15 @@
 use std::sync::Arc;
 
 use async_channel::{Receiver, Sender};
-use bitcoin_core_sv2::template_distribution_protocol::CancellationToken;
 use stratum_apps::{
+    bitcoin_core_sv2::CancellationToken,
     channel_utils::ReceiverCleanup,
     network_helpers::noise_stream::{NoiseTcpReadHalf, NoiseTcpWriteHalf},
     stratum_core::framing_sv2::framing::Frame,
     task_manager::TaskManager,
     utils::types::{Message, Sv2Frame},
 };
-use tracing::{error, trace, warn, Instrument as _};
+use tracing::{Instrument as _, error, trace, warn};
 
 /// Spawns async reader and writer tasks for handling framed I/O with shutdown support.
 #[track_caller]

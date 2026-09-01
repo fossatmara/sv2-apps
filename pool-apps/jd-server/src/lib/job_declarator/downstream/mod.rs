@@ -5,34 +5,33 @@
 //! `DeclareMiningJob` map, and a per-downstream [`CancellationToken`] for clean teardown.
 
 use super::{
-    DownstreamJobDeclarationMessage, JobDeclarationMessage, ALLOCATED_TOKEN_TIMEOUT_SECS,
-    JANITOR_INTERVAL_SECS,
+    ALLOCATED_TOKEN_TIMEOUT_SECS, DownstreamJobDeclarationMessage, JANITOR_INTERVAL_SECS,
+    JobDeclarationMessage,
 };
 use crate::{
     error,
     error::{JDSResult, LoopControl},
     io_task::spawn_io_tasks,
 };
-use async_channel::{unbounded, Receiver, Sender};
-use bitcoin_core_sv2::job_declaration_protocol::CancellationToken;
-use dashmap::DashMap;
+use async_channel::{Receiver, Sender, unbounded};
 use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
 use stratum_apps::{
-    custom_mutex::Mutex,
+    bitcoin_core_sv2::CancellationToken,
     network_helpers::noise_stream::NoiseTcpStream,
     stratum_core::{
         common_messages_sv2::MESSAGE_TYPE_SETUP_CONNECTION,
         framing_sv2,
-        handlers_sv2::HandleCommonMessagesFromClientAsync,
-        job_declaration_sv2::DeclareMiningJob,
-        parsers_sv2::{parse_message_frame_with_tlvs, AnyMessage},
+        handlers_sv2::HandleCommonMessagesFromClientOwnedAsync,
+        job_declaration_sv2::DeclareMiningJobOwned,
+        parsers_sv2::{AnyMessageOwned, parse_message_frame_with_tlvs},
     },
+    sync::{SharedLock, SharedMap},
     task_manager::TaskManager,
     utils::{
-        protocol_message_type::{protocol_message_type, MessageType},
+        protocol_message_type::{MessageType, protocol_message_type},
         types::{DownstreamId, Message, RequestId, Sv2Frame},
     },
 };
@@ -43,7 +42,7 @@ mod common_message_handler;
 /// Data associated with a pending declare mining job.
 /// - Instant is the insertion timestamp
 /// - DeclareMiningJob is the declare mining job
-pub type PendingDeclareMiningJob = (Instant, DeclareMiningJob<'static>);
+pub type PendingDeclareMiningJob = (Instant, DeclareMiningJobOwned);
 
 /// Channel endpoints for a single downstream connection.
 #[derive(Clone)]
@@ -58,9 +57,9 @@ pub struct DownstreamIo {
 #[derive(Clone)]
 pub struct Downstream {
     /// Extensions that have been successfully negotiated with this client.
-    pub negotiated_extensions: Arc<Mutex<Vec<u16>>>,
+    pub negotiated_extensions: SharedLock<Vec<u16>>,
     /// Jobs waiting for missing transactions (keyed by `request_id`).
-    pub pending_declare_mining_jobs: Arc<DashMap<RequestId, PendingDeclareMiningJob>>,
+    pub pending_declare_mining_jobs: SharedMap<RequestId, PendingDeclareMiningJob>,
     pub downstream_io: DownstreamIo,
     pub downstream_id: DownstreamId,
     /// Extensions that JDS supports
@@ -137,8 +136,8 @@ impl Downstream {
             downstream_cancellation_token.clone(),
         );
 
-        let negotiated_extensions = Arc::new(Mutex::new(Vec::new()));
-        let pending_declare_mining_jobs = Arc::new(DashMap::new());
+        let negotiated_extensions = SharedLock::new(Vec::new());
+        let pending_declare_mining_jobs = SharedMap::new();
 
         let downstream_io = DownstreamIo {
             to_job_declarator_sender,
@@ -242,7 +241,7 @@ impl Downstream {
     /// older than `ALLOCATED_TOKEN_TIMEOUT_SECS`.
     fn spawn_pending_jobs_janitor(&self, task_manager: Arc<TaskManager>) {
         let cancellation_token = self.downstream_cancellation_token.clone();
-        let pending_declare_mining_jobs = Arc::clone(&self.pending_declare_mining_jobs);
+        let pending_declare_mining_jobs = self.pending_declare_mining_jobs.clone();
         let downstream_id = self.downstream_id;
         let token_timeout = Duration::from_secs(ALLOCATED_TOKEN_TIMEOUT_SECS);
         let janitor_interval = Duration::from_secs(JANITOR_INTERVAL_SECS);
@@ -283,7 +282,7 @@ impl Downstream {
             error::JDSError::disconnect(framing_sv2::Error::MissingHeader, self.downstream_id)
         })?;
 
-        if header.msg_type() == MESSAGE_TYPE_SETUP_CONNECTION {
+        if header.ext_type() == 0 && header.msg_type() == MESSAGE_TYPE_SETUP_CONNECTION {
             self.handle_common_message_frame_from_client(
                 Some(self.downstream_id),
                 header,
@@ -319,7 +318,7 @@ impl Downstream {
             }
         };
 
-        let message = AnyMessage::JobDeclaration(msg);
+        let message = AnyMessageOwned::JobDeclaration(msg);
         let std_frame: Sv2Frame = message
             .try_into()
             .map_err(|e| error::JDSError::disconnect(e, self.downstream_id))?;
@@ -351,7 +350,8 @@ impl Downstream {
                 debug!("Received mining SV2 frame from downstream.");
                 let negotiated_extensions = self
                     .negotiated_extensions
-                    .super_safe_lock(|extensions| extensions.clone());
+                    .get()
+                    .map_err(error::JDSError::shutdown)?;
                 let (any_message, tlv_fields) = parse_message_frame_with_tlvs(
                     header,
                     sv2_frame.payload(),
@@ -359,8 +359,8 @@ impl Downstream {
                 )
                 .map_err(|e| error::JDSError::disconnect(e, self.downstream_id))?;
 
-                let jd_message = match any_message {
-                    AnyMessage::JobDeclaration(msg) => msg,
+                let jd_message = match any_message.into_owned() {
+                    AnyMessageOwned::JobDeclaration(msg) => msg,
                     _ => {
                         error!("Expected JobDeclaration message but got different type");
                         return Err(error::JDSError::disconnect(

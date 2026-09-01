@@ -15,36 +15,41 @@ use std::{
     collections::BinaryHeap,
     net::SocketAddr,
     sync::{
-        atomic::{AtomicU8, Ordering},
         Arc,
+        atomic::{AtomicU8, AtomicU32, Ordering},
+    },
+};
+use stratum_apps::stratum_core::{
+    binary_sv2::Str0255Owned,
+    job_declaration_sv2::PushSolutionOwned,
+    mining_sv2::{
+        CloseChannelOwned, OpenExtendedMiningChannelOwned, OpenStandardMiningChannelOwned,
     },
 };
 
 use stratum_apps::{
     key_utils::Secp256k1PublicKey,
     stratum_core::{
-        binary_sv2::Str0255,
-        bitcoin::hashes::sha256d,
-        channels_sv2::client,
-        common_messages_sv2::{Protocol, SetupConnection},
-        job_declaration_sv2::PushSolution,
-        mining_sv2::{
-            CloseChannel, OpenExtendedMiningChannel, OpenStandardMiningChannel,
-            SubmitSharesExtended,
+        bitcoin::{
+            Target,
+            hashes::{Hash as _, sha256d},
         },
-        parsers_sv2::{JobDeclaration, Mining, Tlv},
+        channels_sv2::client::{self, extended::ExtendedChannel},
+        common_messages_sv2::{Protocol, SetupConnectionOwned},
+        mining_sv2::SubmitSharesExtendedOwned,
+        parsers_sv2::{JobDeclarationOwned, MiningOwned, Tlv},
+        template_distribution_sv2::SetNewPrevHashOwned as SetNewPrevHashTdp,
     },
     utils::types::{ChannelId, DownstreamId, Hashrate, JobId},
 };
 use tracing::{debug, info};
 
 use crate::{
-    channel_manager::{downstream_message_handler::RouteMessageTo, ChannelManagerData},
-    error::JDCErrorKind,
+    channel_manager::downstream_message_handler::RouteMessageTo, error::JDCErrorKind,
     jd_mode::JDMode,
 };
 
-pub(crate) type DownstreamMessage = (Mining<'static>, Option<Vec<Tlv>>);
+pub(crate) type DownstreamMessage = (MiningOwned, Option<Vec<Tlv>>);
 
 /// Represents a single upstream entry (Pool + JDS pair) with raw address strings
 /// that are resolved via DNS at connection time.
@@ -66,14 +71,15 @@ pub fn get_setup_connection_message(
     min_version: u16,
     max_version: u16,
     address: &SocketAddr,
-) -> Result<SetupConnection<'static>, JDCErrorKind> {
-    let endpoint_host = address.ip().to_string().into_bytes().try_into()?;
-    let vendor = String::new().try_into()?;
-    let hardware_version = String::new().try_into()?;
-    let firmware = String::new().try_into()?;
-    let device_id = String::new().try_into()?;
+) -> Result<SetupConnectionOwned, JDCErrorKind> {
+    let address_str = address.ip().to_string();
+    let endpoint_host = address_str.as_str().try_into()?;
+    let vendor = "".try_into()?;
+    let hardware_version = "".try_into()?;
+    let firmware = "".try_into()?;
+    let device_id = "".try_into()?;
     let flags = 0b0000_0000_0000_0000_0000_0000_0000_0110;
-    Ok(SetupConnection {
+    Ok(SetupConnectionOwned {
         protocol: Protocol::MiningProtocol,
         min_version,
         max_version,
@@ -91,18 +97,14 @@ pub fn get_setup_connection_message(
 pub fn get_setup_connection_message_jds(
     proxy_address: &SocketAddr,
     mode: &JDMode,
-) -> SetupConnection<'static> {
-    let endpoint_host = proxy_address
-        .ip()
-        .to_string()
-        .into_bytes()
-        .try_into()
-        .unwrap();
-    let vendor = String::new().try_into().unwrap();
-    let hardware_version = String::new().try_into().unwrap();
-    let firmware = String::new().try_into().unwrap();
-    let device_id = String::new().try_into().unwrap();
-    let mut setup_connection = SetupConnection {
+) -> SetupConnectionOwned {
+    let address_str = proxy_address.ip().to_string();
+    let endpoint_host = address_str.as_str().try_into().unwrap();
+    let vendor = "".try_into().unwrap();
+    let hardware_version = "".try_into().unwrap();
+    let firmware = "".try_into().unwrap();
+    let device_id = "".try_into().unwrap();
+    let mut setup_connection = SetupConnectionOwned {
         protocol: Protocol::JobDeclarationProtocol,
         min_version: 2,
         max_version: 2,
@@ -123,13 +125,14 @@ pub fn get_setup_connection_message_jds(
 }
 
 /// Constructs a `SetupConnection` message for the Template Provider (TP).
-pub fn get_setup_connection_message_tp(address: SocketAddr) -> SetupConnection<'static> {
-    let endpoint_host = address.ip().to_string().into_bytes().try_into().unwrap();
-    let vendor = String::new().try_into().unwrap();
-    let hardware_version = String::new().try_into().unwrap();
-    let firmware = String::new().try_into().unwrap();
-    let device_id = String::new().try_into().unwrap();
-    SetupConnection {
+pub fn get_setup_connection_message_tp(address: SocketAddr) -> SetupConnectionOwned {
+    let address_str = address.ip().to_string();
+    let endpoint_host = address_str.as_str().try_into().unwrap();
+    let vendor = "".try_into().unwrap();
+    let hardware_version = "".try_into().unwrap();
+    let firmware = "".try_into().unwrap();
+    let device_id = "".try_into().unwrap();
+    SetupConnectionOwned {
         protocol: Protocol::TemplateDistributionProtocol,
         min_version: 2,
         max_version: 2,
@@ -220,17 +223,17 @@ pub enum PendingChannelRequest {
     /// A request to open an extended mining channel.
     ExtendedChannel {
         downstream_id: DownstreamId,
-        message: OpenExtendedMiningChannel<'static>,
+        message: OpenExtendedMiningChannelOwned,
     },
     /// A request to open a standard mining channel.
     StandardChannel {
         downstream_id: DownstreamId,
-        message: OpenStandardMiningChannel<'static>,
+        message: OpenStandardMiningChannelOwned,
     },
 }
 
-impl From<(DownstreamId, OpenExtendedMiningChannel<'static>)> for PendingChannelRequest {
-    fn from(value: (DownstreamId, OpenExtendedMiningChannel<'static>)) -> Self {
+impl From<(DownstreamId, OpenExtendedMiningChannelOwned)> for PendingChannelRequest {
+    fn from(value: (DownstreamId, OpenExtendedMiningChannelOwned)) -> Self {
         PendingChannelRequest::ExtendedChannel {
             downstream_id: value.0,
             message: value.1,
@@ -238,8 +241,8 @@ impl From<(DownstreamId, OpenExtendedMiningChannel<'static>)> for PendingChannel
     }
 }
 
-impl From<(DownstreamId, OpenStandardMiningChannel<'static>)> for PendingChannelRequest {
-    fn from(value: (DownstreamId, OpenStandardMiningChannel<'static>)) -> Self {
+impl From<(DownstreamId, OpenStandardMiningChannelOwned)> for PendingChannelRequest {
+    fn from(value: (DownstreamId, OpenStandardMiningChannelOwned)) -> Self {
         PendingChannelRequest::StandardChannel {
             downstream_id: value.0,
             message: value.1,
@@ -261,16 +264,16 @@ impl PendingChannelRequest {
         }
     }
 
-    pub fn message(self) -> Mining<'static> {
+    pub fn message(self) -> MiningOwned {
         match self {
             PendingChannelRequest::ExtendedChannel {
                 downstream_id: _,
                 message: open_channel_message,
-            } => Mining::OpenExtendedMiningChannel(open_channel_message),
+            } => MiningOwned::OpenExtendedMiningChannel(open_channel_message),
             PendingChannelRequest::StandardChannel {
                 downstream_id: _,
                 message: open_channel_message,
-            } => Mining::OpenStandardMiningChannel(open_channel_message),
+            } => MiningOwned::OpenStandardMiningChannel(open_channel_message),
         }
     }
 
@@ -292,10 +295,10 @@ impl PendingChannelRequest {
 ///
 /// The `msg` is converted into a [`Str0255`] reason code.  
 /// If conversion fails, this function will panic.
-pub(crate) fn create_close_channel_msg(channel_id: ChannelId, msg: &str) -> CloseChannel<'_> {
-    CloseChannel {
+pub(crate) fn create_close_channel_msg(channel_id: ChannelId, msg: &str) -> CloseChannelOwned {
+    CloseChannelOwned {
         channel_id,
-        reason_code: Str0255::try_from(msg.to_string()).expect("Could not convert message."),
+        reason_code: Str0255Owned::try_from(msg).expect("Could not convert message."),
     }
 }
 
@@ -320,41 +323,35 @@ impl From<(DownstreamId, ChannelId, JobId)> for DownstreamChannelJobId {
 /// arrives. This method also appends response to route queue to be sent
 /// to upstream.
 pub fn validate_cached_share(
-    mut upstream_message: SubmitSharesExtended<'static>,
-    channel_manager_data: &mut ChannelManagerData,
+    mut upstream_message: SubmitSharesExtendedOwned,
+    upstream_channel: &mut ExtendedChannel,
+    prev_hash: &SetNewPrevHashTdp,
+    sequence_number_factory: &AtomicU32,
     messages: &mut Vec<RouteMessageTo>,
 ) {
-    let Some(upstream_channel) = channel_manager_data.upstream_channel.as_mut() else {
-        return;
-    };
-    let Some(prev_hash) = channel_manager_data.last_new_prev_hash.as_ref() else {
-        return;
-    };
-
     match upstream_channel.validate_share(upstream_message.clone()) {
         Ok(client::share_accounting::ShareValidationResult::Valid(share_hash)) => {
-            upstream_message.sequence_number = channel_manager_data
-                .sequence_number_factory
-                .fetch_add(1, Ordering::Relaxed);
+            upstream_message.sequence_number =
+                sequence_number_factory.fetch_add(1, Ordering::Relaxed);
 
             info!(
-                "Cached SubmitSharesExtended: valid share, forwarding it to upstream | channel_id: {}, sequence_number: {}, share_hash: {}  ✅",  upstream_message.channel_id, upstream_message.sequence_number, share_hash
+                "Cached SubmitSharesExtended: valid share, forwarding it to upstream | channel_id: {}, sequence_number: {}, share_hash: {}  ✅",
+                upstream_message.channel_id, upstream_message.sequence_number, share_hash
             );
 
-            messages.push(Mining::SubmitSharesExtended(upstream_message.into_static()).into());
+            messages.push(MiningOwned::SubmitSharesExtended(upstream_message).into());
         }
 
         Ok(client::share_accounting::ShareValidationResult::BlockFound(share_hash)) => {
-            upstream_message.sequence_number = channel_manager_data
-                .sequence_number_factory
-                .fetch_add(1, Ordering::Relaxed);
+            upstream_message.sequence_number =
+                sequence_number_factory.fetch_add(1, Ordering::Relaxed);
 
             info!("💰 Block Found (cached extended)!!! 💰 {share_hash}");
 
             let mut channel_extranonce = upstream_channel.get_extranonce_prefix().to_vec();
-            channel_extranonce.extend_from_slice(&upstream_message.extranonce.to_vec());
+            channel_extranonce.extend_from_slice(upstream_message.extranonce.as_bytes());
 
-            let push_solution = PushSolution {
+            let push_solution = PushSolutionOwned {
                 extranonce: channel_extranonce.try_into().expect("extranonce"),
                 ntime: upstream_message.ntime,
                 nonce: upstream_message.nonce,
@@ -363,8 +360,8 @@ pub fn validate_cached_share(
                 prev_hash: prev_hash.prev_hash.clone(),
             };
 
-            messages.push(JobDeclaration::PushSolution(push_solution).into());
-            messages.push(Mining::SubmitSharesExtended(upstream_message.into_static()).into());
+            messages.push(JobDeclarationOwned::PushSolution(push_solution).into());
+            messages.push(MiningOwned::SubmitSharesExtended(upstream_message).into());
         }
 
         Err(err) => {
@@ -381,7 +378,10 @@ pub fn validate_cached_share(
                 _ => unreachable!(),
             };
 
-            debug!("❌ Cached SubmitSharesExtended: SubmitSharesError, not forwarding it to upstream | channel_id={}, sequence_number={}, error={code}", upstream_message.channel_id, upstream_message.sequence_number);
+            debug!(
+                "❌ Cached SubmitSharesExtended: SubmitSharesError, not forwarding it to upstream | channel_id={}, sequence_number={}, error={code}",
+                upstream_message.channel_id, upstream_message.sequence_number
+            );
         }
     }
 }
@@ -392,19 +392,22 @@ const CACHED_SHARES_CAPACITY: usize = 100;
 /// A wrapper around [`SubmitSharesExtended`] that adds ordering by share difficulty.
 #[derive(Clone, Debug)]
 pub struct SharesOrderedByDiff {
-    pub share: SubmitSharesExtended<'static>,
-    share_hash: sha256d::Hash,
+    pub share: SubmitSharesExtendedOwned,
+    share_target: Target,
 }
 
 impl SharesOrderedByDiff {
-    pub fn new(share: SubmitSharesExtended<'static>, share_hash: sha256d::Hash) -> Self {
-        Self { share, share_hash }
+    pub fn new(share: SubmitSharesExtendedOwned, share_hash: sha256d::Hash) -> Self {
+        Self {
+            share,
+            share_target: Target::from_le_bytes(share_hash.to_byte_array()),
+        }
     }
 }
 
 impl Ord for SharesOrderedByDiff {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.share_hash.cmp(&other.share_hash)
+        self.share_target.cmp(&other.share_target)
     }
 }
 
@@ -416,7 +419,7 @@ impl PartialOrd for SharesOrderedByDiff {
 
 impl PartialEq for SharesOrderedByDiff {
     fn eq(&self, other: &Self) -> bool {
-        self.share_hash == other.share_hash
+        self.share_target == other.share_target
     }
 }
 
@@ -425,12 +428,12 @@ impl Eq for SharesOrderedByDiff {}
 /// Inserts a share into the cache, evicting the worst entry when
 /// [`CACHED_SHARES_CAPACITY`] is reached.
 ///
-/// The cache retains the best shares (lowest `share_hash`), since lower
-/// hashes indicate higher-quality shares that are more likely to remain
+/// The cache retains the best shares (lowest proof-of-work value), since lower
+/// values indicate higher-quality shares that are more likely to remain
 /// valid if relayed later.
 ///
 /// Internally implemented with a `BinaryHeap`, where the root represents
-/// the current worst share (highest hash) and is replaced when a better
+/// the current worst share (highest value) and is replaced when a better
 /// share arrives.
 pub(crate) fn add_share_to_cache(
     heap: &mut BinaryHeap<SharesOrderedByDiff>,
@@ -440,8 +443,8 @@ pub(crate) fn add_share_to_cache(
 
     if len < CACHED_SHARES_CAPACITY {
         debug!(
-            "Caching share (hash={:?}); cache size {}/{}",
-            entry.share_hash,
+            "Caching share (hash={:x}); cache size {}/{}",
+            entry.share_target,
             len + 1,
             CACHED_SHARES_CAPACITY
         );
@@ -449,19 +452,64 @@ pub(crate) fn add_share_to_cache(
         return;
     }
 
-    if let Some(worst) = heap.peek() {
-        if entry.share_hash < worst.share_hash {
-            debug!(
-                "Replacing worst cached share: old_hash={:?}, new_hash={:?}",
-                worst.share_hash, entry.share_hash
-            );
-            heap.pop();
-            heap.push(entry);
-        } else {
-            debug!(
-                "Discarding share (hash={:?}); worse than cached worst={:?}",
-                entry.share_hash, worst.share_hash
-            );
+    let Some(worst_target) = heap.peek().map(|worst| worst.share_target) else {
+        return;
+    };
+
+    if entry.share_target < worst_target {
+        debug!(
+            "Replacing worst cached share: old_hash={:x}, new_hash={:x}",
+            worst_target, entry.share_target
+        );
+        heap.pop();
+        heap.push(entry);
+    } else {
+        debug!(
+            "Discarding share (hash={:x}); worse than cached worst={:x}",
+            entry.share_target, worst_target
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stratum_apps::stratum_core::binary_sv2::B032Owned;
+
+    fn share_with_hash(raw_hash: [u8; 32]) -> SharesOrderedByDiff {
+        let share = SubmitSharesExtendedOwned {
+            channel_id: 0,
+            sequence_number: 0,
+            job_id: 0,
+            nonce: 0,
+            ntime: 0,
+            version: 0,
+            extranonce: B032Owned::try_from([0u8; 32]).expect("valid extranonce"),
+        };
+        SharesOrderedByDiff::new(share, sha256d::Hash::from_byte_array(raw_hash))
+    }
+
+    #[test]
+    fn test_cache_keeps_best_proof_of_work_share() {
+        // A share hash is little-endian, so byte 0 is the least significant. `poor` is a
+        // huge integer that compares small byte-wise, `best` a tiny one that compares
+        // large, so raw-byte ordering ranks them the wrong way round.
+        let mut poor = [0u8; 32];
+        poor[31] = 100;
+        let mut best = [0u8; 32];
+        best[0] = 0xff;
+
+        let mut heap = BinaryHeap::new();
+        for _ in 0..CACHED_SHARES_CAPACITY {
+            add_share_to_cache(&mut heap, share_with_hash(poor));
         }
+        add_share_to_cache(&mut heap, share_with_hash(best));
+
+        assert_eq!(heap.len(), CACHED_SHARES_CAPACITY);
+        assert!(
+            heap.iter()
+                .any(|cached| cached.share_target == Target::from_le_bytes(best)),
+            "the best share was evicted in favour of worse ones"
+        );
     }
 }

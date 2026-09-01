@@ -11,6 +11,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
 
     steps:
       - uses: actions/checkout@v4
@@ -21,11 +23,18 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: "false"
+          # Hash every Cargo workspace without registering the shared target more than once.
+          key: cargo-inputs-${{ hashFiles('**/Cargo.toml', '**/Cargo.lock') }}
+          workspaces: integration-tests -> ../target
+
       - name: Build with locked dependencies
         run: |
           cargo build --manifest-path=stratum-apps/Cargo.toml --all-features --locked
           cargo build --manifest-path=pool-apps/Cargo.toml --locked
-          cargo build --manifest-path=pool-apps/jd-server/Cargo.toml --locked
           cargo build --manifest-path=miner-apps/Cargo.toml --locked
           cargo build --manifest-path=integration-tests/Cargo.toml --locked
 

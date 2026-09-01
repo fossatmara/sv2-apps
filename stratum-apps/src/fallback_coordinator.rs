@@ -1,6 +1,6 @@
 use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -13,11 +13,11 @@ use tokio_util::sync::CancellationToken;
 ///
 /// in summary, every time we spawn a fallback-relevant task inside the manager, we MUST:
 /// - call [`FallbackCoordinator::register`] at task bootstrap
-/// - call [`FallbackCoordinator::done`] at task completion
+/// - call [`FallbackHandler::done`] at task completion
 ///
 /// when a fallback trigger arrives to the main status loop, we MUST call
-/// [`FallbackCoordinator::trigger_and_wait`] to wait for all registered components to complete
-/// their cleanup before re-initializing them under the new upstream server.
+/// [`FallbackCoordinator::trigger_fallback_and_wait`] to wait for all registered components to
+/// complete their cleanup before re-initializing them under the new upstream server.
 ///
 /// finally, a new [`FallbackCoordinator`] must be instantiated for the next fallback cycle.
 #[derive(Debug, Clone)]

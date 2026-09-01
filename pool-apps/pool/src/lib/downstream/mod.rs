@@ -1,32 +1,29 @@
-use std::{
-    collections::HashMap,
-    sync::{
-        atomic::{AtomicBool, AtomicU32},
-        Arc,
-    },
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU32},
 };
+use stratum_apps::stratum_core::parsers_sv2::{AnyMessageOwned, MiningOwned};
 
-use async_channel::{unbounded, Receiver, Sender};
-use bitcoin_core_sv2::template_distribution_protocol::CancellationToken;
+use async_channel::{Receiver, Sender, unbounded};
 use stratum_apps::{
+    bitcoin_core_sv2::CancellationToken,
     channel_utils::ReceiverCleanup,
-    custom_mutex::Mutex,
     network_helpers::noise_stream::NoiseTcpStream,
     stratum_core::{
         channels_sv2::server::{
-            extended::ExtendedChannel,
-            group::GroupChannel,
-            jobs::{extended::ExtendedJob, job_store::DefaultJobStore, standard::StandardJob},
-            standard::StandardChannel,
+            extended::ExtendedChannel, group::GroupChannel, standard::StandardChannel,
         },
         common_messages_sv2::MESSAGE_TYPE_SETUP_CONNECTION,
         framing_sv2,
-        handlers_sv2::{HandleCommonMessagesFromClientAsync, HandleExtensionsFromClientAsync},
-        parsers_sv2::{parse_message_frame_with_tlvs, AnyMessage, Mining, Tlv},
+        handlers_sv2::{
+            HandleCommonMessagesFromClientOwnedAsync, HandleExtensionsFromClientOwnedAsync,
+        },
+        parsers_sv2::{Tlv, parse_message_frame_with_tlvs},
     },
+    sync::{SharedLock, SharedMap},
     task_manager::TaskManager,
     utils::{
-        protocol_message_type::{protocol_message_type, MessageType},
+        protocol_message_type::{MessageType, protocol_message_type},
         types::{ChannelId, DownstreamId, Message, Sv2Frame},
     },
 };
@@ -41,27 +38,6 @@ use crate::{
 mod common_message_handler;
 mod extensions_message_handler;
 
-/// Holds state related to a downstream connection's mining channels.
-///
-/// This includes:
-/// - Whether the downstream requires a standard job (`require_std_job`).
-/// - A [`GroupChannel`].
-/// - Active [`ExtendedChannel`]s keyed by channel ID.
-/// - Active [`StandardChannel`]s keyed by channel ID.
-/// - Extensions that have been successfully negotiated with this client
-pub struct DownstreamData {
-    pub group_channel: GroupChannel<'static, DefaultJobStore<ExtendedJob<'static>>>,
-    pub extended_channels:
-        HashMap<ChannelId, ExtendedChannel<'static, DefaultJobStore<ExtendedJob<'static>>>>,
-    pub standard_channels:
-        HashMap<ChannelId, StandardChannel<'static, DefaultJobStore<StandardJob<'static>>>>,
-    pub channel_id_factory: AtomicU32,
-    /// Extensions that have been successfully negotiated with this client
-    pub negotiated_extensions: Vec<u16>,
-    /// Payout mode derived from user_identity (None until channel is opened)
-    pub payout_mode: Option<PayoutMode>,
-}
-
 /// Communication layer for a downstream connection.
 ///
 /// Provides the messaging primitives for interacting with the
@@ -72,8 +48,8 @@ pub struct DownstreamData {
 /// - `downstream_receiver`: receives frames from the downstream.
 #[derive(Clone)]
 pub struct DownstreamIo {
-    channel_manager_sender: Sender<(DownstreamId, Mining<'static>, Option<Vec<Tlv>>)>,
-    channel_manager_receiver: Receiver<(Mining<'static>, Option<Vec<Tlv>>)>,
+    channel_manager_sender: Sender<(DownstreamId, MiningOwned, Option<Vec<Tlv>>)>,
+    channel_manager_receiver: Receiver<(MiningOwned, Option<Vec<Tlv>>)>,
     downstream_sender: Sender<Sv2Frame>,
     downstream_receiver: Receiver<Sv2Frame>,
 }
@@ -89,7 +65,14 @@ impl DownstreamIo {
 /// Represents a downstream client connected to this node.
 #[derive(Clone)]
 pub struct Downstream {
-    pub downstream_data: Arc<Mutex<DownstreamData>>,
+    pub group_channel: SharedLock<GroupChannel>,
+    pub extended_channels: SharedMap<ChannelId, ExtendedChannel>,
+    pub standard_channels: SharedMap<ChannelId, StandardChannel>,
+    pub channel_id_factory: Arc<AtomicU32>,
+    /// Extensions that have been successfully negotiated with this client
+    pub negotiated_extensions: SharedLock<Vec<u16>>,
+    /// Payout mode derived from user_identity (None until channel is opened)
+    pub payout_mode: SharedLock<Option<PayoutMode>>,
     downstream_io: DownstreamIo,
     pub downstream_id: usize,
     pub requires_standard_jobs: Arc<AtomicBool>,
@@ -154,9 +137,9 @@ impl Downstream {
     pub fn new(
         downstream_id: DownstreamId,
         channel_id_factory: AtomicU32,
-        group_channel: GroupChannel<'static, DefaultJobStore<ExtendedJob<'static>>>,
-        channel_manager_sender: Sender<(DownstreamId, Mining<'static>, Option<Vec<Tlv>>)>,
-        channel_manager_receiver: Receiver<(Mining<'static>, Option<Vec<Tlv>>)>,
+        group_channel: GroupChannel,
+        channel_manager_sender: Sender<(DownstreamId, MiningOwned, Option<Vec<Tlv>>)>,
+        channel_manager_receiver: Receiver<(MiningOwned, Option<Vec<Tlv>>)>,
         noise_stream: NoiseTcpStream<Message>,
         cancellation_token: CancellationToken,
         task_manager: Arc<TaskManager>,
@@ -186,18 +169,14 @@ impl Downstream {
             downstream_receiver: inbound_rx,
         };
 
-        let downstream_data = Arc::new(Mutex::new(DownstreamData {
-            extended_channels: HashMap::new(),
-            standard_channels: HashMap::new(),
-            group_channel,
-            channel_id_factory,
-            negotiated_extensions: vec![],
-            payout_mode: None,
-        }));
-
         Downstream {
             downstream_io,
-            downstream_data,
+            group_channel: SharedLock::new(group_channel),
+            extended_channels: SharedMap::new(),
+            standard_channels: SharedMap::new(),
+            channel_id_factory: Arc::new(channel_id_factory),
+            negotiated_extensions: SharedLock::new(Vec::new()),
+            payout_mode: SharedLock::new(None),
             downstream_id,
             requires_standard_jobs: Arc::new(AtomicBool::new(false)),
             requires_custom_work: Arc::new(AtomicBool::new(false)),
@@ -289,13 +268,16 @@ impl Downstream {
             .recv()
             .await
             .map_err(|error| PoolError::disconnect(error, self.downstream_id))?;
-        let header = frame.get_header().ok_or_else(|| {
+        let Some(header) = frame.get_header() else {
             error!("SV2 frame missing header");
-            PoolError::disconnect(framing_sv2::Error::MissingHeader, self.downstream_id)
-        })?;
+            return Err(PoolError::disconnect(
+                framing_sv2::Error::MissingHeader,
+                self.downstream_id,
+            ));
+        };
         // The first ever message received on a new downstream connection
         // should always be a setup connection message.
-        if header.msg_type() == MESSAGE_TYPE_SETUP_CONNECTION {
+        if header.ext_type() == 0 && header.msg_type() == MESSAGE_TYPE_SETUP_CONNECTION {
             self.handle_common_message_frame_from_client(
                 Some(self.downstream_id),
                 header,
@@ -329,7 +311,7 @@ impl Downstream {
             }
         };
 
-        let message = AnyMessage::Mining(msg);
+        let message = AnyMessageOwned::Mining(msg);
         let std_frame: Sv2Frame = message.try_into().map_err(PoolError::shutdown)?;
 
         self.downstream_io
@@ -352,25 +334,29 @@ impl Downstream {
             .recv()
             .await
             .map_err(|error| PoolError::disconnect(error, self.downstream_id))?;
-        let header = sv2_frame.get_header().ok_or_else(|| {
+        let Some(header) = sv2_frame.get_header() else {
             error!("SV2 frame missing header");
-            PoolError::disconnect(framing_sv2::Error::MissingHeader, self.downstream_id)
-        })?;
+            return Err(PoolError::disconnect(
+                framing_sv2::Error::MissingHeader,
+                self.downstream_id,
+            ));
+        };
 
         match protocol_message_type(header.ext_type(), header.msg_type()) {
             MessageType::Mining => {
                 debug!("Received mining SV2 frame from downstream.");
                 let negotiated_extensions = self
-                    .downstream_data
-                    .super_safe_lock(|data| data.negotiated_extensions.clone());
+                    .negotiated_extensions
+                    .get()
+                    .map_err(PoolError::shutdown)?;
                 let (any_message, tlv_fields) = parse_message_frame_with_tlvs(
                     header,
                     sv2_frame.payload(),
                     &negotiated_extensions,
                 )
                 .map_err(|error| PoolError::disconnect(error, self.downstream_id))?;
-                let mining_message = match any_message {
-                    AnyMessage::Mining(msg) => msg,
+                let mining_message = match any_message.into_owned() {
+                    AnyMessageOwned::Mining(msg) => msg,
                     _ => {
                         error!("Expected Mining message but got different type");
                         return Err(PoolError::disconnect(

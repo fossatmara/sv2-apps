@@ -7,11 +7,15 @@
 //! structures for submitting shares and updating targets, and constants
 //! and functions for managing client interactions.
 //!
-//! The module is organized into the following sub-modules:
-//! - [`diff_management`]: (Declared here, likely contains downstream difficulty logic)
-//! - [`downstream`]: Defines the core [`Downstream`] struct and its functionalities.
+//! The module is organized as follows:
+//! - The [`Downstream`] struct handles the state and communication for a single downstream SV1
+//!   miner.
+//! - The [`Sv1Server`] struct is the main server that listens for and manages all downstream miner
+//!   connections.
 
 mod downstream;
+#[cfg(feature = "monitoring")]
+mod monitoring;
 mod sv1_server;
 pub use downstream::Downstream;
 pub use sv1_server::Sv1Server;

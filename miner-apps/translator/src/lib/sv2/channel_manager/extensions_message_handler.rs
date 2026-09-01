@@ -4,32 +4,34 @@ use crate::{
 };
 use stratum_apps::{
     stratum_core::{
-        binary_sv2::Seq064K,
-        extensions_sv2::{RequestExtensions, RequestExtensionsError, RequestExtensionsSuccess},
-        handlers_sv2::HandleExtensionsFromServerAsync,
-        parsers_sv2::{AnyMessage, Tlv},
+        binary_sv2::Seq064KOwned,
+        extensions_sv2::{
+            RequestExtensionsErrorOwned, RequestExtensionsOwned, RequestExtensionsSuccessOwned,
+        },
+        handlers_sv2::HandleExtensionsFromServerOwnedAsync,
+        parsers_sv2::{AnyMessageOwned, Tlv},
     },
     utils::types::Sv2Frame,
 };
 use tracing::{error, info};
 
 #[cfg_attr(not(test), hotpath::measure_all)]
-impl HandleExtensionsFromServerAsync for ChannelManager {
+impl HandleExtensionsFromServerOwnedAsync for ChannelManager {
     type Error = TproxyError<error::ChannelManager>;
 
     fn get_negotiated_extensions_with_server(
         &self,
         _server_id: Option<usize>,
     ) -> Result<Vec<u16>, Self::Error> {
-        Ok(self
-            .negotiated_extensions
-            .super_safe_lock(|data| data.clone()))
+        self.negotiated_extensions
+            .get()
+            .map_err(TproxyError::shutdown)
     }
 
     async fn handle_request_extensions_success(
         &mut self,
         _server_id: Option<usize>,
-        msg: RequestExtensionsSuccess<'_>,
+        msg: RequestExtensionsSuccessOwned,
         _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         let supported: Vec<u16> = msg.supported_extensions.into_inner();
@@ -50,15 +52,14 @@ impl HandleExtensionsFromServerAsync for ChannelManager {
                 missing_required
             );
             return Err(TproxyError::fallback(TproxyErrorKind::General(format!(
-                "Server does not support required extensions: {:?}",
-                missing_required
+                "Server does not support required extensions: {missing_required:?}"
             ))));
         }
 
         // Store the negotiated extensions in the shared channel manager data
-        self.negotiated_extensions.super_safe_lock(|data| {
-            *data = supported;
-        });
+        self.negotiated_extensions
+            .set(supported)
+            .map_err(TproxyError::shutdown)?;
 
         info!("Successfully negotiated extensions");
 
@@ -68,7 +69,7 @@ impl HandleExtensionsFromServerAsync for ChannelManager {
     async fn handle_request_extensions_error(
         &mut self,
         _server_id: Option<usize>,
-        msg: RequestExtensionsError<'_>,
+        msg: RequestExtensionsErrorOwned,
         _tlv_fields: Option<&[Tlv]>,
     ) -> Result<(), Self::Error> {
         let unsupported: Vec<u16> = msg.unsupported_extensions.into_inner();
@@ -129,15 +130,14 @@ impl HandleExtensionsFromServerAsync for ChannelManager {
                 can_support
             );
 
-            let new_require_extensions = RequestExtensions {
+            let new_require_extensions = RequestExtensionsOwned {
                 request_id: msg.request_id + 1,
-                requested_extensions: Seq064K::new(can_support).unwrap(),
+                requested_extensions: Seq064KOwned::new(can_support).unwrap(),
             };
 
-            let sv2_frame: Sv2Frame =
-                AnyMessage::Extensions(new_require_extensions.into_static().into())
-                    .try_into()
-                    .map_err(TproxyError::shutdown)?;
+            let sv2_frame: Sv2Frame = AnyMessageOwned::Extensions(new_require_extensions.into())
+                .try_into()
+                .map_err(TproxyError::shutdown)?;
 
             self.channel_manager_io
                 .upstream_sender

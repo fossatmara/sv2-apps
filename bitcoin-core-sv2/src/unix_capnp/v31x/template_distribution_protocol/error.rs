@@ -1,9 +1,14 @@
+//! Error types for Bitcoin Core v31.x Sv2 Template Distribution Protocol via capnp over UNIX
+//! socket.
+
 use std::path::Path;
 use stratum_core::bitcoin::{
     block::ValidationError, consensus, consensus::encode::Error as ConsensusEncodeError,
 };
 
-/// Error type for [`crate::BitcoinCoreSv2TDP`]
+use bitcoin_capnp_types_v31::capnp;
+
+/// Error type for [`super::BitcoinCoreSv2TDP`]
 #[derive(Debug)]
 pub enum BitcoinCoreSv2TDPError {
     CapnpError(capnp::Error),
@@ -84,10 +89,10 @@ impl std::fmt::Display for TemplateDataError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TemplateDataError::InvalidCoinbaseTx(e) => {
-                write!(f, "Invalid coinbase transaction: {}", e)
+                write!(f, "Invalid coinbase transaction: {e}")
             }
             TemplateDataError::InvalidSolution => write!(f, "Invalid solution"),
-            TemplateDataError::InvalidSolutionPoW(e) => write!(f, "Invalid solution: {}", e),
+            TemplateDataError::InvalidSolutionPoW(e) => write!(f, "Invalid solution: {e}"),
             TemplateDataError::InvalidMerkleRoot => write!(f, "Invalid merkle root"),
             TemplateDataError::InvalidBlockVersion => write!(f, "Invalid block version"),
             TemplateDataError::InvalidCoinbaseTxVersion => {
@@ -105,7 +110,7 @@ impl std::fmt::Display for TemplateDataError {
             TemplateDataError::FailedToSumCoinbaseOutputs => {
                 write!(f, "Failed to sum coinbase outputs")
             }
-            TemplateDataError::CapnpError(e) => write!(f, "Cap'n Proto error: {}", e),
+            TemplateDataError::CapnpError(e) => write!(f, "Cap'n Proto error: {e}"),
             TemplateDataError::FailedIpcSubmitSolution => {
                 write!(f, "Failed to submit solution via IPC")
             }
@@ -116,7 +121,7 @@ impl std::fmt::Display for TemplateDataError {
                 write!(f, "Failed to create merkle path sequence")
             }
             TemplateDataError::BitcoinCoreSv2TDPError(error) => {
-                write!(f, "Bitcoin Core Sv2 error: {:?}", error)
+                write!(f, "Bitcoin Core Sv2 error: {error:?}")
             }
         }
     }

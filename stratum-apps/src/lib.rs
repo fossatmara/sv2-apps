@@ -12,13 +12,16 @@
 //! - `config` - Configuration management helpers (enabled by default)
 //! - `payout` - Shared payout-mode parsing and coinbase-output distribution helpers
 //! - `monitoring` - HTTP and Prometheus monitoring helpers (optional)
+//! - `asic-rs-telemetry` - Optional miner telemetry helpers powered by `asic-rs`
 //! - `std` - Standard-library support for key and random utilities (enabled by default)
 //! - `core` - Re-export and enable `stratum-core`
+//! - `bitcoin-core-sv2` - Re-export and enable `bitcoin_core_sv2`
 //!
 //! ### Role-Specific Feature Bundles
 //! - `pool` - Everything needed for pool applications
 //! - `jd_client` - Everything needed for JD client applications
-//! - `jd_server` - Configuration helpers for JD server applications
+//! - `jd_server` - Configuration helpers and Bitcoin Core IPC runtime APIs for JD server
+//!   applications
 //! - `translator` - Everything needed for translator applications (includes SV1 and payout helpers)
 //! - `mining_device` - Configuration helpers for mining device applications
 //!
@@ -26,11 +29,20 @@
 //!
 //! - [`network_helpers`] - High-level networking utilities for SV2 connections
 //! - [`config_helpers`] - Configuration management and parsing utilities
-//! - [`payout`] - Payout-mode parsing and coinbase-output construction/verification helpers
+//! - \[`payout`\] - Payout-mode parsing and coinbase-output construction/verification helpers
 
 /// Re-export all the modules from `stratum_core`
 #[cfg(feature = "core")]
 pub use stratum_core;
+
+/// Re-export all the modules from `bitcoin_core_sv2`
+#[cfg(feature = "bitcoin-core-sv2")]
+pub use bitcoin_core_sv2;
+
+/// Re-export `tokio_util`, for the [`tokio_util::sync::CancellationToken`] required by the
+/// networking helpers
+#[cfg(feature = "tokio-util")]
+pub use tokio_util;
 
 /// High-level networking utilities for SV2 connections
 ///
@@ -46,10 +58,6 @@ pub mod network_helpers;
 #[cfg(feature = "config")]
 pub mod config_helpers;
 
-/// Custom Mutex
-///
-/// A wrapper around std::sync::Mutex
-pub mod custom_mutex;
 /// Key utilities for cryptographic operations
 ///
 /// Provides Secp256k1 key management, serialization/deserialization, and signature services.

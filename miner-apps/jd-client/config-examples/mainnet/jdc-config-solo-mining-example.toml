@@ -39,6 +39,10 @@ upstreams = []
 
 # Templates come directly from the Template Provider below.
 
+# LAN subnet containing ASIC miner web/API addresses (for example, 192.168.1.0/24).
+[miner_telemetry]
+cidrs = ["192.168.1.0/24"]
+
 # Local Sv2 Template Provider config
 [template_provider_type.Sv2Tp]
 address = "127.0.0.1:8442"

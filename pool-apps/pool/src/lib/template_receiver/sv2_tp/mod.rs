@@ -1,19 +1,23 @@
 use std::sync::Arc;
+use stratum_apps::stratum_core::parsers_sv2::{AnyMessageOwned, TemplateDistributionOwned};
 mod common_message_handler;
-use async_channel::{unbounded, Receiver, Sender};
-use bitcoin_core_sv2::template_distribution_protocol::CancellationToken;
+use async_channel::{Receiver, Sender, unbounded};
 use stratum_apps::{
+    bitcoin_core_sv2::CancellationToken,
     channel_utils::ReceiverCleanup,
     key_utils::Secp256k1PublicKey,
-    network_helpers::{self, connect_with_noise, resolve_host_port, TCP_CONNECT_TIMEOUT},
+    network_helpers::{self, TCP_CONNECT_TIMEOUT, connect_with_noise, resolve_host_port},
     stratum_core::{
+        common_messages_sv2::{
+            MESSAGE_TYPE_SETUP_CONNECTION_ERROR, MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS,
+        },
         framing_sv2,
-        handlers_sv2::HandleCommonMessagesFromServerAsync,
-        parsers_sv2::{AnyMessage, TemplateDistribution},
+        handlers_sv2::HandleCommonMessagesFromServerOwnedAsync,
+        parsers_sv2::TemplateDistribution,
     },
     task_manager::TaskManager,
     utils::{
-        protocol_message_type::{protocol_message_type, MessageType},
+        protocol_message_type::{MessageType, protocol_message_type},
         types::{Message, Sv2Frame},
     },
 };
@@ -28,8 +32,8 @@ use crate::{
 
 #[derive(Clone)]
 pub struct Sv2TpIo {
-    channel_manager_sender: Sender<TemplateDistribution<'static>>,
-    channel_manager_receiver: Receiver<TemplateDistribution<'static>>,
+    channel_manager_sender: Sender<TemplateDistributionOwned>,
+    channel_manager_receiver: Receiver<TemplateDistributionOwned>,
     tp_sender: Sender<Sv2Frame>,
     tp_receiver: Receiver<Sv2Frame>,
 }
@@ -85,12 +89,12 @@ impl Sv2Tp {
     /// - Performs Noise handshake
     /// - Spawns IO tasks for inbound/outbound frames
     ///
-    /// Retries up to 3 times before returning [`PoolError::Shutdown`].
+    /// Retries up to 3 times before returning [`PoolError::shutdown`].
     pub async fn new(
         tp_address: String,
         public_key: Option<Secp256k1PublicKey>,
-        channel_manager_receiver: Receiver<TemplateDistribution<'static>>,
-        channel_manager_sender: Sender<TemplateDistribution<'static>>,
+        channel_manager_receiver: Receiver<TemplateDistributionOwned>,
+        channel_manager_sender: Sender<TemplateDistributionOwned>,
         cancellation_token: CancellationToken,
         task_manager: Arc<TaskManager>,
     ) -> PoolResult<Sv2Tp, error::TemplateProvider> {
@@ -273,7 +277,7 @@ impl Sv2Tp {
                 let message =
                     TemplateDistribution::try_from((header.msg_type(), sv2_frame.payload()))
                         .map_err(PoolError::shutdown)?
-                        .into_static();
+                        .into_owned();
 
                 self.sv2_tp_io
                     .channel_manager_sender
@@ -305,7 +309,7 @@ impl Sv2Tp {
             .recv()
             .await
             .map_err(PoolError::shutdown)?;
-        let message = AnyMessage::TemplateDistribution(msg).into_static();
+        let message = AnyMessageOwned::TemplateDistribution(msg);
         let frame: Sv2Frame = message.try_into().map_err(PoolError::shutdown)?;
 
         debug!("Forwarding message from channel manager to outbound_tx");
@@ -355,6 +359,18 @@ impl Sv2Tp {
             msg_type = ?header.msg_type(),
             "Received upstream handshake response"
         );
+
+        if header.ext_type() != 0
+            || !matches!(
+                header.msg_type(),
+                MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS | MESSAGE_TYPE_SETUP_CONNECTION_ERROR
+            )
+        {
+            return Err(PoolError::shutdown(PoolErrorKind::UnexpectedMessage(
+                header.ext_type(),
+                header.msg_type(),
+            )));
+        }
 
         self.handle_common_message_frame_from_server(None, header, incoming.payload())
             .await?;

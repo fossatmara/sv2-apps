@@ -2,33 +2,41 @@ mod extensions_message_handler;
 mod mining_message_handler;
 
 use crate::{
-    error::{self, Action, LoopControl, TproxyError, TproxyErrorKind, TproxyResult},
-    utils::{AggregatedState, AtomicAggregatedState, AGGREGATED_CHANNEL_ID},
     TproxyMode,
+    error::{self, Action, LoopControl, TproxyError, TproxyErrorKind, TproxyResult},
+    utils::{
+        AGGREGATED_CHANNEL_ID, AggregatedState, AtomicAggregatedState,
+        aggregated_upstream_user_identity, tlv_user_identity_from_sv1_worker_name,
+    },
 };
 use async_channel::{Receiver, Sender};
-use dashmap::DashMap;
 use std::sync::{Arc, OnceLock};
 use stratum_apps::{
     channel_utils::ReceiverCleanup,
-    custom_mutex::Mutex,
     fallback_coordinator::FallbackCoordinator,
     payout::PayoutMode,
     stratum_core::{
         channels_sv2::{
             client::{extended::ExtendedChannel, group::GroupChannel},
-            extranonce_manager::{bytes_needed, ExtranonceAllocator},
+            extranonce_manager::{ExtranonceAllocator, bytes_needed},
         },
         codec_sv2::StandardSv2Frame,
-        extensions_sv2::{EXTENSION_TYPE_WORKER_HASHRATE_TRACKING, TLV_FIELD_TYPE_USER_IDENTITY},
+        extensions_sv2::EXTENSION_TYPE_WORKER_HASHRATE_TRACKING,
         framing_sv2,
-        handlers_sv2::{HandleExtensionsFromServerAsync, HandleMiningMessagesFromServerAsync},
-        mining_sv2::OpenExtendedMiningChannelSuccess,
-        parsers_sv2::{AnyMessage, Mining, Tlv, TlvList},
+        handlers_sv2::{
+            HandleExtensionsFromServerOwnedAsync, HandleMiningMessagesFromServerOwnedAsync,
+        },
+        mining_sv2::{
+            ERROR_CODE_OPEN_MINING_CHANNEL_CHANNEL_CAPACITY_EXHAUSTED,
+            ERROR_CODE_OPEN_MINING_CHANNEL_UNSUPPORTED_MIN_EXTRANONCE_SIZE,
+            OpenExtendedMiningChannelSuccessOwned, OpenMiningChannelErrorOwned,
+        },
+        parsers_sv2::{AnyMessageOwned, MiningOwned, TlvField, TlvList},
     },
+    sync::{SharedLock, SharedMap},
     task_manager::TaskManager,
     utils::{
-        protocol_message_type::{protocol_message_type, MessageType},
+        protocol_message_type::{MessageType, protocol_message_type},
         types::{ChannelId, DownstreamId, Hashrate, RequestId, Sv2Frame},
     },
 };
@@ -69,8 +77,9 @@ pub(crate) const NON_AGGREGATED_TPROXY_MAX_CHANNELS: u32 = 1;
 struct ChannelManagerIo {
     upstream_sender: Sender<Sv2Frame>,
     upstream_receiver: Receiver<Sv2Frame>,
-    sv1_server_sender: Sender<(Mining<'static>, Option<Vec<Tlv>>)>,
-    sv1_server_receiver: Receiver<(Mining<'static>, Option<Vec<Tlv>>)>,
+    sv1_server_sender: Sender<MiningOwned>,
+    // Option<String> carries non-empty sv1_worker_name metadata for SubmitSharesExtended.
+    sv1_server_receiver: Receiver<(MiningOwned, Option<String>)>,
 }
 
 #[cfg_attr(not(test), hotpath::measure_all)]
@@ -78,8 +87,8 @@ impl ChannelManagerIo {
     fn new(
         upstream_sender: Sender<Sv2Frame>,
         upstream_receiver: Receiver<Sv2Frame>,
-        sv1_server_sender: Sender<(Mining<'static>, Option<Vec<Tlv>>)>,
-        sv1_server_receiver: Receiver<(Mining<'static>, Option<Vec<Tlv>>)>,
+        sv1_server_sender: Sender<MiningOwned>,
+        sv1_server_receiver: Receiver<(MiningOwned, Option<String>)>,
     ) -> Self {
         Self {
             upstream_sender,
@@ -143,25 +152,25 @@ pub struct ChannelManager {
     ///
     /// Entries are removed once the upstream success message is received
     /// and propagated accordingly.
-    pub pending_downstream_channels: Arc<DashMap<DownstreamId, (String, Hashrate, usize)>>,
+    pub pending_downstream_channels: SharedMap<DownstreamId, (String, Hashrate, usize)>,
     /// Map of active extended channels by channel ID.
     /// In aggregated mode, the shared upstream channel is stored under AGGREGATED_CHANNEL_ID.
     /// In non-aggregated mode, each downstream has its own channel with its assigned ID.
-    pub extended_channels: Arc<DashMap<ChannelId, ExtendedChannel<'static>>>,
+    pub extended_channels: SharedMap<ChannelId, ExtendedChannel>,
     /// Map of active group channels by group channel ID
-    pub group_channels: Arc<DashMap<ChannelId, GroupChannel<'static>>>,
+    pub group_channels: SharedMap<ChannelId, GroupChannel>,
     /// Share sequence number counter for tracking valid shares forwarded upstream.
     /// In aggregated mode: single counter for all shares going to the upstream channel.
     /// In non-aggregated mode: one counter per downstream channel.
-    pub share_sequence_counters: Arc<DashMap<u32, u32>>,
+    pub share_sequence_counters: SharedMap<u32, u32>,
     /// Extensions that have been successfully negotiated with the upstream server
-    pub negotiated_extensions: Arc<Mutex<Vec<u16>>>,
+    pub negotiated_extensions: SharedLock<Vec<u16>>,
     /// Single extranonce allocator used in aggregated mode to sub-divide the
     /// upstream-assigned prefix across all downstream channels.
     ///
     /// `None` until the upstream `OpenExtendedMiningChannelSuccess` for the
     /// aggregated channel is received; `Some` afterwards.
-    pub aggregated_extranonce_allocator: Arc<Mutex<Option<ExtranonceAllocator>>>,
+    pub aggregated_extranonce_allocator: SharedLock<Option<ExtranonceAllocator>>,
     /// Tracks whether the single upstream channel in aggregated mode is absent,
     /// being established, or connected.
     pub aggregated_channel_state: AtomicAggregatedState,
@@ -176,17 +185,30 @@ pub struct ChannelManager {
 
 #[cfg_attr(not(test), hotpath::measure_all)]
 impl ChannelManager {
-    fn reset_state(&self) {
-        self.pending_downstream_channels.clear();
-        self.extended_channels.clear();
-        self.group_channels.clear();
-        self.share_sequence_counters.clear();
-        self.negotiated_extensions
-            .super_safe_lock(|data| data.clear());
-        self.aggregated_extranonce_allocator
-            .super_safe_lock(|allocator| *allocator = None);
-        self.aggregated_channel_state
-            .set(AggregatedState::NoChannel);
+    async fn reject_downstream_channel_request(
+        &self,
+        request_id: RequestId,
+        error_code: &'static str,
+    ) -> TproxyResult<(), error::ChannelManager> {
+        warn!(
+            request_id,
+            error_code, "Rejecting downstream channel request"
+        );
+        self.channel_manager_io
+            .sv1_server_sender
+            .send(MiningOwned::OpenMiningChannelError(
+                OpenMiningChannelErrorOwned {
+                    request_id,
+                    error_code: error_code
+                        .try_into()
+                        .expect("static channel error code must fit in Str0255"),
+                },
+            ))
+            .await
+            .map_err(|e| {
+                error!("Failed to send open channel error to SV1Server: {e:?}");
+                TproxyError::shutdown(TproxyErrorKind::ChannelErrorSender)
+            })
     }
 
     fn expected_payout_distribution(&self) -> &Option<PayoutMode> {
@@ -278,8 +300,8 @@ impl ChannelManager {
     pub fn new(
         upstream_sender: Sender<Sv2Frame>,
         upstream_receiver: Receiver<Sv2Frame>,
-        sv1_server_sender: Sender<(Mining<'static>, Option<Vec<Tlv>>)>,
-        sv1_server_receiver: Receiver<(Mining<'static>, Option<Vec<Tlv>>)>,
+        sv1_server_sender: Sender<MiningOwned>,
+        sv1_server_receiver: Receiver<(MiningOwned, Option<String>)>,
         supported_extensions: Vec<u16>,
         required_extensions: Vec<u16>,
         tproxy_mode: TproxyMode,
@@ -296,12 +318,12 @@ impl ChannelManager {
             channel_manager_io,
             supported_extensions,
             required_extensions,
-            pending_downstream_channels: Arc::new(DashMap::new()),
-            extended_channels: Arc::new(DashMap::new()),
-            group_channels: Arc::new(DashMap::new()),
-            share_sequence_counters: Arc::new(DashMap::new()),
-            negotiated_extensions: Arc::new(Mutex::new(Vec::new())),
-            aggregated_extranonce_allocator: Arc::new(Mutex::new(None)),
+            pending_downstream_channels: SharedMap::new(),
+            extended_channels: SharedMap::new(),
+            group_channels: SharedMap::new(),
+            share_sequence_counters: SharedMap::new(),
+            negotiated_extensions: SharedLock::new(Vec::new()),
+            aggregated_extranonce_allocator: SharedLock::new(None),
             aggregated_channel_state: AtomicAggregatedState::new(AggregatedState::NoChannel),
             expected_payout_distribution: Arc::new(OnceLock::new()),
             mode: tproxy_mode,
@@ -344,13 +366,11 @@ impl ChannelManager {
                 tokio::select! {
                     biased;
                     _ = cancellation_token.cancelled() => {
-                        info!("ChannelManager: received shutdown signal, resetting state");
-                        self.reset_state();
+                        info!("ChannelManager: received shutdown signal");
                         break;
                     }
                     _ = fallback_token.cancelled() => {
-                        info!("ChannelManager: fallback triggered, resetting state");
-                        self.reset_state();
+                        info!("ChannelManager: fallback triggered");
                         break;
                     }
                     res = self.clone().handle_upstream_frame() => {
@@ -463,14 +483,14 @@ impl ChannelManager {
     /// * `Ok(())` - Message processed successfully
     /// * `Err(TproxyError)` - Error processing the message
     async fn handle_downstream_message(self: Arc<Self>) -> TproxyResult<(), error::ChannelManager> {
-        let (message, tlv_fields) = self
+        let (message, sv1_worker_name) = self
             .channel_manager_io
             .sv1_server_receiver
             .recv()
             .await
             .map_err(TproxyError::shutdown)?;
         match message {
-            Mining::OpenExtendedMiningChannel(m) => {
+            MiningOwned::OpenExtendedMiningChannel(m) => {
                 let mut open_channel_msg = m.clone();
                 let mut user_identity = m.user_identity.as_utf8_or_hex();
                 let hashrate = m.nominal_hash_rate;
@@ -504,16 +524,9 @@ impl ChannelManager {
                             // Modify user_identity for the upstream `OpenExtendedMiningChannel`.
                             // SRI patterns are passed unchanged to preserve pool-side parsing.
                             // See: https://github.com/stratum-mining/sv2-apps/issues/369
-                            let translator_identity = if user_identity.starts_with("sri/") {
-                                user_identity.clone()
-                            } else if let Some(dot_index) = user_identity.find('.') {
-                                format!("{}.translator-proxy", &user_identity[..dot_index])
-                            } else {
-                                format!("{user_identity}.translator-proxy")
-                            };
-                            user_identity = translator_identity;
+                            user_identity = aggregated_upstream_user_identity(&user_identity);
                             open_channel_msg.user_identity =
-                                user_identity.as_bytes().to_vec().try_into().unwrap();
+                                user_identity.as_str().try_into().unwrap();
                         }
                     }
                 }
@@ -547,12 +560,12 @@ impl ChannelManager {
                 }
 
                 info!(
-                    "Sending OpenExtendedMiningChannel message to upstream: {}",
+                    "Sending OpenExtendedMiningChannel message to upstream: {:?}",
                     open_channel_msg
                 );
 
-                let message = Mining::OpenExtendedMiningChannel(open_channel_msg);
-                let sv2_frame: Sv2Frame = AnyMessage::Mining(message)
+                let message = MiningOwned::OpenExtendedMiningChannel(open_channel_msg);
+                let sv2_frame: Sv2Frame = AnyMessageOwned::Mining(message)
                     .try_into()
                     .map_err(TproxyError::shutdown)?;
                 self.channel_manager_io
@@ -564,20 +577,22 @@ impl ChannelManager {
                         TproxyError::fallback(TproxyErrorKind::ChannelErrorSender)
                     })?;
             }
-            Mining::SubmitSharesExtended(mut m) => {
+            MiningOwned::SubmitSharesExtended(mut m) => {
                 if self.mode.is_aggregated()
                     && self.extended_channels.contains_key(&AGGREGATED_CHANNEL_ID)
                 {
                     let downstream_channel_id = m.channel_id;
                     let downstream_extranonce_prefix = self
                         .extended_channels
-                        .get(&downstream_channel_id)
-                        .map(|channel| channel.get_extranonce_prefix().to_vec());
-                    let upstream_prefix_len =
-                        self.aggregated_extranonce_allocator
-                            .super_safe_lock(|allocator| {
-                                allocator.as_ref().map(|a| a.upstream_prefix_len() as usize)
-                            });
+                        .with(&downstream_channel_id, |channel| {
+                            channel.get_extranonce_prefix().to_vec()
+                        });
+                    let upstream_prefix_len = self
+                        .aggregated_extranonce_allocator
+                        .with(|allocator| {
+                            allocator.as_ref().map(|a| a.upstream_prefix_len() as usize)
+                        })
+                        .map_err(TproxyError::shutdown)?;
                     if let (Some(downstream_extranonce_prefix), Some(upstream_prefix_len)) =
                         (downstream_extranonce_prefix, upstream_prefix_len)
                     {
@@ -593,15 +608,15 @@ impl ChannelManager {
 
                     let upstream_extended_channel_id = self
                         .extended_channels
-                        .get(&AGGREGATED_CHANNEL_ID)
-                        .map(|ch| ch.get_channel_id())
+                        .with(&AGGREGATED_CHANNEL_ID, |ch| ch.get_channel_id())
                         .unwrap();
                     m.channel_id = upstream_extended_channel_id;
 
                     let value = self
                         .extended_channels
-                        .get_mut(&AGGREGATED_CHANNEL_ID)
-                        .map(|mut aggregated_channel| aggregated_channel.validate_share(m.clone()));
+                        .with_mut(&AGGREGATED_CHANNEL_ID, |aggregated_channel| {
+                            aggregated_channel.validate_share(m.clone())
+                        });
                     if let Some(Ok(_result)) = value {
                         info!(
                             "SubmitSharesExtended: valid share, forwarding it to upstream | channel_id: {}, sequence_number: {} ☑️",
@@ -617,8 +632,9 @@ impl ChannelManager {
                 } else {
                     let value = self
                         .extended_channels
-                        .get_mut(&m.channel_id)
-                        .map(|mut extended_channel| extended_channel.validate_share(m.clone()));
+                        .with_mut(&m.channel_id, |extended_channel| {
+                            extended_channel.validate_share(m.clone())
+                        });
                     if let Some(Ok(_result)) = value {
                         info!(
                             "SubmitSharesExtended: valid share, forwarding it to upstream | channel_id: {}, sequence_number: {} ☑️",
@@ -642,10 +658,13 @@ impl ChannelManager {
                         // zero-slack open path where upstream granted
                         // exactly the rollable size we asked for and no
                         // rewriting is needed.
-                        let layout = self.extended_channels.get(&m.channel_id).and_then(|c| {
-                            c.upstream_prefix_len()
-                                .map(|n| (n as usize, c.get_extranonce_prefix().to_vec()))
-                        });
+                        let layout = self
+                            .extended_channels
+                            .with(&m.channel_id, |c| {
+                                c.upstream_prefix_len()
+                                    .map(|n| (n as usize, c.get_extranonce_prefix().to_vec()))
+                            })
+                            .flatten();
                         if let Some((upstream_prefix_len, downstream_extranonce_prefix)) = layout {
                             let translator_prefix =
                                 &downstream_extranonce_prefix[upstream_prefix_len..];
@@ -660,38 +679,29 @@ impl ChannelManager {
                 }
 
                 // Send the share upstream (common for both aggregated and non-aggregated modes)
-                let contains_type_in_negotiated_extension =
-                    self.negotiated_extensions.super_safe_lock(|data| {
-                        data.contains(&EXTENSION_TYPE_WORKER_HASHRATE_TRACKING)
-                    });
-
-                // Check if we should try to include TLV fields
-                let should_send_with_tlv =
-                    contains_type_in_negotiated_extension && tlv_fields.is_some();
+                let contains_type_in_negotiated_extension = self
+                    .negotiated_extensions
+                    .with(|data| data.contains(&EXTENSION_TYPE_WORKER_HASHRATE_TRACKING))
+                    .map_err(TproxyError::shutdown)?;
 
                 let mut sent = false;
-                if should_send_with_tlv {
-                    info!(
-                        "TLV fields in Channel Manager: {:?}",
-                        tlv_fields.clone().unwrap()
-                    );
-                    // Create frame bytes with TLVs
-                    let user_identity_tlv = tlv_fields.and_then(|tlvs| {
-                        tlvs.iter()
-                            .find(|tlv| {
-                                tlv.r#type.extension_type == EXTENSION_TYPE_WORKER_HASHRATE_TRACKING
-                                    && tlv.r#type.field_type == TLV_FIELD_TYPE_USER_IDENTITY
-                            })
-                            .cloned()
-                    });
-
-                    if let Some(tlv) = user_identity_tlv {
+                if contains_type_in_negotiated_extension {
+                    if let Some(sv1_worker_name) = sv1_worker_name
+                        .as_deref()
+                        .filter(|sv1_worker_name| !sv1_worker_name.is_empty())
+                    {
+                        let tlv_user_identity =
+                            tlv_user_identity_from_sv1_worker_name(sv1_worker_name)
+                                .map_err(TproxyError::shutdown)?;
+                        let tlv = tlv_user_identity.to_tlv().map_err(TproxyError::shutdown)?;
                         let tlv_list = TlvList::from_slice(&[tlv]).map_err(|e| {
                             error!("Failed to create TLV list: {:?}", e);
                             TproxyError::shutdown(e)
                         })?;
                         let frame_bytes = tlv_list
-                            .build_frame_bytes_with_tlvs(Mining::SubmitSharesExtended(m.clone()))
+                            .build_frame_bytes_with_tlvs(MiningOwned::SubmitSharesExtended(
+                                m.clone(),
+                            ))
                             .map_err(|e| {
                                 error!("Failed to build frame bytes with TLVs: {:?}", e);
                                 TproxyError::shutdown(e)
@@ -722,8 +732,8 @@ impl ChannelManager {
                 }
 
                 if !sent {
-                    let message = Mining::SubmitSharesExtended(m);
-                    let sv2_frame: Sv2Frame = AnyMessage::Mining(message)
+                    let message = MiningOwned::SubmitSharesExtended(m);
+                    let sv2_frame: Sv2Frame = AnyMessageOwned::Mining(message)
                         .try_into()
                         .map_err(TproxyError::shutdown)?;
                     self.channel_manager_io
@@ -739,30 +749,33 @@ impl ChannelManager {
                         })?;
                 }
             }
-            Mining::UpdateChannel(mut m) => {
+            MiningOwned::UpdateChannel(mut m) => {
                 debug!("Received UpdateChannel from SV1Server: {}", m);
 
                 if self.mode.is_aggregated() {
                     // Update the aggregated channel's nominal hashrate so
                     // that monitoring reports a value consistent with the
                     // downstream vardiff estimate.
-                    if let Some(mut aggregated_extended_channel) =
-                        self.extended_channels.get_mut(&AGGREGATED_CHANNEL_ID)
-                    {
-                        aggregated_extended_channel.set_nominal_hashrate(m.nominal_hash_rate);
-                        m.channel_id = aggregated_extended_channel.get_channel_id();
+                    if let Some(channel_id) = self.extended_channels.with_mut(
+                        &AGGREGATED_CHANNEL_ID,
+                        |aggregated_extended_channel| {
+                            aggregated_extended_channel.set_nominal_hashrate(m.nominal_hash_rate);
+                            aggregated_extended_channel.get_channel_id()
+                        },
+                    ) {
+                        m.channel_id = channel_id;
                     } else {
                         warn!(
-                            "Ignoring aggregated UpdateChannel before upstream channel is open: {}",
+                            "Ignoring aggregated UpdateChannel before upstream channel is open: {:?}",
                             m
                         );
                         return Ok(());
                     }
                 } else {
                     // Non-aggregated: update the specific channel's nominal hashrate
-                    if let Some(mut channel) = self.extended_channels.get_mut(&m.channel_id) {
+                    self.extended_channels.with_mut(&m.channel_id, |channel| {
                         channel.set_nominal_hashrate(m.nominal_hash_rate);
-                    }
+                    });
                 }
 
                 info!(
@@ -770,8 +783,8 @@ impl ChannelManager {
                     m.channel_id
                 );
                 // Forward UpdateChannel message to upstream
-                let message = Mining::UpdateChannel(m);
-                let sv2_frame: Sv2Frame = AnyMessage::Mining(message)
+                let message = MiningOwned::UpdateChannel(m);
+                let sv2_frame: Sv2Frame = AnyMessageOwned::Mining(message)
                     .try_into()
                     .map_err(TproxyError::shutdown)?;
 
@@ -784,7 +797,7 @@ impl ChannelManager {
                         TproxyError::fallback(TproxyErrorKind::ChannelErrorSender)
                     })?;
             }
-            Mining::CloseChannel(m) => {
+            MiningOwned::CloseChannel(m) => {
                 debug!("Received CloseChannel from Sv1Server: {m}");
 
                 // Guard: never remove the aggregated upstream sentinel entry
@@ -817,20 +830,20 @@ impl ChannelManager {
                 }
 
                 // Remove from any group channels that contain it
-                for mut group_channel in self.group_channels.iter_mut() {
+                self.group_channels.for_each_mut(|_, group_channel| {
                     if group_channel.has_channel_id(m.channel_id) {
                         group_channel.remove_channel_id(m.channel_id);
                         debug!("Removed channel {} from group channel", m.channel_id);
                     }
-                }
+                });
 
                 // Only forward `CloseChannel` upstream in non-aggregated
                 // mode. In aggregated mode the upstream channel is shared
                 // across all SV1 miners and must stay open when any one of
                 // them disconnects.
                 if !self.mode.is_aggregated() {
-                    let message = Mining::CloseChannel(m);
-                    let sv2_frame: Sv2Frame = AnyMessage::Mining(message)
+                    let message = MiningOwned::CloseChannel(m);
+                    let sv2_frame: Sv2Frame = AnyMessageOwned::Mining(message)
                         .try_into()
                         .map_err(TproxyError::shutdown)?;
 
@@ -874,8 +887,7 @@ impl ChannelManager {
         // server.
         let target = self
             .extended_channels
-            .get(&AGGREGATED_CHANNEL_ID)
-            .map(|ch| *ch.get_target())
+            .with(&AGGREGATED_CHANNEL_ID, |ch| *ch.get_target())
             .unwrap();
         // The aggregated allocator was built with the upstream prefix padded
         // so that `rollable_extranonce_size == config.downstream_extranonce2_size`.
@@ -884,24 +896,49 @@ impl ChannelManager {
         // the downstream sees as its SV1 extranonce1.
         let allocation = self
             .aggregated_extranonce_allocator
-            .super_safe_lock(|allocator| {
-                allocator.as_mut().and_then(|a| {
+            .with(|allocator| {
+                allocator.as_mut().map(|a| {
                     let rollable = a.rollable_extranonce_size() as usize;
-                    a.allocate_extended(min_extranonce_size)
-                        .ok()
-                        .map(|prefix| (prefix, rollable))
+                    (a.allocate_extended(min_extranonce_size), rollable)
                 })
-            });
-        if let Some((new_extranonce_prefix, rollable_extranonce_size)) = allocation {
+            })
+            .map_err(TproxyError::shutdown)?;
+        let Some((allocation, rollable_extranonce_size)) = allocation else {
+            error!("Aggregated channel is connected without an extranonce allocator");
+            return Err(TproxyError::shutdown(
+                TproxyErrorKind::OpenMiningChannelError,
+            ));
+        };
+        if let Ok(new_extranonce_prefix) = allocation {
             if rollable_extranonce_size == min_extranonce_size {
-                // Find max channel ID, excluding AGGREGATED_CHANNEL_ID
-                // (u32::MAX) which would cause overflow when adding 1
-                let channel_id = self
-                    .extended_channels
-                    .iter()
-                    .filter(|x| *x.key() != AGGREGATED_CHANNEL_ID)
-                    .fold(0, |acc, x| std::cmp::max(acc, *x.key()));
-                let next_channel_id = channel_id + 1;
+                // Prefer monotonically increasing downstream IDs while space remains. Once the
+                // highest usable ID is reached, scan from 1 for a gap left by a disconnected
+                // downstream. AGGREGATED_CHANNEL_ID is reserved for aggregate upstream messages
+                // and must never be assigned to an individual downstream.
+                let mut channel_id = 0;
+                self.extended_channels.for_each(|extended_channel_id, _| {
+                    if extended_channel_id != AGGREGATED_CHANNEL_ID {
+                        channel_id = channel_id.max(extended_channel_id);
+                    }
+                });
+                let next_channel_id = channel_id
+                    .checked_add(1)
+                    .filter(|channel_id| *channel_id != AGGREGATED_CHANNEL_ID)
+                    .or_else(|| {
+                        (1..AGGREGATED_CHANNEL_ID)
+                            .find(|channel_id| !self.extended_channels.contains_key(channel_id))
+                    });
+                let Some(next_channel_id) = next_channel_id else {
+                    // The prefix holds its allocator slot until dropped. Release it before the
+                    // asynchronous rejection path so a failed request does not consume capacity.
+                    drop(new_extranonce_prefix);
+                    return self
+                        .reject_downstream_channel_request(
+                            request_id,
+                            ERROR_CODE_OPEN_MINING_CHANNEL_CHANNEL_CAPACITY_EXHAUSTED,
+                        )
+                        .await;
+                };
                 let success_extranonce_prefix: Vec<u8> = new_extranonce_prefix.as_bytes().to_vec();
                 let new_downstream_extended_channel = ExtendedChannel::new(
                     next_channel_id,
@@ -914,8 +951,8 @@ impl ChannelManager {
                 );
                 self.extended_channels
                     .insert(next_channel_id, new_downstream_extended_channel);
-                let success_message =
-                    Mining::OpenExtendedMiningChannelSuccess(OpenExtendedMiningChannelSuccess {
+                let success_message = MiningOwned::OpenExtendedMiningChannelSuccess(
+                    OpenExtendedMiningChannelSuccessOwned {
                         request_id,
                         channel_id: next_channel_id,
                         target: target.to_le_bytes().into(),
@@ -926,11 +963,12 @@ impl ChannelManager {
                         group_channel_id: 0, /* use a dummy value, this
                                               * shouldn't
                                               * matter for the Sv1 server */
-                    });
+                    },
+                );
 
                 self.channel_manager_io
                     .sv1_server_sender
-                    .send((success_message, None))
+                    .send(success_message)
                     .await
                     .map_err(|e| {
                         error!("Failed to send open channel message to SV1Server: {:?}", e);
@@ -941,44 +979,47 @@ impl ChannelManager {
                 let active_job_for_sv1_server = || {
                     // Extract data from aggregated channel in a scope block
                     // to release the borrow before accessing other channels
-                    let (last_active_job, future_jobs, last_chain_tip) = {
-                        let aggregated_channel =
-                            self.extended_channels.get(&AGGREGATED_CHANNEL_ID)?;
-                        (
-                            aggregated_channel.get_active_job().map(|j| j.0.clone()),
-                            aggregated_channel
-                                .get_future_jobs()
-                                .map(|(_, job)| job)
-                                .map(|j| j.0.clone())
-                                .collect::<Vec<_>>(),
-                            aggregated_channel.get_chain_tip().cloned(),
-                        )
-                    };
+                    let (last_active_job, future_jobs, last_chain_tip) = self
+                        .extended_channels
+                        .with(&AGGREGATED_CHANNEL_ID, |aggregated_channel| {
+                            (
+                                aggregated_channel.get_active_job().map(|j| j.0.clone()),
+                                aggregated_channel
+                                    .get_future_jobs()
+                                    .map(|(_, job)| job)
+                                    .map(|j| j.0.clone())
+                                    .collect::<Vec<_>>(),
+                                aggregated_channel.get_chain_tip().cloned(),
+                            )
+                        })?;
 
                     if let Some(chain_tip) = last_chain_tip {
                         self.extended_channels
-                            .get_mut(&next_channel_id)?
-                            .set_chain_tip(chain_tip);
+                            .with_mut(&next_channel_id, |channel| {
+                                channel.set_chain_tip(chain_tip)
+                            })?;
                     }
 
                     if let Some(mut job) = last_active_job.clone() {
                         job.channel_id = next_channel_id;
                         _ = self
                             .extended_channels
-                            .get_mut(&next_channel_id)?
-                            .on_new_extended_mining_job(job);
+                            .with_mut(&next_channel_id, |channel| {
+                                channel.on_new_extended_mining_job(job)
+                            })?;
                     }
                     // Also add any future jobs so SetNewPrevHash won't fail
                     for mut future_job in future_jobs {
                         future_job.channel_id = next_channel_id;
                         _ = self
                             .extended_channels
-                            .get_mut(&next_channel_id)?
-                            .on_new_extended_mining_job(future_job);
+                            .with_mut(&next_channel_id, |channel| {
+                                channel.on_new_extended_mining_job(future_job)
+                            })?;
                     }
 
                     last_active_job.map(|mut job| {
-                        job.channel_id = AGGREGATED_CHANNEL_ID;
+                        job.channel_id = next_channel_id;
                         job
                     })
                 };
@@ -986,7 +1027,7 @@ impl ChannelManager {
                 if let Some(job) = active_job_for_sv1_server() {
                     self.channel_manager_io
                         .sv1_server_sender
-                        .send((Mining::NewExtendedMiningJob(job), None))
+                        .send(MiningOwned::NewExtendedMiningJob(job))
                         .await
                         .map_err(|e| {
                             error!(
@@ -996,9 +1037,22 @@ impl ChannelManager {
                             TproxyError::shutdown(TproxyErrorKind::ChannelErrorSender)
                         })?;
                 }
+                return Ok(());
             }
         }
-        Ok(())
+        if rollable_extranonce_size != min_extranonce_size {
+            self.reject_downstream_channel_request(
+                request_id,
+                ERROR_CODE_OPEN_MINING_CHANNEL_UNSUPPORTED_MIN_EXTRANONCE_SIZE,
+            )
+            .await
+        } else {
+            self.reject_downstream_channel_request(
+                request_id,
+                ERROR_CODE_OPEN_MINING_CHANNEL_CHANNEL_CAPACITY_EXHAUSTED,
+            )
+            .await
+        }
     }
 
     /// Gets the next sequence number for a valid share and increments the counter.
@@ -1007,11 +1061,11 @@ impl ChannelManager {
     /// - In aggregated mode: use upstream channel ID (single counter for all shares)
     /// - In non-aggregated mode: use downstream channel ID (one counter per channel)
     fn next_share_sequence_number(&self, counter_key: u32) -> u32 {
-        let mut counter = self.share_sequence_counters.entry(counter_key).or_insert(0);
-        let counter = counter.value_mut();
-
-        *counter += 1;
-        *counter
+        self.share_sequence_counters
+            .with_mut_or_default(counter_key, |counter| {
+                *counter += 1;
+                *counter
+            })
     }
 }
 
@@ -1019,8 +1073,14 @@ impl ChannelManager {
 mod tests {
     use super::*;
     use async_channel::unbounded;
-    use stratum_apps::stratum_core::mining_sv2::{
-        OpenExtendedMiningChannel, SubmitSharesExtended, UpdateChannel,
+    use stratum_apps::stratum_core::{
+        binary_sv2::{Seq0255Owned, Sv2OptionOwned},
+        bitcoin::Target,
+        channels_sv2::extranonce_manager::ExtranoncePrefix,
+        mining_sv2::{
+            NewExtendedMiningJobOwned, OpenExtendedMiningChannelOwned, SetNewPrevHashOwned,
+            SubmitSharesExtendedOwned, UpdateChannelOwned,
+        },
     };
 
     fn create_test_channel_manager() -> ChannelManager {
@@ -1042,16 +1102,65 @@ mod tests {
         )
     }
 
+    fn create_connected_aggregated_channel_manager() -> (ChannelManager, Receiver<MiningOwned>) {
+        let (upstream_sender, _upstream_receiver) = unbounded();
+        let (_upstream_sender, upstream_receiver) = unbounded();
+        let (sv1_server_sender, sv1_server_receiver_for_test) = unbounded();
+        let (_sv1_server_sender, sv1_server_receiver) = unbounded();
+
+        let manager = ChannelManager::new(
+            upstream_sender,
+            upstream_receiver,
+            sv1_server_sender,
+            sv1_server_receiver,
+            vec![],
+            vec![],
+            TproxyMode::Aggregated,
+            #[cfg(feature = "monitoring")]
+            true,
+        );
+
+        manager.extended_channels.insert(
+            AGGREGATED_CHANNEL_ID,
+            ExtendedChannel::new(
+                42,
+                "aggregated".to_string(),
+                ExtranoncePrefix::from_wire(vec![0; 4]).unwrap(),
+                Target::from_le_bytes([0xff; 32]),
+                1.0,
+                true,
+                8,
+            ),
+        );
+        manager
+            .aggregated_extranonce_allocator
+            .set(Some(
+                ExtranonceAllocator::from_upstream_prefix(
+                    vec![0; 4],
+                    vec![],
+                    12,
+                    AGGREGATED_TPROXY_MAX_CHANNELS,
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+        manager
+            .aggregated_channel_state
+            .set(AggregatedState::Connected);
+
+        (manager, sv1_server_receiver_for_test)
+    }
+
     #[tokio::test]
     async fn test_handle_downstream_open_channel_message() {
         let manager = create_test_channel_manager();
 
         // Create an OpenExtendedMiningChannel message
-        let open_channel = OpenExtendedMiningChannel {
+        let open_channel = OpenExtendedMiningChannelOwned {
             request_id: 1,
-            user_identity: "test_user".as_bytes().to_vec().try_into().unwrap(),
+            user_identity: "test_user".try_into().unwrap(),
             nominal_hash_rate: 1000.0,
-            max_target: vec![0xFFu8; 32].try_into().unwrap(),
+            max_target: [0xFFu8; 32].into(),
             min_extranonce_size: 4,
         };
 
@@ -1063,11 +1172,11 @@ mod tests {
         // Test that the message can be handled without panicking
         // In a real test environment, we would need to mock the upstream sender
         // For now, we just verify the channel manager can process the message type
-        let mining_message = Mining::OpenExtendedMiningChannel(open_channel);
+        let mining_message = MiningOwned::OpenExtendedMiningChannel(open_channel);
 
         // Verify the message can be processed (would normally be sent to upstream)
         match mining_message {
-            Mining::OpenExtendedMiningChannel(msg) => {
+            MiningOwned::OpenExtendedMiningChannel(msg) => {
                 assert_eq!(msg.request_id, 1);
                 assert_eq!(msg.nominal_hash_rate, 1000.0);
                 assert_eq!(msg.min_extranonce_size, 4);
@@ -1081,7 +1190,7 @@ mod tests {
         let _manager = create_test_channel_manager();
 
         // Create a SubmitSharesExtended message
-        let submit_shares = SubmitSharesExtended {
+        let submit_shares = SubmitSharesExtendedOwned {
             channel_id: 1,
             sequence_number: 100,
             job_id: 42,
@@ -1092,11 +1201,11 @@ mod tests {
         };
 
         // Test that the message can be handled
-        let mining_message = Mining::SubmitSharesExtended(submit_shares);
+        let mining_message = MiningOwned::SubmitSharesExtended(submit_shares);
 
         // Verify the message structure
         match mining_message {
-            Mining::SubmitSharesExtended(msg) => {
+            MiningOwned::SubmitSharesExtended(msg) => {
                 assert_eq!(msg.channel_id, 1);
                 assert_eq!(msg.sequence_number, 100);
                 assert_eq!(msg.job_id, 42);
@@ -1111,18 +1220,18 @@ mod tests {
         let _manager = create_test_channel_manager();
 
         // Create an UpdateChannel message
-        let update_channel = UpdateChannel {
+        let update_channel = UpdateChannelOwned {
             channel_id: 1,
             nominal_hash_rate: 2000.0,
-            maximum_target: [0xFFu8; 32].try_into().unwrap(),
+            maximum_target: [0xFFu8; 32].into(),
         };
 
         // Test that the message can be handled
-        let mining_message = Mining::UpdateChannel(update_channel);
+        let mining_message = MiningOwned::UpdateChannel(update_channel);
 
         // Verify the message structure
         match mining_message {
-            Mining::UpdateChannel(msg) => {
+            MiningOwned::UpdateChannel(msg) => {
                 assert_eq!(msg.channel_id, 1);
                 assert_eq!(msg.nominal_hash_rate, 2000.0);
             }
@@ -1149,14 +1258,14 @@ mod tests {
             true,
         ));
 
-        let update_channel = UpdateChannel {
+        let update_channel = UpdateChannelOwned {
             channel_id: 0,
             nominal_hash_rate: 0.0,
-            maximum_target: [0xFFu8; 32].try_into().unwrap(),
+            maximum_target: [0xFFu8; 32].into(),
         };
 
         sv1_server_sender_for_test
-            .send((Mining::UpdateChannel(update_channel), None))
+            .send((MiningOwned::UpdateChannel(update_channel), None))
             .await
             .unwrap();
 
@@ -1171,7 +1280,7 @@ mod tests {
         let manager = create_test_channel_manager();
 
         // Test that Debug trait is implemented
-        let debug_str = format!("{:?}", manager);
+        let debug_str = format!("{manager:?}");
         assert!(debug_str.contains("ChannelManager"));
     }
 
@@ -1185,5 +1294,140 @@ mod tests {
         let has_pending = manager.pending_downstream_channels.contains_key(&1);
 
         assert!(has_pending);
+    }
+
+    #[tokio::test]
+    async fn aggregated_channel_capacity_exhaustion_rejects_request() {
+        let (manager, sv1_server_receiver) = create_connected_aggregated_channel_manager();
+        let mut allocator =
+            ExtranonceAllocator::from_upstream_prefix(vec![0; 4], vec![0; 1], 12, 1).unwrap();
+        let occupied_prefix = allocator.allocate_extended(6).unwrap();
+        manager
+            .aggregated_extranonce_allocator
+            .set(Some(allocator))
+            .unwrap();
+
+        manager
+            .handle_downstream_channel_request_in_aggregated_mode(
+                7,
+                "rejected-miner".to_string(),
+                1.0,
+                6,
+            )
+            .await
+            .unwrap();
+
+        let error = match sv1_server_receiver.try_recv().unwrap() {
+            MiningOwned::OpenMiningChannelError(error) => error,
+            other => panic!("expected open error, got {other:?}"),
+        };
+        assert_eq!(error.request_id, 7);
+        assert_eq!(
+            error.error_code.as_utf8_or_hex(),
+            ERROR_CODE_OPEN_MINING_CHANNEL_CHANNEL_CAPACITY_EXHAUSTED
+        );
+        assert!(sv1_server_receiver.try_recv().is_err());
+
+        drop(occupied_prefix);
+    }
+
+    #[tokio::test]
+    async fn aggregated_channel_id_allocation_does_not_use_reserved_id() {
+        let (manager, sv1_server_receiver) = create_connected_aggregated_channel_manager();
+        manager.extended_channels.insert(
+            AGGREGATED_CHANNEL_ID - 1,
+            ExtendedChannel::new(
+                AGGREGATED_CHANNEL_ID - 1,
+                "last-channel".to_string(),
+                ExtranoncePrefix::from_wire(vec![0xaa; 6]).unwrap(),
+                Target::from_le_bytes([0xff; 32]),
+                1.0,
+                true,
+                6,
+            ),
+        );
+
+        manager
+            .handle_downstream_channel_request_in_aggregated_mode(
+                7,
+                "new-miner".to_string(),
+                1.0,
+                6,
+            )
+            .await
+            .unwrap();
+
+        let success = match sv1_server_receiver.try_recv().unwrap() {
+            MiningOwned::OpenExtendedMiningChannelSuccess(success) => success,
+            other => panic!("expected open success, got {other:?}"),
+        };
+        assert_ne!(success.channel_id, AGGREGATED_CHANNEL_ID);
+        assert_eq!(success.channel_id, 1);
+        assert_eq!(
+            manager
+                .extended_channels
+                .with(&AGGREGATED_CHANNEL_ID, |channel| channel.get_channel_id()),
+            Some(42)
+        );
+    }
+
+    #[tokio::test]
+    async fn late_aggregated_join_targets_initial_job_to_new_channel_only() {
+        let (manager, sv1_server_receiver) = create_connected_aggregated_channel_manager();
+
+        manager
+            .extended_channels
+            .with_mut(&AGGREGATED_CHANNEL_ID, |aggregated_channel| {
+                aggregated_channel
+                    .on_new_extended_mining_job(NewExtendedMiningJobOwned {
+                        channel_id: 42,
+                        job_id: 1,
+                        min_ntime: Sv2OptionOwned::new(None),
+                        version: 0x20000000,
+                        version_rolling_allowed: true,
+                        merkle_path: Seq0255Owned::new(vec![]).unwrap(),
+                        coinbase_tx_prefix: hex::decode("02000000010000000000000000000000000000000000000000000000000000000000000000ffffffff265200162f5374726174756d2056322053524920506f6f6c2f2f08")
+                            .unwrap()
+                            .try_into()
+                            .unwrap(),
+                        coinbase_tx_suffix: hex::decode("feffffff0200f2052a01000000160014ebe1b7dcc293ccaa0ee743a86f89df8258c208fc0000000000000000266a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf901000000")
+                            .unwrap()
+                            .try_into()
+                            .unwrap(),
+                    })
+                    .unwrap();
+                aggregated_channel
+                    .on_set_new_prev_hash(SetNewPrevHashOwned {
+                        channel_id: 42,
+                        job_id: 1,
+                        prev_hash: vec![0; 32].try_into().unwrap(),
+                        min_ntime: 0,
+                        nbits: 0x207fffff,
+                    })
+                    .unwrap();
+            })
+            .unwrap();
+
+        manager
+            .handle_downstream_channel_request_in_aggregated_mode(
+                7,
+                "new-miner".to_string(),
+                1.0,
+                6,
+            )
+            .await
+            .unwrap();
+
+        let success = match sv1_server_receiver.try_recv().unwrap() {
+            MiningOwned::OpenExtendedMiningChannelSuccess(success) => success,
+            other => panic!("expected open success, got {other:?}"),
+        };
+        let job = match sv1_server_receiver.try_recv().unwrap() {
+            MiningOwned::NewExtendedMiningJob(job) => job,
+            other => panic!("expected initial job, got {other:?}"),
+        };
+
+        assert_eq!(job.channel_id, success.channel_id);
+        assert_ne!(job.channel_id, AGGREGATED_CHANNEL_ID);
     }
 }

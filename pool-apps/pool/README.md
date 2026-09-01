@@ -59,9 +59,11 @@ The configuration file contains the following information:
      - `address` - The Template Provider's network address
      - `public_key` - (Optional) The TP's authority public key for connection verification
    - `[template_provider_type.BitcoinCoreIpc]` - Connects directly to Bitcoin Core via IPC, with the following parameters:
+     - `version` - Required Bitcoin Core IPC schema major version (`30` or `31`, any other value fails startup)
      - `network` - Bitcoin network (mainnet, testnet4, signet, regtest) for determining socket path
      - `data_dir` - (Optional) Custom Bitcoin data directory. Uses OS default if not set
      - `fee_threshold` - Minimum fee threshold to trigger new templates
+     - `min_interval` - Minimum interval between template updates in seconds
 
 For connections with a Sv2 Template Provider, you may want to verify that your TP connection is authentic. You can get the `public_key` from the logs of your TP, for example:
 
@@ -70,6 +72,35 @@ For connections with a Sv2 Template Provider, you may want to verify that your T
 ```
 
 Make sure the machine running the Pool application has its clock synced with an NTP server. Certificate validation is time-sensitive, and even a small drift of a few seconds can trigger an `InvalidCertificate` error.
+
+### Environment Variables
+
+Every configuration value can also be supplied through the environment. Variables are prefixed
+with `POOL` and joined with a **double underscore** (`__`) between nested keys — a single
+underscore is just part of a field name (`POOL__LISTEN_ADDRESS` sets `listen_address`).
+
+Environment variables take precedence over the TOML file, and the file itself is optional: the
+pool can be configured entirely from the environment. If a mandatory parameter is supplied by
+neither source, the pool exits with an error.
+
+```bash
+POOL__LISTEN_ADDRESS=0.0.0.0:3333
+# Nested fields join each level with `__`:
+POOL__JDS__LISTEN_ADDRESS=0.0.0.0:3334
+# Tagged enums (template_provider_type) take the variant as a path segment,
+# matched case-insensitively. If the file selects a different variant, the
+# environment's variant replaces it; set only one variant in the environment:
+POOL__TEMPLATE_PROVIDER_TYPE__BITCOINCOREIPC__VERSION=31
+POOL__TEMPLATE_PROVIDER_TYPE__BITCOINCOREIPC__NETWORK=mainnet
+# List fields (supported_extensions, required_extensions) are comma-separated.
+# A lone value is read as a 1-element list:
+POOL__SUPPORTED_EXTENSIONS=2,3
+# The embedded JDS has its own extension lists under the `jds` section:
+POOL__JDS__SUPPORTED_EXTENSIONS=2,3
+POOL__JDS__REQUIRED_EXTENSIONS=2
+```
+
+See `docker/docker_env.example` for a complete working set of variables.
 
 ### Run
 

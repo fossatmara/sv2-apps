@@ -4,6 +4,7 @@ use std::{
     marker::PhantomData,
     sync::{MutexGuard, PoisonError},
 };
+use stratum_apps::stratum_core::parsers_sv2::MiningOwned;
 
 use stratum_apps::{
     stratum_core::{
@@ -19,7 +20,7 @@ use stratum_apps::{
         codec_sv2, framing_sv2,
         handlers_sv2::HandlerErrorType,
         noise_sv2,
-        parsers_sv2::{Mining, ParserError},
+        parsers_sv2::ParserError,
     },
     utils::types::{
         CanDisconnect, CanShutdown, ChannelId, DownstreamId, ExtensionType, MessageType,
@@ -143,7 +144,7 @@ pub enum PoolErrorKind {
     /// Custom error message.
     Custom(String),
     /// Error related to the SV2 protocol, including an error code and a `Mining` message.
-    Sv2ProtocolError((u32, Mining<'static>)),
+    Sv2ProtocolError((u32, MiningOwned)),
     /// Vardiff Error
     Vardiff(VardiffError),
     /// Parser Error
@@ -204,6 +205,8 @@ pub enum PoolErrorKind {
     Jds(jd_server_sv2::error::JDSErrorKind),
     /// Timeout error
     Timeout,
+    /// Error deserializing the configuration.
+    BadConfigDeserialize(stratum_apps::config_helpers::ConfigError),
 }
 
 impl std::fmt::Display for PoolErrorKind {
@@ -228,7 +231,10 @@ impl std::fmt::Display for PoolErrorKind {
                 write!(f, "Received Vardiff Error : {e:?}")
             }
             Parser(e) => write!(f, "Parser error: `{e:?}`"),
-            UnexpectedMessage(extension_type, message_type) => write!(f, "Unexpected message: extension type: {extension_type:?}, message type: {message_type:?}"),
+            UnexpectedMessage(extension_type, message_type) => write!(
+                f,
+                "Unexpected message: extension type: {extension_type:?}, message type: {message_type:?}"
+            ),
             ChannelErrorSender => write!(f, "Channel sender error"),
             InvalidSocketAddress(address) => write!(f, "Invalid socket address: {address:?}"),
             BitcoinEncodeError(_) => write!(f, "Error generated during encoding"),
@@ -251,22 +257,13 @@ impl std::fmt::Display for PoolErrorKind {
                 write!(f, "Channel error: {channel_error:?}")
             }
             InvalidUnsupportedExtensionsSequence(e) => {
-                write!(
-                    f,
-                    "Invalid unsupported extensions sequence: {e:?}"
-                )
+                write!(f, "Invalid unsupported extensions sequence: {e:?}")
             }
             InvalidRequiredExtensionsSequence(e) => {
-                write!(
-                    f,
-                    "Invalid required extensions sequence: {e:?}"
-                )
+                write!(f, "Invalid required extensions sequence: {e:?}")
             }
             InvalidSupportedExtensionsSequence(e) => {
-                write!(
-                    f,
-                    "Invalid supported extensions sequence: {e:?}"
-                )
+                write!(f, "Invalid supported extensions sequence: {e:?}")
             }
             ClientDoesNotSupportRequiredExtensions(extensions) => {
                 write!(
@@ -282,7 +279,7 @@ impl std::fmt::Display for PoolErrorKind {
             }
             BitcoinCoreSv2TDPCancellationTokenActivated => {
                 write!(f, "BitcoinCoreSv2TDP cancellation token activated")
-            },
+            }
             UnsupportedProtocol => write!(f, "Protocol not supported"),
             SetupConnectionError => {
                 write!(f, "Failed to Setup connection")
@@ -297,6 +294,7 @@ impl std::fmt::Display for PoolErrorKind {
             PayoutModeError(e) => write!(f, "Unable to parse the PayoutMode: {e}"),
             Jds(e) => write!(f, "JDS error: {e:?}"),
             Timeout => write!(f, "Time out error"),
+            BadConfigDeserialize(e) => write!(f, "Bad `config` TOML deserialize: `{e:?}`"),
         }
     }
 }
@@ -304,6 +302,12 @@ impl std::fmt::Display for PoolErrorKind {
 impl From<std::io::Error> for PoolErrorKind {
     fn from(e: std::io::Error) -> PoolErrorKind {
         PoolErrorKind::Io(e)
+    }
+}
+
+impl From<stratum_apps::config_helpers::ConfigError> for PoolErrorKind {
+    fn from(e: stratum_apps::config_helpers::ConfigError) -> PoolErrorKind {
+        PoolErrorKind::BadConfigDeserialize(e)
     }
 }
 
@@ -367,8 +371,8 @@ impl<T> From<PoisonError<MutexGuard<'_, T>>> for PoolErrorKind {
     }
 }
 
-impl From<(u32, Mining<'static>)> for PoolErrorKind {
-    fn from(e: (u32, Mining<'static>)) -> Self {
+impl From<(u32, MiningOwned)> for PoolErrorKind {
+    fn from(e: (u32, MiningOwned)) -> Self {
         PoolErrorKind::Sv2ProtocolError(e)
     }
 }

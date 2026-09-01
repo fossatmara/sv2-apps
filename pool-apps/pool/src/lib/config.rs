@@ -5,7 +5,7 @@
 //!
 //! This module handles:
 //! - Initializing [`PoolConfig`]
-//! - Managing [`TemplateProviderConfig`], [`AuthorityConfig`], [`CoinbaseOutput`], and
+//! - Managing [`TemplateProviderType`], [`AuthorityConfig`], [`CoinbaseRewardScript`], and
 //!   [`ConnectionConfig`]
 //! - Validating and converting coinbase outputs
 use std::{
@@ -15,7 +15,7 @@ use std::{
 
 pub use jd_server_sv2::config::{JDSConfig, JDSPartialConfig};
 use stratum_apps::{
-    config_helpers::{opt_path_from_toml, CoinbaseRewardScript},
+    config_helpers::{CoinbaseRewardScript, opt_path_from_toml},
     key_utils::{Secp256k1PublicKey, Secp256k1SecretKey},
     stratum_core::bitcoin::{Amount, TxOut},
     tp_type::TemplateProviderType,
@@ -172,7 +172,7 @@ impl PoolConfig {
     pub fn get_txout(&self) -> TxOut {
         TxOut {
             value: Amount::from_sat(0),
-            script_pubkey: self.coinbase_reward_script.script_pubkey().to_owned(),
+            script_pubkey: self.coinbase_reward_script.script_pubkey(),
         }
     }
 

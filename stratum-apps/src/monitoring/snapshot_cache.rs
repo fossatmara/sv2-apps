@@ -45,8 +45,9 @@ use std::{
 use stratum_core::mining_sv2::{
     ERROR_CODE_SUBMIT_SHARES_BAD_EXTRANONCE_SIZE, ERROR_CODE_SUBMIT_SHARES_DIFFICULTY_TOO_LOW,
     ERROR_CODE_SUBMIT_SHARES_DUPLICATE_SHARE, ERROR_CODE_SUBMIT_SHARES_INVALID_CHANNEL_ID,
-    ERROR_CODE_SUBMIT_SHARES_INVALID_JOB_ID, ERROR_CODE_SUBMIT_SHARES_INVALID_SHARE,
-    ERROR_CODE_SUBMIT_SHARES_STALE_SHARE,
+    ERROR_CODE_SUBMIT_SHARES_INVALID_JOB_ID,
+    ERROR_CODE_SUBMIT_SHARES_INVALID_NON_ROLLABLE_VERSION_BIT,
+    ERROR_CODE_SUBMIT_SHARES_INVALID_SHARE, ERROR_CODE_SUBMIT_SHARES_STALE_SHARE,
 };
 use tracing::debug;
 
@@ -71,6 +72,7 @@ const SHARE_REJECTION_CODES: &[&str] = &[
     ERROR_CODE_SUBMIT_SHARES_DIFFICULTY_TOO_LOW,
     ERROR_CODE_SUBMIT_SHARES_DUPLICATE_SHARE,
     ERROR_CODE_SUBMIT_SHARES_BAD_EXTRANONCE_SIZE,
+    ERROR_CODE_SUBMIT_SHARES_INVALID_NON_ROLLABLE_VERSION_BIT,
 ];
 
 /// Tracks which label combinations were set on the previous refresh so we can
@@ -300,7 +302,7 @@ impl SnapshotCache {
                         ]);
                     }
                 }
-                if let (Some(ref m), Some(hashrate)) = (
+                if let (Some(m), Some(hashrate)) = (
                     &metrics.sv2_server_channel_hashrate,
                     channel.nominal_hashrate,
                 ) {
@@ -340,7 +342,7 @@ impl SnapshotCache {
                         ]);
                     }
                 }
-                if let (Some(ref m), Some(hashrate)) = (
+                if let (Some(m), Some(hashrate)) = (
                     &metrics.sv2_server_channel_hashrate,
                     channel.nominal_hashrate,
                 ) {

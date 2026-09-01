@@ -5,7 +5,43 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+#[cfg(feature = "asic-rs-telemetry")]
+use std::net::IpAddr;
 use utoipa::ToSchema;
+
+#[cfg(feature = "asic-rs-telemetry")]
+use super::miner_telemetry::{MinerTelemetry, MinerTelemetryStatus};
+
+/// Kind of SV2 downstream client connected to this node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Sv2ClientKind {
+    /// A mining device connected directly as an SV2 downstream client.
+    Miner,
+    /// A Translator Proxy connected as the SV2 client for one or more SV1 miners.
+    TranslatorProxy,
+    /// The downstream client type could not be inferred from SetupConnection metadata.
+    Unknown,
+}
+
+impl Default for Sv2ClientKind {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+impl Sv2ClientKind {
+    /// Infer the downstream client kind from SetupConnection vendor and hardware version fields.
+    pub fn from_setup_connection(vendor: &str, hardware_version: &str) -> Self {
+        if vendor == "SRI" && hardware_version == "Translator Proxy" {
+            Self::TranslatorProxy
+        } else if vendor.is_empty() && hardware_version.is_empty() {
+            Self::Unknown
+        } else {
+            Self::Miner
+        }
+    }
+}
 
 /// Information about an extended channel
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -59,11 +95,42 @@ pub struct StandardChannelInfo {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Sv2ClientInfo {
     pub client_id: usize,
+    /// Classification inferred from the client's SV2 SetupConnection metadata.
+    pub client_kind: Sv2ClientKind,
     pub extended_channels: Vec<ExtendedChannelInfo>,
     pub standard_channels: Vec<StandardChannelInfo>,
+    #[cfg(feature = "asic-rs-telemetry")]
+    /// Miner management IP used for matched telemetry, if discovery found one.
+    #[schema(value_type = Option<String>)]
+    pub management_ip: Option<IpAddr>,
+    #[cfg(feature = "asic-rs-telemetry")]
+    /// Latest telemetry fetched from the matched miner management interface.
+    pub miner_telemetry: Option<MinerTelemetry>,
+    #[cfg(feature = "asic-rs-telemetry")]
+    /// Current discovery and fetch status for miner telemetry matching.
+    pub miner_telemetry_status: Option<MinerTelemetryStatus>,
 }
 
 impl Sv2ClientInfo {
+    pub fn new(
+        client_id: usize,
+        extended_channels: Vec<ExtendedChannelInfo>,
+        standard_channels: Vec<StandardChannelInfo>,
+    ) -> Self {
+        Self {
+            client_id,
+            client_kind: Sv2ClientKind::Unknown,
+            extended_channels,
+            standard_channels,
+            #[cfg(feature = "asic-rs-telemetry")]
+            management_ip: None,
+            #[cfg(feature = "asic-rs-telemetry")]
+            miner_telemetry: None,
+            #[cfg(feature = "asic-rs-telemetry")]
+            miner_telemetry_status: None,
+        }
+    }
+
     /// Get total number of channels for this client
     pub fn total_channels(&self) -> usize {
         self.extended_channels.len() + self.standard_channels.len()
@@ -86,9 +153,16 @@ impl Sv2ClientInfo {
     pub fn to_metadata(&self) -> Sv2ClientMetadata {
         Sv2ClientMetadata {
             client_id: self.client_id,
+            client_kind: self.client_kind,
             extended_channels_count: self.extended_channels.len(),
             standard_channels_count: self.standard_channels.len(),
             total_hashrate: self.total_hashrate(),
+            #[cfg(feature = "asic-rs-telemetry")]
+            management_ip: self.management_ip,
+            #[cfg(feature = "asic-rs-telemetry")]
+            miner_telemetry: self.miner_telemetry.clone(),
+            #[cfg(feature = "asic-rs-telemetry")]
+            miner_telemetry_status: self.miner_telemetry_status,
         }
     }
 }
@@ -97,9 +171,21 @@ impl Sv2ClientInfo {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Sv2ClientMetadata {
     pub client_id: usize,
+    /// Classification inferred from the client's SV2 SetupConnection metadata.
+    pub client_kind: Sv2ClientKind,
     pub extended_channels_count: usize,
     pub standard_channels_count: usize,
     pub total_hashrate: f32,
+    #[cfg(feature = "asic-rs-telemetry")]
+    /// Miner management IP used for matched telemetry, if discovery found one.
+    #[schema(value_type = Option<String>)]
+    pub management_ip: Option<IpAddr>,
+    #[cfg(feature = "asic-rs-telemetry")]
+    /// Latest telemetry fetched from the matched miner management interface.
+    pub miner_telemetry: Option<MinerTelemetry>,
+    #[cfg(feature = "asic-rs-telemetry")]
+    /// Current discovery and fetch status for miner telemetry matching.
+    pub miner_telemetry_status: Option<MinerTelemetryStatus>,
 }
 
 /// Aggregate information about all Sv2 clients
@@ -208,8 +294,15 @@ mod tests {
     ) -> Sv2ClientInfo {
         Sv2ClientInfo {
             client_id: id,
+            client_kind: Sv2ClientKind::Miner,
             extended_channels: ext,
             standard_channels: std,
+            #[cfg(feature = "asic-rs-telemetry")]
+            management_ip: None,
+            #[cfg(feature = "asic-rs-telemetry")]
+            miner_telemetry: None,
+            #[cfg(feature = "asic-rs-telemetry")]
+            miner_telemetry_status: None,
         }
     }
 
@@ -252,6 +345,25 @@ mod tests {
         assert_eq!(meta.extended_channels_count, 1);
         assert_eq!(meta.standard_channels_count, 2);
         assert_eq!(meta.total_hashrate, 225.0);
+        assert_eq!(meta.client_kind, Sv2ClientKind::Miner);
+        #[cfg(feature = "asic-rs-telemetry")]
+        assert!(meta.miner_telemetry.is_none());
+    }
+
+    #[test]
+    fn client_kind_from_setup_connection_classifies_known_clients() {
+        assert_eq!(
+            Sv2ClientKind::from_setup_connection("SRI", "Translator Proxy"),
+            Sv2ClientKind::TranslatorProxy
+        );
+        assert_eq!(
+            Sv2ClientKind::from_setup_connection("Bitaxe", "Gamma"),
+            Sv2ClientKind::Miner
+        );
+        assert_eq!(
+            Sv2ClientKind::from_setup_connection("", ""),
+            Sv2ClientKind::Unknown
+        );
     }
 
     // ── ClientsMonitoring trait default implementations ─────────────

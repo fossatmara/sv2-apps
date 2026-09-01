@@ -13,17 +13,23 @@
 //!
 //! `BitcoinCoreSv2TDP` will not start distributing new templates until it receives the first
 //! `CoinbaseOutputConstraints` message.
+//!
+//! This example is pinned to Bitcoin Core v31.x, although it can be adapted to work with other
+//! versions.
 
-use bitcoin_core_sv2::template_distribution_protocol::BitcoinCoreSv2TDP;
+use bitcoin_core_sv2::runtime_api::{
+    BitcoinCoreVersion,
+    template_distribution_protocol::{self, BitcoinCoreSv2TDP},
+};
 use std::path::Path;
 
 use async_channel::unbounded;
 use stratum_core::{
-    parsers_sv2::TemplateDistribution,
-    template_distribution_sv2::{CoinbaseOutputConstraints, RequestTransactionData},
+    parsers_sv2::TemplateDistributionOwned,
+    template_distribution_sv2::{CoinbaseOutputConstraintsOwned, RequestTransactionDataOwned},
 };
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{error, info};
 
 #[tokio::main]
 async fn main() {
@@ -68,7 +74,7 @@ async fn main() {
         let rt = match tokio::runtime::Runtime::new() {
             Ok(rt) => rt,
             Err(e) => {
-                tracing::error!("Failed to create Tokio runtime: {:?}", e);
+                error!("Failed to create Tokio runtime: {:?}", e);
                 cancellation_token_clone.cancel();
                 return;
             }
@@ -77,7 +83,9 @@ async fn main() {
 
         tokio_local_set.block_on(&rt, async move {
             // create a new `BitcoinCoreSv2TDP` instance
-            let mut sv2_bitcoin_core = match BitcoinCoreSv2TDP::new(
+            let mut sv2_bitcoin_core: BitcoinCoreSv2TDP = match template_distribution_protocol::new(
+                // Change this line to select a different supported Bitcoin Core major version.
+                BitcoinCoreVersion::V31X,
                 &bitcoin_core_unix_socket_path_clone,
                 fee_threshold,
                 min_interval,
@@ -89,7 +97,7 @@ async fn main() {
             {
                 Ok(sv2_bitcoin_core) => sv2_bitcoin_core,
                 Err(e) => {
-                    tracing::error!("Failed to create BitcoinCoreToSv2: {:?}", e);
+                    error!("Failed to create BitcoinCoreToSv2: {:?}", e);
                     cancellation_token_clone.cancel();
                     return;
                 }
@@ -129,16 +137,16 @@ async fn main() {
                     info!("Message received: {}", template_distribution_message);
 
                     // send a RequestTransactionData every time a NewTemplate message is received
-                    if let TemplateDistribution::NewTemplate(new_template) = template_distribution_message {
+                    if let TemplateDistributionOwned::NewTemplate(new_template) = template_distribution_message {
                         let template_id = new_template.template_id;
-                        let request_transaction_data = TemplateDistribution::RequestTransactionData(RequestTransactionData {
+                        let request_transaction_data = TemplateDistributionOwned::RequestTransactionData(RequestTransactionDataOwned {
                             template_id,
                         });
 
                         match msg_sender_into_bitcoin_core_sv2_clone.send(request_transaction_data).await {
                             Ok(_) => (),
                             Err(e) => {
-                                tracing::error!("Failed to send request transaction data: {}", e);
+                                error!("Failed to send request transaction data: {}", e);
                                 cancellation_token_clone.cancel();
                                 return;
                             }
@@ -154,7 +162,7 @@ async fn main() {
     // `BitcoinCoreSv2TDP` will not start distributing new templates until it receives the first
     // `CoinbaseOutputConstraints` message.
     let new_coinbase_output_constraints =
-        TemplateDistribution::CoinbaseOutputConstraints(CoinbaseOutputConstraints {
+        TemplateDistributionOwned::CoinbaseOutputConstraints(CoinbaseOutputConstraintsOwned {
             coinbase_output_max_additional_size: 2,
             coinbase_output_max_additional_sigops: 2,
         });
@@ -163,7 +171,7 @@ async fn main() {
         .send(new_coinbase_output_constraints)
         .await
     {
-        tracing::error!("Failed to send coinbase output constraints: {}", e);
+        error!("Failed to send coinbase output constraints: {}", e);
         cancellation_token.cancel();
     }
     info!("Sent CoinbaseOutputConstraints");

@@ -1,6 +1,6 @@
 mod args;
 use stratum_apps::config_helpers::logging::init_logging;
-pub use translator_sv2::{config, error, sv1, sv2, TranslatorSv2};
+pub use translator_sv2::{TranslatorSv2, config, error, sv1, sv2};
 
 use crate::args::process_cli_args;
 
@@ -29,5 +29,18 @@ async fn inner_main() {
 
     init_logging(proxy_config.log_dir());
 
-    TranslatorSv2::new(proxy_config).start().await;
+    let translator = TranslatorSv2::new(proxy_config);
+    tokio::spawn({
+        let translator = translator.clone();
+        async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                tracing::info!("Ctrl+C received — initiating graceful shutdown...");
+                translator.shutdown().await;
+            }
+        }
+    });
+
+    if translator.start().await.is_err() {
+        std::process::exit(1);
+    };
 }

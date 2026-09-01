@@ -1,19 +1,23 @@
 use std::{net::SocketAddr, sync::Arc};
+use stratum_apps::stratum_core::parsers_sv2::{AnyMessageOwned, JobDeclarationOwned};
 
-use async_channel::{unbounded, Receiver, Sender};
-use bitcoin_core_sv2::template_distribution_protocol::CancellationToken;
+use async_channel::{Receiver, Sender, unbounded};
 use stratum_apps::{
+    bitcoin_core_sv2::CancellationToken,
     channel_utils::ReceiverCleanup,
     fallback_coordinator::FallbackCoordinator,
-    network_helpers::{connect_with_noise, resolve_host, TCP_CONNECT_TIMEOUT},
+    network_helpers::{TCP_CONNECT_TIMEOUT, connect_with_noise, resolve_host},
     stratum_core::{
+        common_messages_sv2::{
+            MESSAGE_TYPE_SETUP_CONNECTION_ERROR, MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS,
+        },
         framing_sv2,
-        handlers_sv2::HandleCommonMessagesFromServerAsync,
-        parsers_sv2::{AnyMessage, JobDeclaration},
+        handlers_sv2::HandleCommonMessagesFromServerOwnedAsync,
+        parsers_sv2::JobDeclaration,
     },
     task_manager::TaskManager,
     utils::{
-        protocol_message_type::{protocol_message_type, MessageType},
+        protocol_message_type::{MessageType, protocol_message_type},
         types::{Message, Sv2Frame},
     },
 };
@@ -24,7 +28,7 @@ use crate::{
     error::{self, Action, JDCError, JDCErrorKind, JDCResult, LoopControl},
     io_task::spawn_io_tasks,
     jd_mode::JDMode,
-    utils::{get_setup_connection_message_jds, UpstreamEntry},
+    utils::{UpstreamEntry, get_setup_connection_message_jds},
 };
 
 mod message_handler;
@@ -32,8 +36,8 @@ mod message_handler;
 /// Holds all channels required for Job Declarator communication.
 #[derive(Clone)]
 pub struct JobDeclaratorIo {
-    channel_manager_sender: Sender<JobDeclaration<'static>>,
-    channel_manager_receiver: Receiver<JobDeclaration<'static>>,
+    channel_manager_sender: Sender<JobDeclarationOwned>,
+    channel_manager_receiver: Receiver<JobDeclarationOwned>,
     jds_sender: Sender<Sv2Frame>,
     jds_receiver: Receiver<Sv2Frame>,
 }
@@ -126,8 +130,8 @@ impl JobDeclarator {
     /// - Spawns background IO tasks for reading/writing frames.
     pub async fn new(
         upstream_entry: &UpstreamEntry,
-        channel_manager_sender: Sender<JobDeclaration<'static>>,
-        channel_manager_receiver: Receiver<JobDeclaration<'static>>,
+        channel_manager_sender: Sender<JobDeclarationOwned>,
+        channel_manager_receiver: Receiver<JobDeclarationOwned>,
         cancellation_token: CancellationToken,
         fallback_coordinator: FallbackCoordinator,
         mode: JDMode,
@@ -307,6 +311,18 @@ impl JobDeclarator {
             msg_type = ?header.msg_type(),
             "Processing handshake response.");
 
+        if header.ext_type() != 0
+            || !matches!(
+                header.msg_type(),
+                MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS | MESSAGE_TYPE_SETUP_CONNECTION_ERROR
+            )
+        {
+            return Err(JDCError::fallback(JDCErrorKind::UnexpectedMessage(
+                header.ext_type(),
+                header.msg_type(),
+            )));
+        }
+
         self.handle_common_message_frame_from_server(None, header, incoming.payload())
             .await?;
 
@@ -319,7 +335,7 @@ impl JobDeclarator {
         match self.job_declarator_io.channel_manager_receiver.recv().await {
             Ok(msg) => {
                 debug!("Forwarding message from channel manager to JDS.");
-                let message = AnyMessage::JobDeclaration(msg);
+                let message = AnyMessageOwned::JobDeclaration(msg);
                 let sv2_frame: Sv2Frame = message.try_into().map_err(JDCError::shutdown)?;
                 self.job_declarator_io
                     .jds_sender
@@ -367,7 +383,7 @@ impl JobDeclarator {
             MessageType::JobDeclaration => {
                 let message = JobDeclaration::try_from((message_type, sv2_frame.payload()))
                     .map_err(JDCError::fallback)?
-                    .into_static();
+                    .into_owned();
                 self.job_declarator_io
                     .channel_manager_sender
                     .send(message)
@@ -383,5 +399,50 @@ impl JobDeclarator {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ConfigJDCMode;
+    use stratum_apps::stratum_core::{
+        common_messages_sv2::ChannelEndpointChangedOwned, parsers_sv2::CommonMessagesOwned,
+    };
+
+    #[tokio::test]
+    async fn setup_connection_rejects_channel_endpoint_changed_response() {
+        let (channel_manager_sender, _jd_to_cm_receiver) = unbounded();
+        let (_cm_to_jd_sender, channel_manager_receiver) = unbounded();
+        let (jds_sender, _jds_outbound_receiver) = unbounded();
+        let (jds_inbound_sender, jds_receiver) = unbounded();
+
+        let mut jd = JobDeclarator {
+            job_declarator_io: JobDeclaratorIo {
+                channel_manager_sender,
+                channel_manager_receiver,
+                jds_sender,
+                jds_receiver,
+            },
+            socket_address: "127.0.0.1:1234".parse().expect("valid socket address"),
+            mode: JDMode::new(ConfigJDCMode::FullTemplate),
+        };
+
+        let response: Message = Message::Common(CommonMessagesOwned::ChannelEndpointChanged(
+            ChannelEndpointChangedOwned { channel_id: 0 },
+        ));
+        let frame: Sv2Frame = response
+            .try_into()
+            .expect("Failed to serialize ChannelEndpointChanged frame");
+        jds_inbound_sender
+            .send(frame)
+            .await
+            .expect("Failed to inject ChannelEndpointChanged response");
+
+        assert!(
+            jd.setup_connection().await.is_err(),
+            "setup_connection must reject responses other than SetupConnectionSuccess"
+        );
+        assert!(jd.mode.is_solo_mining());
     }
 }

@@ -3,10 +3,12 @@
 use stratum_apps::{
     stratum_core::{
         bitcoin::Wtxid,
-        job_declaration_sv2::{DeclareMiningJob, ProvideMissingTransactionsSuccess, PushSolution},
-        mining_sv2::SetCustomMiningJob,
+        job_declaration_sv2::{
+            DeclareMiningJobOwned, ProvideMissingTransactionsSuccessOwned, PushSolutionOwned,
+        },
+        mining_sv2::SetCustomMiningJobOwned,
     },
-    utils::types::JdToken,
+    utils::types::{DownstreamId, JdToken},
 };
 
 pub mod bitcoin_core_ipc;
@@ -17,12 +19,12 @@ pub mod bitcoin_core_ipc;
 /// - different ways to connect to the Bitcoin Node.
 ///
 /// Please note that while this is a trait with some similarities with
-/// `handlers_sv2::job_declaration::HandleJobDeclarationMessagesFromClientAsync`,
+/// `handlers_sv2::job_declaration::HandleJobDeclarationMessagesFromClientOwnedAsync`,
 /// this has a different purpose.
 ///
 /// More specifically, we diverge from
-/// `handlers_sv2::job_declaration::HandleJobDeclarationMessagesFromClientAsync` in the following
-/// ways:
+/// `handlers_sv2::job_declaration::HandleJobDeclarationMessagesFromClientOwnedAsync` in the
+/// following ways:
 /// - we do not handle the `AllocateMiningJobToken` message
 /// - we handle `SetCustomMiningJob` message
 #[async_trait::async_trait]
@@ -30,20 +32,31 @@ pub trait JobValidationEngine: Send + Sync {
     /// Handles a declare mining job request.
     async fn handle_declare_mining_job(
         &self,
-        declare_mining_job: DeclareMiningJob<'_>,
-        provide_missing_transactions_success: Option<ProvideMissingTransactionsSuccess<'_>>,
+        downstream_id: DownstreamId,
+        declare_mining_job: DeclareMiningJobOwned,
+        provide_missing_transactions_success: Option<ProvideMissingTransactionsSuccessOwned>,
     ) -> DeclareMiningJobResult;
 
     /// Submits a mining solution to the backend.
-    async fn handle_push_solution(&self, push_solution: PushSolution<'_>);
+    async fn handle_push_solution(
+        &self,
+        downstream_id: DownstreamId,
+        push_solution: PushSolutionOwned,
+    );
 
     /// Validates a `SetCustomMiningJob` (Mining Protocol) against the previously declared job
     /// identified by `allocated_token`.
     async fn handle_set_custom_mining_job(
         &self,
-        set_custom_mining_job: SetCustomMiningJob<'_>,
+        downstream_id: DownstreamId,
+        set_custom_mining_job: SetCustomMiningJobOwned,
         allocated_token: JdToken,
     ) -> SetCustomMiningJobResult;
+
+    /// Removes validation state associated with a downstream connection.
+    ///
+    /// Called by [`crate::job_declarator::JobDeclarator`] when a downstream disconnects.
+    fn cleanup_downstream(&self, downstream_id: DownstreamId);
 
     /// Performs backend-specific shutdown work.
     ///
