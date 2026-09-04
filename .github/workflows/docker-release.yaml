@@ -114,8 +114,42 @@ jobs:
           file: ${{ matrix.dockerfile }}
           platforms: ${{ matrix.platforms }}
           tags: ${{ steps.tags.outputs.tags }}
-          # Layer cache stored in ECR (no GHA 10GB cap; biggest win for bitcoind,
+          # Layer cache READ from ECR (no GHA 10GB cap; biggest win for bitcoind,
           # which compiles Bitcoin Core + capnproto from source). ECR rejects the
-          # default cache manifest type, so push it as an OCI image manifest.
+          # default cache manifest type, so it was pushed as an OCI image manifest.
+          #
+          # THE WRITE SIDE IS DELIBERATELY GONE, AND REMOVING IT IS WHAT MAKES THIS
+          # WORKFLOW ABLE TO PUBLISH ANYTHING AT ALL. `cache-to` wrote a FIXED tag,
+          # `<image>:buildcache`, and every ECR repo here is
+          # image_tag_mutability = "IMMUTABLE" (pool-v4-infra
+          # infra/terraform/aws/ecr/main.tf, cited to compliance §10.M). So the
+          # first run wrote the tag and every run since has failed:
+          #
+          #   ERROR: error writing manifest blob: unknown: The image tag
+          #   'buildcache' already exists in the 'tproxy' repository and cannot be
+          #   overwritten because the tag is immutable.
+          #
+          # buildx fails the whole solve on a cache-export error, so this did not
+          # merely skip the cache — NO IMAGE WAS PUSHED. All four matrix entries
+          # failed identically in run 33908124186 (2026-09-04), and the 2026-08-09
+          # and 2026-08-13 runs before it. That is why ECR still serves only the
+          # v0.1.0 build: the pipeline has been unable to publish since the
+          # buildcache tag was created, and nothing alerted on it.
+          #
+          # Keeping `cache-from` is not pointless with no writer. It still reads
+          # the existing entry, which is exactly the expensive one — bitcoind's
+          # Bitcoin Core and capnproto layers change rarely. And the Rust images'
+          # real incremental cache is the cargo registry/git/target mount persisted
+          # by the actions/cache steps above, which never touched ECR and is
+          # unaffected.
+          #
+          # THE DURABLE FIX IS INFRA, NOT THIS FILE: ECR supports
+          # IMMUTABLE_WITH_EXCLUSION with a tag filter, so `buildcache` can be
+          # mutable while every release tag stays immutable and digest-pinnable
+          # (aws provider ~> 6.53 in that repo supports it). That edits a §10.M
+          # control, so it belongs in its own reviewed change — and ecr/main.tf
+          # already records a decision to keep IMMUTABLE rather than relax it for
+          # cosign, which is the discussion to reopen. Restore `cache-to` when the
+          # exclusion lands; until then a stale read-only cache costs build minutes,
+          # whereas the write side costs every image.
           cache-from: type=registry,ref=${{ env.ECR_REGISTRY }}/${{ matrix.image }}:buildcache
-          cache-to: type=registry,ref=${{ env.ECR_REGISTRY }}/${{ matrix.image }}:buildcache,mode=max,image-manifest=true,oci-mediatypes=true
