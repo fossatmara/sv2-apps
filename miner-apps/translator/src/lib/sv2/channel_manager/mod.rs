@@ -948,6 +948,7 @@ impl ChannelManager {
                     hashrate,
                     true,
                     min_extranonce_size as u16,
+                    None, // max_past_jobs: use the library default (16)
                 );
                 self.extended_channels
                     .insert(next_channel_id, new_downstream_extended_channel);
